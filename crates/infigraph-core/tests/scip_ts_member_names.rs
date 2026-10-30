@@ -48,3 +48,16 @@ fn a_dollar_prefixed_member_is_one_symbol() {
         .collect();
     assert!(missing.is_empty(), "SCIP-only members: {missing:?}");
 }
+
+#[test]
+fn a_quoted_member_name_is_named_without_its_quotes() {
+    let (_, scip_ids) = ids("scip_ts_quoted_name");
+    assert!(
+        scip_ids.iter().any(|id| id == "a.ts::Flags::c-strings"),
+        "SCIP names the member `'c-strings'` unquoted: {scip_ids:?}"
+    );
+    assert!(
+        !scip_ids.iter().any(|id| id.contains('\'')),
+        "no quote is part of a member's name: {scip_ids:?}"
+    );
+}

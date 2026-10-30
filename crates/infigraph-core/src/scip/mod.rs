@@ -1517,6 +1517,19 @@ fn accessor_name(name: String) -> String {
     name
 }
 
+/// A quoted member name keeps the source's own spelling, not the quotes the
+/// indexer wraps a non-identifier name in: `'c-strings'` is `c-strings`, as
+/// tree-sitter names a member it has. A name that is a single quote (`'`)
+/// keeps it, as it has no pair to strip.
+fn unquote_name(name: &str) -> &str {
+    for quote in ['\'', '"'] {
+        if name.len() >= 2 && name.starts_with(quote) && name.ends_with(quote) {
+            return &name[1..name.len() - 1];
+        }
+    }
+    name
+}
+
 fn descriptor_name(scip_sym: &str) -> String {
     let mut s = scip_sym.trim_end();
 
@@ -1561,7 +1574,8 @@ fn descriptor_name(scip_sym: &str) -> String {
     for quote in ['`', '"'] {
         if let Some(rest) = s.strip_suffix(quote) {
             if let Some(start) = rest.rfind(quote) {
-                return format!("{}{disambiguator}{suffix}", &rest[start + 1..]);
+                let name = unquote_name(&rest[start + 1..]);
+                return format!("{name}{disambiguator}{suffix}");
             }
         }
     }
@@ -1784,6 +1798,7 @@ fn scip_descriptors(scip_sym: &str) -> Option<Vec<Descriptor>> {
                 }
                 name.push(c);
             }
+            name = unquote_name(&name).to_string();
         } else {
             while let Some(&c) = chars.get(*i) {
                 if stop.contains(&c) {
@@ -2618,6 +2633,20 @@ mod tests {
         assert_eq!(
             scip_sym_to_name("scip-python python test-pkg 1.0.0 `test`/Animal#"),
             "Animal"
+        );
+    }
+
+    #[test]
+    fn scip_sym_to_name_drops_the_quotes_round_a_quoted_member() {
+        // scip-typescript wraps a non-identifier property name in its quotes
+        // (`'c-strings'`); the member is named as the source spells it.
+        assert_eq!(
+            scip_sym_to_name("scip-typescript npm t 1.0.0 `a.ts`/Flags#`'c-strings'`."),
+            "c-strings"
+        );
+        assert_eq!(
+            scip_sym_to_name("scip-typescript npm t 1.0.0 `a.ts`/Flags#`\"x\"`."),
+            "x"
         );
     }
 
