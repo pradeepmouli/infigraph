@@ -22,6 +22,11 @@
 //!    type-literal or class property is a tree-sitter symbol `file::Owner::name`
 //!    (through nested literals, as scip-typescript names it); a local variable
 //!    is `file::fn::name`, owned by its nearest enclosing named function.
+//! 3: a member's name is the name the source spells: a `$` in an identifier
+//!    is part of it (`file::As::$kind`, as tree-sitter has it, not `As::kind`);
+//!    a quoted member name is unquoted (`file::Flags::c-strings`, not
+//!    `'c-strings'`); a TypeScript namespace is an owner, nested ones in order
+//!    (`file::Pattern::Map`, `file::Literal::String::C`).
 
 use std::path::Path;
 
@@ -30,7 +35,7 @@ use super::query_exec::{LocalExec, QueryExec};
 use super::GraphStore;
 
 /// The scheme this binary writes.
-pub const ID_SCHEME: i64 = 2;
+pub const ID_SCHEME: i64 = 3;
 
 /// The scheme a graph is stamped with: 0 for one that predates the stamp (the
 /// row missing or NULL reads as 0). `None` when the query itself failed: that is

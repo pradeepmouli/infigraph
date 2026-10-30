@@ -1567,8 +1567,10 @@ fn descriptor_name(scip_sym: &str) -> String {
     }
 
     // Bare identifier: trailing run of alphanumeric/underscore characters.
+    // `$` is an identifier character in JavaScript and TypeScript (`$kind`),
+    // and tree-sitter names the member with it, so the SCIP name keeps it.
     let ident_start = s
-        .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .rfind(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
         .map(|i| i + 1)
         .unwrap_or(0);
     if ident_start < s.len() {
@@ -2616,6 +2618,16 @@ mod tests {
         assert_eq!(
             scip_sym_to_name("scip-python python test-pkg 1.0.0 `test`/Animal#"),
             "Animal"
+        );
+    }
+
+    #[test]
+    fn scip_sym_to_name_keeps_a_dollar_in_an_identifier() {
+        // scip-typescript writes `readonly $kind` as a bare `$kind.`; tree-sitter
+        // names the member `$kind`, so the two must agree.
+        assert_eq!(
+            scip_sym_to_name("scip-typescript npm t 1.0.0 `a.ts`/As#$kind."),
+            "$kind"
         );
     }
 
