@@ -264,20 +264,29 @@ pub fn extract_entities(
                         find_parent_class(node, source, decompose_query)
                     }
                 });
+            // Owned means the member has a class or TypeScript owner of its own:
+            // a namespace alone does not own a literal's member, so the check
+            // comes before the namespaces are put in front of the owner.
+            if owned_only && parent_class.is_none() {
+                continue;
+            }
+            // The namespaces go in front of the id's owner. A parent must be a
+            // symbol, and a namespace is none (tree-sitter makes no symbol of
+            // it): a member whose only owner is a namespace has no parent.
+            let has_owner = parent_class.is_some();
             let parent_class = if in_typescript {
                 ts_with_namespaces(node, source, parent_class)
             } else {
                 parent_class
             };
-            if owned_only && parent_class.is_none() {
-                continue;
-            }
             let id = if let Some(ref cls) = parent_class {
                 format!("{}::{}::{}", file, cls, name)
             } else {
                 format!("{}::{}", file, name)
             };
-            let parent = parent_class.map(|cls| format!("{}::{}", file, cls));
+            let parent = parent_class
+                .filter(|_| has_owner)
+                .map(|cls| format!("{}::{}", file, cls));
 
             let complexity = match sym_kind {
                 SymbolKind::Function | SymbolKind::Method | SymbolKind::Test => {
