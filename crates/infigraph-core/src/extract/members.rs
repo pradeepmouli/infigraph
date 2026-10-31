@@ -14,9 +14,12 @@
 //!   @member.within the object literal that member sits in
 //!   @member.root   the name a literal is bound to (`const X = {..}`)
 //!   @member.owner  the key a nested literal is the value of (`b: {..}`)
-//!   @member.scope  the object literal a root or an owner names
+//!   @member.value  the expression a root or an owner is bound to: the literal
+//!                  it names is found by [`literal_object`], through the
+//!                  wrappers (`as`, `satisfies`, parentheses) the queries do not
+//!                  need to know about
 //!
-//! A member's owners are found by following `within` -> `scope` links up to a
+//! A member's owners are found by following `within` -> literal links up to a
 //! root. A literal reached any other way (a call argument, an array element, a
 //! return value) has no name to own it: its members get no owners.
 
@@ -67,14 +70,14 @@ impl MemberScan {
         names: &[&str],
         source: &[u8],
     ) {
-        let (mut name, mut within, mut root, mut owner, mut scope) = (None, None, None, None, None);
+        let (mut name, mut within, mut root, mut owner, mut value) = (None, None, None, None, None);
         for c in captures {
             match names[c.index as usize] {
                 "member.name" => name = Some(c.node),
                 "member.within" => within = Some(c.node),
                 "member.root" => root = Some(c.node),
                 "member.owner" => owner = Some(c.node),
-                "member.scope" => scope = Some(c.node),
+                "member.value" => value = Some(c.node),
                 _ => {}
             }
         }
@@ -84,17 +87,19 @@ impl MemberScan {
             let p = name.start_position();
             self.members
                 .push(((p.row as u32, p.column as u32), text(name), range(within)));
-        } else if let (Some(scope), Some(root)) = (scope, root) {
+        } else if let (Some(root), Some(object)) = (root, value.and_then(literal_object)) {
             self.scopes.insert(
-                range(scope),
+                range(object),
                 Scope {
                     owner: text(root),
                     within: None,
                 },
             );
-        } else if let (Some(scope), Some(owner), Some(within)) = (scope, owner, within) {
+        } else if let (Some(owner), Some(object), Some(within)) =
+            (owner, value.and_then(literal_object), within)
+        {
             self.scopes.insert(
-                range(scope),
+                range(object),
                 Scope {
                     owner: text(owner),
                     within: Some(range(within)),
@@ -126,6 +131,24 @@ impl MemberScan {
                 (at, LiteralMember { name, owners })
             })
             .collect()
+    }
+}
+
+/// The object literal `value` is, through the wrappers that keep it the same
+/// value: `as`, `satisfies` (any number, in any order) and parentheses.
+/// `{ .. } as const satisfies Record<..>` names the literal exactly as
+/// `{ .. }` does. This is the only place that knows the wrapper kinds; the
+/// queries capture the expression and leave the unwrapping to it.
+fn literal_object(value: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    let mut node = value;
+    loop {
+        match node.kind() {
+            "object" => return Some(node),
+            "as_expression" | "satisfies_expression" | "parenthesized_expression" => {
+                node = node.named_child(0)?;
+            }
+            _ => return None,
+        }
     }
 }
 

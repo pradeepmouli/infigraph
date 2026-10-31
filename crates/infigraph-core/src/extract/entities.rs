@@ -28,7 +28,7 @@ use crate::model::{Span, Symbol, SymbolKind};
 ///     `decompose_query`, when present, resolves a compound `@method.parent`
 ///     capture (e.g. a generic `impl<T> Foo<T> for Vec<Bar>`'s `type:` field)
 ///     down to its base identifier -- see `resolve_compound_node_text`.)
-///   @member.name / @member.within / @member.root / @member.owner / @member.scope
+///   @member.name / @member.within / @member.root / @member.owner / @member.value
 ///     (optional; TypeScript) -- these emit NO symbol and are ignored here. They
 ///     tell the SCIP import who owns an object-literal member; see `members.rs`.
 pub fn extract_entities(

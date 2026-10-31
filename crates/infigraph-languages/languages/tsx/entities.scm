@@ -60,43 +60,35 @@
 ; is the TypeScript half of the parent-capture idiom (@method.parent) for
 ; fields and properties.
 
-; const X = { ... } at module level (also `as` / `satisfies` wrappers, `var`,
-; and `export`). A literal bound inside a function has no stable owner name --
-; the same `const node = {..}` recurs in every function -- so it gets none.
+; const X = { ... } at module level, with any `var` or `export`. The bound
+; expression is captured whole and extract::members::literal_object finds the
+; literal in it, through `as` / `satisfies` / parentheses. A literal bound
+; inside a function has no stable owner name -- the same `const node = {..}`
+; recurs in every function -- so it gets none.
 (program
   [(lexical_declaration
      (variable_declarator
        name: (identifier) @member.root
-       value: [(object) @member.scope
-                  (as_expression . (object) @member.scope)
-                  (satisfies_expression . (object) @member.scope)]))
+       value: (_) @member.value))
    (variable_declaration
      (variable_declarator
        name: (identifier) @member.root
-       value: [(object) @member.scope
-                  (as_expression . (object) @member.scope)
-                  (satisfies_expression . (object) @member.scope)]))
+       value: (_) @member.value))
    (export_statement
      declaration: [(lexical_declaration
                      (variable_declarator
                        name: (identifier) @member.root
-                       value: [(object) @member.scope
-                                  (as_expression . (object) @member.scope)
-                                  (satisfies_expression . (object) @member.scope)]))
+                       value: (_) @member.value))
                    (variable_declaration
                      (variable_declarator
                        name: (identifier) @member.root
-                       value: [(object) @member.scope
-                                  (as_expression . (object) @member.scope)
-                                  (satisfies_expression . (object) @member.scope)]))])])
+                       value: (_) @member.value))])])
 
-; a key whose value is itself a literal: { b: { ... } }
+; a key whose value is itself a literal (or a literal under wrappers): { b: {..} }
 (object
   (pair
     key: (_) @member.owner
-    value: [(object) @member.scope
-            (as_expression . (object) @member.scope)
-            (satisfies_expression . (object) @member.scope)])) @member.within
+    value: (_) @member.value)) @member.within
 
 ; every member of a literal
 (object

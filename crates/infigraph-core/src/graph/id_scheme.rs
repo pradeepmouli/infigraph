@@ -31,6 +31,10 @@
 //!    by the literal it sits in (`file::ENRICH_SHAPES::unfielded-symbol-slot`),
 //!    not by scip-typescript's `'unfielded-symbol-slot'0` with no owner; a
 //!    member is a variable, not a function.
+//! 5: an object literal under `as`, `satisfies` or parentheses (any nesting:
+//!    `{ .. } as const satisfies Record<..>`) is still the literal the name is
+//!    bound to, so its members are `file::Const::key`, and a literal nested as
+//!    the value of a key under such wrappers is owned by that key too.
 
 use std::path::Path;
 
@@ -39,7 +43,7 @@ use super::query_exec::{LocalExec, QueryExec};
 use super::GraphStore;
 
 /// The scheme this binary writes.
-pub const ID_SCHEME: i64 = 4;
+pub const ID_SCHEME: i64 = 5;
 
 /// The scheme a graph is stamped with: 0 for one that predates the stamp (the
 /// row missing or NULL reads as 0). `None` when the query itself failed: that is
