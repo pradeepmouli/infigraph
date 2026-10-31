@@ -5,7 +5,7 @@ use kuzu::Connection;
 
 use super::schema::ensure_custom_edge_table;
 use super::store::{GraphStore, WriteLock};
-use super::store_util::escape;
+use super::store_util::{escape, IncomingEdges};
 use crate::model::{FileExtraction, RelationKind};
 
 impl GraphStore {
@@ -55,6 +55,9 @@ impl GraphStore {
         extraction: &FileExtraction,
         witness: &WriteLock,
     ) -> Result<()> {
+        // Edges into this file's symbols from other files die with the
+        // DETACH DELETE below and are not re-extracted, so read them first.
+        let incoming = IncomingEdges::capture(conn, &[extraction.file.as_str()])?;
         // Remove old symbols for this file
         let _ = conn.query(&format!(
             "MATCH (s:Symbol) WHERE s.file = '{}' DETACH DELETE s",
@@ -68,7 +71,8 @@ impl GraphStore {
             "MATCH (f:File) WHERE f.id = '{}' DETACH DELETE f",
             escape(&extraction.file)
         ));
-        self.upsert_file_conn_no_delete(conn, extraction, witness)
+        self.upsert_file_conn_no_delete(conn, extraction, witness)?;
+        incoming.restore(conn)
     }
 
     pub fn upsert_file_conn_no_delete(

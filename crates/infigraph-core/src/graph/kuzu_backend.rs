@@ -13,6 +13,7 @@ use super::backend::{
 };
 use super::queries::GraphQuery;
 use super::store::GraphStore;
+use super::store_util::IncomingEdges;
 use super::{
     ApiSymbol, ArchitectureStats, BranchInfo, ComplexityRow, DeadCodeRow, FileDeps, GraphStats,
     ImpactRow, ReferenceRow, SymbolDetail, SymbolMeta, SymbolRow, SymbolWithDocstring, TestContext,
@@ -328,6 +329,16 @@ impl GraphBackend for KuzuBackend {
         // batch back instead of leaving a half-applied batch open on a
         // connection that is about to be dropped. Each lbug call is
         // bracketed by a `write_phase` so a C++ abort names it (#132).
+        // Edges into the replaced symbols from files this batch does not
+        // re-extract are read now and written back after the rewrite (see
+        // `IncomingEdges`). A fresh batch deletes nothing, so it has none.
+        let incoming = if existing_hashes_empty {
+            IncomingEdges::default()
+        } else {
+            let files: Vec<&str> = extractions.iter().map(|e| e.file.as_str()).collect();
+            IncomingEdges::capture(&self.store.connection()?, &files)?
+        };
+
         if use_csv {
             // Parquet bulk path: delete stale → COPY FROM → folders
             if !existing_hashes_empty {
@@ -340,6 +351,11 @@ impl GraphBackend for KuzuBackend {
             let conn = self.store.connection()?;
             self.store
                 .upsert_all_parquet_conn(&conn, extractions, &write_lock)?;
+            drop(conn);
+            let _phase = crate::write_phase::enter(&"bulk-index: restore incoming edges", batch);
+            self.store
+                .transaction(|conn| incoming.restore(conn))
+                .context("restoring the edges into the replaced symbols")?;
         } else {
             // Per-file UNWIND path for small incremental updates. The gate
             // re-runs the growth check every few files (#132 gap 1): the
@@ -354,7 +370,7 @@ impl GraphBackend for KuzuBackend {
                         self.store
                             .upsert_file_conn_no_delete(conn, extraction, &write_lock)?;
                     }
-                    Ok(())
+                    incoming.restore(conn)
                 })
                 .context("index transaction for the incremental batch")?;
         }
