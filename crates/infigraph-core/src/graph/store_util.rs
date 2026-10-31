@@ -964,6 +964,8 @@ pub(crate) fn write_absent_edges<S: AsRef<str>, D: AsRef<str>>(
         .map(|(src, dst)| (src.as_ref().to_string(), dst.as_ref().to_string()))
         .collect();
     let owned = absent_edges(conn, rel, src_label, dst_label, owned)?;
+    // A failed chunk is ignored, as the writers this replaced ignored theirs:
+    // its pairs stay absent until the files holding them are written again.
     for chunk in owned.chunks(PAIRS_PER_WRITE) {
         let _ = conn.query(&pair_edge_statement(
             src_label,
@@ -973,6 +975,69 @@ pub(crate) fn write_absent_edges<S: AsRef<str>, D: AsRef<str>>(
         ));
     }
     Ok(())
+}
+
+/// Symbol-to-symbol edge tables whose edges from *other* files are lost when a
+/// file's symbols are replaced: `DETACH DELETE` on the replaced symbols removes
+/// every edge into them, and the file holding the edge is not re-extracted, so
+/// nothing writes it back (base.ts edited, child.ts's INHERITS gone until
+/// child.ts is touched).
+const INCOMING_EDGE_TABLES: [&str; 3] = ["CALLS", "INHERITS", "TESTED_BY"];
+
+/// The edges into the symbols of `files` that come from other files, read
+/// before those symbols are deleted and written back by [`Self::restore`].
+///
+/// Cost follows the edges, not the files: one scoped read per table over the
+/// rows that point into `files`, then one [`write_absent_edges`] per table.
+/// A hub of 1,600 children costs 1,600 pairs and no re-extraction. A restored
+/// edge is kept only where its target id still exists after the rewrite, so
+/// an edge to a symbol that was renamed or removed is dropped, and a name that
+/// now resolves to something new is not picked up (only the resolver does that).
+#[derive(Default)]
+pub(crate) struct IncomingEdges {
+    saved: Vec<(&'static str, Vec<(String, String)>)>,
+}
+
+impl IncomingEdges {
+    pub(crate) fn capture(conn: &Connection<'_>, files: &[&str]) -> Result<Self> {
+        if files.is_empty() {
+            return Ok(Self::default());
+        }
+        let list: Vec<String> = files.iter().map(|f| format!("'{}'", escape(f))).collect();
+        let list = list.join(", ");
+        let mut saved = Vec::new();
+        for table in INCOMING_EDGE_TABLES {
+            let rows = conn
+                .query(&format!(
+                    "MATCH (a:Symbol)-[:{table}]->(b:Symbol) \
+                     WHERE b.file IN [{list}] AND NOT (a.file IN [{list}]) \
+                     RETURN a.id, b.id"
+                ))
+                .map_err(|e| anyhow::anyhow!("reading the incoming {table} edges: {e}"))?;
+            let pairs: Vec<(String, String)> = rows
+                .filter(|row| row.len() >= 2)
+                .map(|row| {
+                    (
+                        raw_string(&row[0]).to_string(),
+                        raw_string(&row[1]).to_string(),
+                    )
+                })
+                .collect();
+            if !pairs.is_empty() {
+                saved.push((table, pairs));
+            }
+        }
+        Ok(Self { saved })
+    }
+
+    /// Writes the captured edges back. Call after the replaced symbols exist
+    /// again, in the same transaction as their delete.
+    pub(crate) fn restore(self, conn: &Connection<'_>) -> Result<()> {
+        for (table, pairs) in self.saved {
+            write_absent_edges(conn, "Symbol", "Symbol", table, &pairs)?;
+        }
+        Ok(())
+    }
 }
 
 /// Source ids per existence query in [`absent_edges`].
@@ -1198,6 +1263,197 @@ mod tests {
             .and_then(|row| row.first().map(|v| v.to_string()))
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap()
+    }
+
+    /// A file holding one class per name, and no relations.
+    pub(crate) fn extraction_of(file: &str, names: &[&str]) -> crate::model::FileExtraction {
+        use crate::model::{FileExtraction, Span, Symbol, SymbolKind};
+        let span = Span {
+            file: file.into(),
+            start_line: 1,
+            start_col: 0,
+            end_line: 2,
+            end_col: 0,
+        };
+        FileExtraction {
+            file: file.into(),
+            language: "python".into(),
+            content_hash: "abc".into(),
+            symbols: names
+                .iter()
+                .map(|name| Symbol {
+                    id: format!("{file}::{name}"),
+                    name: name.to_string(),
+                    kind: SymbolKind::Class,
+                    span: span.clone(),
+                    signature_hash: "h".into(),
+                    parent: None,
+                    language: "python".into(),
+                    visibility: Some("public".into()),
+                    docstring: None,
+                    complexity: 1,
+                    parameters: None,
+                    return_type: None,
+                    scip_id: None,
+                })
+                .collect(),
+            relations: Vec::new(),
+            statements: Vec::new(),
+        }
+    }
+
+    pub(crate) fn inherits_count(store: &super::super::GraphStore) -> usize {
+        let conn = store.connection().unwrap();
+        let mut r = conn
+            .query("MATCH ()-[r:INHERITS]->() RETURN count(r)")
+            .unwrap();
+        r.next()
+            .and_then(|row| row.first().map(|v| v.to_string()))
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn replacing_a_file_keeps_the_edges_other_files_hold_into_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            super::super::GraphStore::open(&tmp.path().join(crate::graph::names::STEM)).unwrap();
+        store
+            .upsert_file(&extraction_of("base.py", &["Base"]))
+            .unwrap();
+        store
+            .upsert_file(&extraction_of("child.py", &["Child"]))
+            .unwrap();
+        {
+            let conn = store.connection().unwrap();
+            super::write_absent_edges(
+                &conn,
+                "Symbol",
+                "Symbol",
+                "INHERITS",
+                &[("child.py::Child", "base.py::Base")],
+            )
+            .unwrap();
+        }
+
+        store
+            .upsert_file(&extraction_of("base.py", &["Base"]))
+            .unwrap();
+
+        assert_eq!(
+            inherits_count(&store),
+            1,
+            "base.py was replaced; child.py's edge into it must survive"
+        );
+    }
+
+    /// The cost bound for a hub: 1,600 children extend one base. Replacing the
+    /// base writes back 1,600 edges; no child file is re-extracted.
+    #[test]
+    fn replacing_a_hub_restores_every_child_edge_in_one_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            super::super::GraphStore::open(&tmp.path().join(crate::graph::names::STEM)).unwrap();
+        let children: Vec<String> = (0..1600).map(|i| format!("C{i}")).collect();
+        let child_names: Vec<&str> = children.iter().map(String::as_str).collect();
+        store
+            .upsert_file(&extraction_of("child.py", &child_names))
+            .unwrap();
+        store
+            .upsert_file(&extraction_of("base.py", &["Base"]))
+            .unwrap();
+        let edges: Vec<(String, String)> = children
+            .iter()
+            .map(|c| (format!("child.py::{c}"), "base.py::Base".to_string()))
+            .collect();
+        {
+            let conn = store.connection().unwrap();
+            super::write_absent_edges(&conn, "Symbol", "Symbol", "INHERITS", &edges).unwrap();
+        }
+        assert_eq!(inherits_count(&store), 1600);
+
+        store
+            .upsert_file(&extraction_of("base.py", &["Base"]))
+            .unwrap();
+
+        assert_eq!(inherits_count(&store), 1600);
+    }
+
+    #[test]
+    fn an_edge_into_a_symbol_the_replacement_no_longer_has_is_not_restored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            super::super::GraphStore::open(&tmp.path().join(crate::graph::names::STEM)).unwrap();
+        store
+            .upsert_file(&extraction_of("base.py", &["Base"]))
+            .unwrap();
+        store
+            .upsert_file(&extraction_of("child.py", &["Child"]))
+            .unwrap();
+        {
+            let conn = store.connection().unwrap();
+            super::write_absent_edges(
+                &conn,
+                "Symbol",
+                "Symbol",
+                "INHERITS",
+                &[("child.py::Child", "base.py::Base")],
+            )
+            .unwrap();
+        }
+
+        store
+            .upsert_file(&extraction_of("base.py", &["Renamed"]))
+            .unwrap();
+
+        assert_eq!(
+            inherits_count(&store),
+            0,
+            "base.py::Base is gone, so the edge to it has no target to restore to"
+        );
+    }
+
+    /// The daemon's path: a batch that replaces a file goes through
+    /// `upsert_files_bulk`. One extraction takes the per-file UNWIND branch;
+    /// more than 100 take the Parquet COPY branch. Both must keep the edge.
+    #[test]
+    fn a_batch_replacing_a_file_keeps_the_edges_into_it_on_both_write_paths() {
+        use crate::graph::backend::GraphBackend;
+        for unrelated in [0usize, 100] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = super::super::GraphStore::open(&tmp.path().join(crate::graph::names::STEM))
+                .unwrap();
+            store
+                .upsert_file(&extraction_of("base.py", &["Base"]))
+                .unwrap();
+            store
+                .upsert_file(&extraction_of("child.py", &["Child"]))
+                .unwrap();
+            {
+                let conn = store.connection().unwrap();
+                super::write_absent_edges(
+                    &conn,
+                    "Symbol",
+                    "Symbol",
+                    "INHERITS",
+                    &[("child.py::Child", "base.py::Base")],
+                )
+                .unwrap();
+            }
+            let backend = crate::graph::kuzu_backend::KuzuBackend::from_store(store);
+            let mut batch = vec![extraction_of("base.py", &["Base"])];
+            batch
+                .extend((0..unrelated).map(|i| extraction_of(&format!("other{i}.py"), &["Other"])));
+
+            backend.upsert_files_bulk(&batch, false).unwrap();
+
+            assert_eq!(
+                inherits_count(&backend.store()),
+                1,
+                "a batch of {} extraction(s) replacing base.py",
+                batch.len()
+            );
+        }
     }
 
     fn write_calls(store: &super::super::GraphStore, pairs: &[(&str, &str)]) {

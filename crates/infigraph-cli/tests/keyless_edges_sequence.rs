@@ -187,8 +187,20 @@ fn apply(op: Op, root: &Path, home: &Path, step: usize) -> String {
     format!("{op:?}")
 }
 
+/// The default run: short enough for every `cargo test --all`.
 #[test]
 fn keyless_tables_hold_one_row_per_pair_through_a_seeded_sequence() {
+    run_sequence(8);
+}
+
+/// The long run, 24 steps (about 150s). `cargo test -- --ignored` runs it.
+#[test]
+#[ignore = "24 steps, about 150s"]
+fn keyless_tables_hold_one_row_per_pair_over_a_long_sequence() {
+    run_sequence(24);
+}
+
+fn run_sequence(default_steps: usize) {
     let seed: u64 = std::env::var("INFIGRAPH_SEQUENCE_SEED")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -196,7 +208,7 @@ fn keyless_tables_hold_one_row_per_pair_through_a_seeded_sequence() {
     let steps: usize = std::env::var("INFIGRAPH_SEQUENCE_STEPS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(24);
+        .unwrap_or(default_steps);
 
     let root = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
