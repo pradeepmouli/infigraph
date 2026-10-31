@@ -2,6 +2,7 @@ mod backend;
 pub mod compaction;
 pub mod cozo_store;
 pub mod daemon_kuzu_backend;
+pub mod edge_census;
 pub(crate) mod growth_gate;
 pub mod id_scheme;
 mod kuzu_backend;

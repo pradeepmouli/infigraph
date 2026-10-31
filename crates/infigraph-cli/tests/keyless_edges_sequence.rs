@@ -12,16 +12,7 @@ mod support;
 use std::path::Path;
 use std::process::Output;
 
-/// Keyless edge tables: (table, source label, target label).
-const TABLES: &[(&str, &str, &str)] = &[
-    ("CALLS", "Symbol", "Symbol"),
-    ("INHERITS", "Symbol", "Symbol"),
-    ("TESTED_BY", "Symbol", "Symbol"),
-    ("IMPORTS", "Module", "Module"),
-    ("CONTAINS", "Module", "Symbol"),
-    ("DEFINES", "File", "Symbol"),
-    ("HAS_STATEMENT", "Symbol", "Statement"),
-];
+use infigraph_core::graph::edge_census::{union_query, TableCount, KEYLESS_EDGE_TABLES};
 
 const BASE: &str = "export interface Base1 { a: number }\n\
 export interface Base2 { b: number }\n\
@@ -88,27 +79,12 @@ fn routed(root: &Path, home: &Path, args: &[&str]) -> Output {
 
 /// Rows and distinct (source, target) pairs of every table, through one daemon
 /// query: one CLI spawn per check, not one per table.
-fn counts(root: &Path, home: &Path) -> Vec<(String, i64, i64)> {
-    let cypher = TABLES
-        .iter()
-        .map(|(table, src, dst)| {
-            format!(
-                "MATCH (a:{src})-[r:{table}]->(b:{dst}) RETURN '{table}' AS t, count(r) AS rows, count(DISTINCT a.id + '|' + b.id) AS pairs"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" UNION ALL ");
-    let out = routed(root, home, &["query", &cypher]);
+fn counts(root: &Path, home: &Path) -> Vec<TableCount> {
+    let out = routed(root, home, &["query", &union_query(&KEYLESS_EDGE_TABLES)]);
     support::assert_ok(&out, "count keyless tables");
     support::stdout(&out)
         .lines()
-        .filter_map(|line| {
-            let mut parts = line.split('|').map(str::trim);
-            let table = parts.next()?;
-            let rows = parts.next()?.parse().ok()?;
-            let pairs = parts.next()?.parse().ok()?;
-            Some((table.to_string(), rows, pairs))
-        })
+        .filter_map(TableCount::from_line)
         .collect()
 }
 
@@ -238,12 +214,12 @@ fn run_sequence(default_steps: usize) {
 /// operations so far, and the table with its counts.
 fn check(root: &Path, home: &Path, seed: u64, history: &[String]) {
     let counted = counts(root, home);
-    for (table, _, _) in TABLES {
+    for (table, _, _) in KEYLESS_EDGE_TABLES {
         // An empty match yields no row from this engine, so a missing table is 0 rows.
         let (rows, distinct) = counted
             .iter()
-            .find(|(name, _, _)| name == table)
-            .map_or((0, 0), |(_, rows, pairs)| (*rows, *pairs));
+            .find(|c| c.table == table)
+            .map_or((0, 0), |c| (c.rows, c.pairs));
         assert_eq!(
             rows,
             distinct,

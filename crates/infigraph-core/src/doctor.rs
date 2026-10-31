@@ -1294,6 +1294,111 @@ pub fn check_degraded(ctx: &DoctorContext) -> Vec<CheckResult> {
         .collect()
 }
 
+const KEYLESS_EDGES_CATEGORY: &str = "keyless edges";
+
+pub fn check_keyless_edges(ctx: &DoctorContext) -> Vec<CheckResult> {
+    projects_in_scope(ctx)
+        .iter()
+        .flat_map(|p| check_one_project_keyless_edges(p))
+        .collect()
+}
+
+/// One row per pair in each keyless edge table (`graph::edge_census`).
+///
+/// Counted through the observer path: the project's live daemon when there is
+/// one, else a read-only open (`ObservedGraph`), never a lease or a daemon
+/// start. An absent or unopenable graph is silent, since other checks report
+/// it. A census the budget cut short says so: a table it did not reach is
+/// "not checked", never a pass.
+fn check_one_project_keyless_edges(project_path: &Path) -> Vec<CheckResult> {
+    use crate::degraded::DegradedMode;
+    use crate::graph::edge_census::{census, table_count_query, TableCount, CENSUS_BUDGET};
+    use crate::graph::observe::ObservedGraph;
+
+    let graph_path = project_path
+        .join(".infigraph")
+        .join(crate::graph::names::STEM);
+    if !graph_path.exists() {
+        return Vec::new();
+    }
+    let Ok(observed) = ObservedGraph::open(project_path, &graph_path) else {
+        return Vec::new();
+    };
+    let name = project_path.display().to_string();
+
+    let counted = census(CENSUS_BUDGET, |table: &str, src: &str, dst: &str| {
+        let rows = observed.with_query(|q| q.raw_query(&table_count_query(table, src, dst)))??;
+        match rows.first() {
+            Some(cells) => TableCount::from_cells(cells)
+                .ok_or_else(|| anyhow::anyhow!("unreadable count row for {table}")),
+            // An empty match returns no row: the table holds no edges.
+            None => Ok(TableCount {
+                table: table.to_string(),
+                rows: 0,
+                pairs: 0,
+            }),
+        }
+    });
+    let census = match counted {
+        Ok(census) => census,
+        Err(e) => {
+            return vec![CheckResult::warn(
+                KEYLESS_EDGES_CATEGORY,
+                name,
+                format!("could not count the keyless edge tables: {e}"),
+                "run `infigraph verify`; if it fails, run `infigraph rebuild`",
+            )]
+        }
+    };
+
+    let mut out = Vec::new();
+    let extra = census.extra();
+    if extra > 0 {
+        let tables = census
+            .counted
+            .iter()
+            .filter(|c| c.extra() > 0)
+            .map(|c| format!("{} +{}", c.table, c.extra()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mode = DegradedMode::KeylessDuplicateEdges {
+            extra_rows: extra,
+            tables,
+        };
+        out.push(CheckResult::warn(
+            KEYLESS_EDGES_CATEGORY,
+            name.clone(),
+            mode.message(),
+            mode.remedy(),
+        ));
+    }
+    if !census.not_checked.is_empty() {
+        out.push(CheckResult::warn(
+            KEYLESS_EDGES_CATEGORY,
+            name.clone(),
+            format!(
+                "not checked within {}s: {} (the census ran out of budget, so these tables are \
+                 unknown, not clean)",
+                CENSUS_BUDGET.as_secs(),
+                census.not_checked.join(", ")
+            ),
+            "run `infigraph doctor` again; if the budget keeps running out, the graph is larger \
+             than the budget allows",
+        ));
+    }
+    if out.is_empty() {
+        out.push(CheckResult::pass(
+            KEYLESS_EDGES_CATEGORY,
+            name,
+            format!(
+                "{} keyless edge tables hold one row per pair",
+                census.counted.len()
+            ),
+        ));
+    }
+    out
+}
+
 pub fn check_sidecars(ctx: &DoctorContext) -> Vec<CheckResult> {
     let projects = projects_in_scope(ctx);
 
@@ -1934,6 +2039,7 @@ pub fn run_doctor(ctx: DoctorContext) -> DoctorReport {
     checks.extend(check_disk(&ctx));
     checks.extend(check_sidecars(&ctx));
     checks.extend(check_degraded(&ctx));
+    checks.extend(check_keyless_edges(&ctx));
     checks.extend(check_last_runs(&ctx));
     checks.extend(check_docs(&ctx));
     checks.extend(check_scip_staleness(&ctx));
