@@ -228,7 +228,9 @@ fn doctor_says_what_to_write_instead_of_a_dotted_key() {
 }
 
 #[test]
-fn doctor_explains_a_key_for_a_name_the_file_has_several_of() {
+fn a_key_for_a_name_the_file_has_several_of_names_the_group() {
+    // Two `dup` in one file are the members `dup#1` and `dup#2`, which a bare
+    // key names as a group: the key resolves, so doctor does not list it.
     let twice = "def dup():\n    return 1\n\n\ndef dup():\n    return 2\n";
     let dir = code_project(
         &[("src/twice.py", twice)],
@@ -238,11 +240,9 @@ fn doctor_explains_a_key_for_a_name_the_file_has_several_of() {
         )],
     );
     index_documents(dir.path());
-    let out = doctor(dir.path());
-    assert!(
-        out.contains("symbols have that name") && out.contains("src/twice.py::dup"),
-        "{out}"
-    );
+    reindex_code(dir.path());
+    let rows = infigraph_docs::link_check::missing_symbols(dir.path()).unwrap();
+    assert!(rows.is_empty(), "{rows:?}");
 }
 
 #[test]

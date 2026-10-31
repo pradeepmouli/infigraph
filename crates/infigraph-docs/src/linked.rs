@@ -24,7 +24,8 @@ use infigraph_core::graph::GraphBackend;
 use crate::ack::Acks;
 use crate::backend::DocBackend;
 use crate::code_links::{is_file_form, CodeLinkRow, LinkKind, CODE_LINKS_VERSION};
-use crate::stale_docs::verdict;
+use crate::link_check::{group_query, groups_in, is_member_of};
+use crate::stale_docs::{newest, verdict};
 use crate::DocIndex;
 
 /// An entry longer than this many characters is cut, and says so.
@@ -167,11 +168,27 @@ fn ids_named_by(backend: &dyn GraphBackend, target: &str) -> Vec<String> {
         .collect()
 }
 
+/// The bare key a group member is written under, and every member's span, when
+/// `symbol_id` is one of two or more same-named symbols (`file::Owner::name#2`
+/// of `file::Owner::name`). `None` for any other symbol.
+fn group_of(backend: &dyn GraphBackend, symbol_id: &str) -> Option<(String, Vec<(usize, usize)>)> {
+    let (key, _) = symbol_id.rsplit_once('#')?;
+    if !is_member_of(symbol_id, key) {
+        return None;
+    }
+    let rows = backend.raw_query(&group_query(&[key])).unwrap_or_default();
+    groups_in(&[key], &rows)
+        .remove(key)
+        .map(|group| (key.to_string(), group.spans))
+}
+
 /// Everything the document store links to `symbol_id` (a symbol of `file`),
 /// read against `backend`.
 ///
 /// `lines` is the symbol's first and last line in `file`: the code half of
-/// the staleness question, which git answers for just those lines.
+/// the staleness question, which git answers for just those lines. A group
+/// member is linked by its group's bare key, and judged over every member's
+/// lines, not its own.
 pub fn lookup(
     root: &Path,
     backend: &dyn GraphBackend,
@@ -194,8 +211,15 @@ pub fn lookup(
     };
     let mut found = LinkedDocs::default();
 
+    let (key, spans) = match group_of(backend, symbol_id) {
+        Some((key, spans)) => (key, spans),
+        None => (symbol_id.to_string(), vec![lines]),
+    };
     let module_key = format!("{file}::module");
     let mut keys = vec![symbol_id.to_string()];
+    if key != symbol_id {
+        keys.push(key.clone());
+    }
     if module_key != symbol_id {
         keys.push(module_key.clone());
     }
@@ -203,7 +227,7 @@ pub fn lookup(
         Ok(rows) => {
             for row in &rows {
                 let entry = LinkedEntry::from_row(row);
-                if row.target == symbol_id {
+                if row.target == symbol_id || row.target == key {
                     found.entries.push(entry);
                 } else {
                     found.file_notes.push(entry);
@@ -248,7 +272,7 @@ pub fn lookup(
         found.mentions = mentions;
     }
 
-    judge_entries(root, store, symbol_id, file, lines, &mut found);
+    judge_entries(root, store, &key, file, &spans, &mut found);
 
     found.unscanned = unscanned_documents(store);
     match found.unscanned {
@@ -264,28 +288,33 @@ pub fn lookup(
 /// after the entry's did. Git is asked for those two ranges only. A failure
 /// is the degraded mode `doc-sync-unknown` for this call: no entry is called
 /// current or stale, and nothing waits longer than the git timeout.
+/// Judges each entry under `key` (the key the entries are written under) against
+/// the newest change to `spans`, the lines of the symbol or of its whole group.
 fn judge_entries(
     root: &Path,
     store: &dyn DocBackend,
-    symbol_id: &str,
+    key: &str,
     file: &str,
-    lines: (usize, usize),
+    spans: &[(usize, usize)],
     found: &mut LinkedDocs,
 ) {
     if found.entries.is_empty() {
         return;
     }
     // A review that cannot be read leaves the entry judged by its history.
-    let acks = Acks::of(store, &[symbol_id.to_string()]).unwrap_or_default();
+    let acks = Acks::of(store, &[key.to_string()]).unwrap_or_default();
     let judge = |entry: &LinkedEntry| -> Result<Option<String>, BlameError> {
-        let code = git_blame::blame_ranges_cached(root, file, &[lines], GIT_TIMEOUT)?;
+        let code = git_blame::blame_ranges_cached(root, file, spans, GIT_TIMEOUT)?;
+        let Some(code) = newest(code) else {
+            return Ok(None);
+        };
         let doc = git_blame::blame_ranges_cached(
             root,
             &entry.doc_file,
             &[(entry.line_start, entry.line_end)],
             GIT_TIMEOUT,
         )?;
-        Ok(verdict(symbol_id, &code[0], &doc[0], &acks).state.label())
+        Ok(verdict(key, &code, &doc[0], &acks).state.label())
     };
     let mut failure = None;
     for entry in &mut found.entries {
