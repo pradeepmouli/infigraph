@@ -32,6 +32,7 @@ pub const IDS_OUTDATED: &str = "ids-outdated";
 pub const SCIP_LITERAL_OWNERS_UNAVAILABLE: &str = "scip-literal-owners-unavailable";
 pub const SESSIONS_UNREADABLE: &str = "sessions-unreadable";
 pub const SCIP_UNKNOWN_LANGUAGE: &str = "scip-unknown-language";
+pub const KEYLESS_DUPLICATE_EDGES: &str = "keyless-duplicate-edges";
 
 /// One way infigraph is running degraded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +117,11 @@ pub enum DegradedMode {
     /// `[scip] disable` names a language no SCIP indexer serves (a typo): it
     /// disables nothing, so the indexer the author meant still runs.
     ScipUnknownLanguage { names: String },
+    /// Some keyless edge tables hold a pair more than once: a writer from
+    /// before the idempotent writers appended it again. `tables` names the
+    /// tables and how many extra rows each holds. Only `doctor` counts the
+    /// rows, so this is reported there and not in footers.
+    KeylessDuplicateEdges { extra_rows: u64, tables: String },
 }
 
 impl DegradedMode {
@@ -148,6 +154,7 @@ impl DegradedMode {
             DegradedMode::ScipLiteralOwnersUnavailable => SCIP_LITERAL_OWNERS_UNAVAILABLE,
             DegradedMode::SessionsUnreadable { .. } => SESSIONS_UNREADABLE,
             DegradedMode::ScipUnknownLanguage { .. } => SCIP_UNKNOWN_LANGUAGE,
+            DegradedMode::KeylessDuplicateEdges { .. } => KEYLESS_DUPLICATE_EDGES,
         }
     }
 
@@ -271,6 +278,11 @@ impl DegradedMode {
                 "`[scip] disable` names {names}, which no SCIP indexer serves: it disables \
                  nothing, so the indexer you meant still runs"
             ),
+            DegradedMode::KeylessDuplicateEdges { extra_rows, tables } => format!(
+                "{extra_rows} duplicate edge rows ({tables}): some pairs are stored more than \
+                 once, so edge counts are too high. Reported by `infigraph doctor` only, not in \
+                 footers"
+            ),
         }
     }
 
@@ -334,6 +346,10 @@ impl DegradedMode {
             }
             DegradedMode::ScipUnknownLanguage { .. } => {
                 "correct the name in `[scip] disable` (`infigraph index` lists the known ones)"
+            }
+            DegradedMode::KeylessDuplicateEdges { .. } => {
+                "run `infigraph rebuild`: a full rebuild writes each edge once. An index does not \
+                 repair edges between files it does not touch"
             }
         }
     }

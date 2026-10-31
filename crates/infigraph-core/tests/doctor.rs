@@ -2161,3 +2161,95 @@ mod scip_languages {
         );
     }
 }
+
+/// A project whose graph holds `rows` copies of one INHERITS pair, as a writer
+/// from before the idempotent writers left it. The store is closed on return,
+/// so doctor opens it the way it opens any project.
+fn graph_with_inherits_rows(rows: usize) -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    let ig = dir.path().join(".infigraph");
+    std::fs::create_dir_all(&ig).unwrap();
+    let store = GraphStore::open(&ig.join(infigraph_core::graph::names::STEM)).unwrap();
+    {
+        let conn = store.connection().unwrap();
+        for id in ["a", "b"] {
+            conn.query(&format!(
+                "CREATE (:Symbol {{id: '{id}', name: '{id}', kind: 'Class', file: 'a.py'}})"
+            ))
+            .unwrap();
+        }
+        for _ in 0..rows {
+            conn.query(
+                "MATCH (a:Symbol {id: 'a'}), (b:Symbol {id: 'b'}) CREATE (a)-[:INHERITS]->(b)",
+            )
+            .unwrap();
+        }
+    }
+    dir
+}
+
+#[test]
+fn doctor_warns_on_duplicate_keyless_edges_and_names_the_rebuild() {
+    use infigraph_core::doctor::check_keyless_edges;
+
+    let dir = graph_with_inherits_rows(2);
+    let ctx = ctx_for(
+        DoctorScope::Project(dir.path().to_path_buf()),
+        Registry::default(),
+    );
+
+    let checks = check_keyless_edges(&ctx);
+    let warned = checks
+        .iter()
+        .find(|c| c.status == CheckStatus::Warn && c.message.contains("duplicate edge rows"))
+        .unwrap_or_else(|| panic!("two rows for one pair must WARN: {checks:?}"));
+    assert!(
+        warned
+            .message
+            .contains("1 duplicate edge rows (INHERITS +1)"),
+        "{}",
+        warned.message
+    );
+    assert!(
+        warned.message.contains("not in footers"),
+        "the limit must be named in the message: {}",
+        warned.message
+    );
+    assert!(
+        warned
+            .remediation
+            .as_deref()
+            .unwrap_or_default()
+            .contains("infigraph rebuild"),
+        "{:?}",
+        warned.remediation
+    );
+}
+
+#[test]
+fn doctor_passes_when_every_keyless_table_holds_one_row_per_pair() {
+    use infigraph_core::doctor::check_keyless_edges;
+
+    let dir = graph_with_inherits_rows(1);
+    let ctx = ctx_for(
+        DoctorScope::Project(dir.path().to_path_buf()),
+        Registry::default(),
+    );
+
+    let checks = check_keyless_edges(&ctx);
+    assert!(
+        !checks.iter().any(|c| c.status == CheckStatus::Warn),
+        "one row per pair must not WARN: {checks:?}"
+    );
+    let passed = checks
+        .iter()
+        .find(|c| c.status == CheckStatus::Pass)
+        .unwrap_or_else(|| panic!("no pass result: {checks:?}"));
+    assert!(
+        passed
+            .message
+            .contains("7 keyless edge tables hold one row per pair"),
+        "{}",
+        passed.message
+    );
+}
