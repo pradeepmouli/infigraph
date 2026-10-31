@@ -22,6 +22,7 @@ use infigraph_core::git_blame::{self, RangeBlame, GIT_TIMEOUT};
 use crate::backend::DocBackend;
 use crate::code_links::LinkKind;
 use crate::link_check;
+use crate::stale_docs::newest;
 
 /// The reviews held for some targets.
 #[derive(Debug, Default)]
@@ -138,23 +139,23 @@ pub fn plan(root: &Path, targets: &[String]) -> Result<AckPlan> {
             ));
             continue;
         };
-        let lines = (symbol.start, symbol.end);
-        let blame = match git_blame::blame_ranges_cached(root, &symbol.file, &[lines], GIT_TIMEOUT)
-        {
-            Ok(blames) => blames.into_iter().next(),
-            Err(e) => {
-                report
-                    .refused
-                    .push((target.clone(), format!("git could not answer: {e}")));
-                continue;
-            }
-        };
+        let blame =
+            match git_blame::blame_ranges_cached(root, &symbol.file, &symbol.spans, GIT_TIMEOUT) {
+                Ok(blames) => newest(blames),
+                Err(e) => {
+                    report
+                        .refused
+                        .push((target.clone(), format!("git could not answer: {e}")));
+                    continue;
+                }
+            };
         match blame {
             Some(code) if code.dirty => report.refused.push((
                 target.clone(),
                 format!(
-                    "{}:{}-{} has uncommitted edits: commit them first, a review names a commit",
-                    symbol.file, lines.0, lines.1
+                    "{}:{} has uncommitted edits: commit them first, a review names a commit",
+                    symbol.file,
+                    symbol.lines_text()
                 ),
             )),
             Some(code) => {
@@ -168,8 +169,9 @@ pub fn plan(root: &Path, targets: &[String]) -> Result<AckPlan> {
             None => report.refused.push((
                 target.clone(),
                 format!(
-                    "git gave no answer for {}:{}-{}",
-                    symbol.file, lines.0, lines.1
+                    "git gave no answer for {}:{}",
+                    symbol.file,
+                    symbol.lines_text()
                 ),
             )),
         }

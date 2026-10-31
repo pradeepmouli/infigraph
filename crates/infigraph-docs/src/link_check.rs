@@ -62,12 +62,91 @@ pub(crate) fn with_docs<T>(
     }
 }
 
-/// A live symbol a key resolved to.
+/// A live symbol a key resolved to: its file and the first and last line of
+/// its declaration. A key that names a group of same-named symbols (see
+/// [`group_query`]) resolves to every member's span, so staleness is judged
+/// over all of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Live {
     pub file: String,
-    pub start: usize,
-    pub end: usize,
+    pub spans: Vec<(usize, usize)>,
+}
+
+impl Live {
+    pub(crate) fn single(file: &str, start: usize, end: usize) -> Self {
+        Live {
+            file: file.to_string(),
+            spans: vec![(start, end)],
+        }
+    }
+
+    /// The first line of the first span and the last line of the last one: the
+    /// lines of a symbol, or of a group from its first member to its last.
+    pub(crate) fn hull(&self) -> (usize, usize) {
+        let start = self.spans.iter().map(|s| s.0).min().unwrap_or(0);
+        let end = self.spans.iter().map(|s| s.1).max().unwrap_or(0);
+        (start, end)
+    }
+
+    /// Every span as `start-end`, for a message: `12-20, 40-44`.
+    pub(crate) fn lines_text(&self) -> String {
+        self.spans
+            .iter()
+            .map(|(s, e)| format!("{s}-{e}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// The query that reads the members of the groups `keys` name: every symbol
+/// whose id is `key#<something>`. Shared by [`resolve`] and by `linked`, which
+/// reads the same members through a backend rather than an executor.
+pub(crate) fn group_query(keys: &[&str]) -> String {
+    let filter = keys
+        .iter()
+        .map(|k| format!("s.id STARTS WITH '{}#'", escape_str(k)))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    format!("MATCH (s:Symbol) WHERE {filter} RETURN s.id, s.file, s.start_line, s.end_line")
+}
+
+/// The groups among `keys` from the rows [`group_query`] returned: a key whose
+/// members are `key#<digits>` ids, two or more of them. An id is a member of
+/// the key only through its own `#<digits>` suffix, so a member of another
+/// owner, another file, or a deeper symbol (`key#1::inner`) never joins it.
+pub(crate) fn groups_in(keys: &[&str], rows: &[Vec<String>]) -> HashMap<String, Live> {
+    let mut members: HashMap<&str, Live> = HashMap::new();
+    for row in rows {
+        let [id, file, start, end] = &row[..] else {
+            continue;
+        };
+        let (Ok(start), Ok(end)) = (start.parse::<usize>(), end.parse::<usize>()) else {
+            continue;
+        };
+        let Some(key) = keys.iter().copied().find(|k| is_member_of(id, k)) else {
+            continue;
+        };
+        members
+            .entry(key)
+            .or_insert_with(|| Live {
+                file: file.clone(),
+                spans: Vec::new(),
+            })
+            .spans
+            .push((start, end));
+    }
+    members
+        .into_iter()
+        .filter(|(_, group)| group.spans.len() >= 2)
+        .map(|(key, group)| (key.to_string(), group))
+        .collect()
+}
+
+/// Whether `id` is `key#<digits>`: one ordinal member of `key`.
+pub(crate) fn is_member_of(id: &str, key: &str) -> bool {
+    id.strip_prefix(key)
+        .and_then(|rest| rest.strip_prefix('#'))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Why a key resolves to nothing.
@@ -97,9 +176,10 @@ impl Miss {
         match self {
             Miss::Dotted { suggestion } => format!("{key}  ->  did you mean {suggestion}"),
             Miss::Numbered { count } => format!(
-                "{key}  ->  {count} symbols have that name; `#N` ids depend on source order and \
-                 cannot be keys (this is how members of an object literal nothing names, and \
-                 overloads, are numbered: do not key an entry on one)"
+                "{key}  ->  {count} symbols have that name as `name#N` ids (an object literal \
+                 nothing names, or an overload, is numbered this way); a bare key names them \
+                 only when two or more share the name, and a `#N` id follows source order: do \
+                 not key an entry on one"
             ),
             Miss::NoSuchSymbol if ends_in_ordinal(key) => format!(
                 "{key}  ->  a `#N` id follows source order and moves when the code does: do not \
@@ -121,7 +201,8 @@ fn rows_of(exec: &dyn QueryExec, cypher: &str) -> Vec<Vec<String>> {
 }
 
 /// Which of `keys` are live symbols (id -> where), and which `<file>::module`
-/// keys name a file the graph has.
+/// keys name a file the graph has. A key with no symbol of its own resolves to
+/// the group of same-named symbols it names, if there is one ([`groups_in`]).
 fn resolve(exec: &dyn QueryExec, keys: &[&str]) -> (HashMap<String, Live>, Vec<String>) {
     let mut live = HashMap::new();
     let mut modules = Vec::new();
@@ -140,16 +221,18 @@ fn resolve(exec: &dyn QueryExec, keys: &[&str]) -> (HashMap<String, Live>, Vec<S
         ) {
             if let [id, file, start, end] = &row[..] {
                 if let (Ok(start), Ok(end)) = (start.parse(), end.parse()) {
-                    live.insert(
-                        id.clone(),
-                        Live {
-                            file: file.clone(),
-                            start,
-                            end,
-                        },
-                    );
+                    live.insert(id.clone(), Live::single(file, start, end));
                 }
             }
+        }
+        let unresolved: Vec<&str> = batch
+            .iter()
+            .copied()
+            .filter(|k| !live.contains_key(*k))
+            .collect();
+        if !unresolved.is_empty() {
+            let rows = rows_of(exec, &group_query(&unresolved));
+            live.extend(groups_in(&unresolved, &rows));
         }
         let files: Vec<String> = batch
             .iter()
@@ -937,23 +1020,26 @@ mod tests {
 
     /// A repository where `code.py` changed after `doc.md` did, and one entry
     /// that links them.
+    /// Runs `git` in `dir` with both dates set to `date`.
+    fn git_at(dir: &Path, args: &[&str], date: &str) {
+        let out = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}");
+    }
+
     fn stale_repo() -> (tempfile::TempDir, Vec<(CodeLinkRow, Live)>) {
         let dir = tempfile::tempdir().unwrap();
-        let git = |args: &[&str], date: &str| {
-            let out = std::process::Command::new("git")
-                .args(["-c", "commit.gpgsign=false"])
-                .args(args)
-                .current_dir(dir.path())
-                .env("GIT_AUTHOR_DATE", date)
-                .env("GIT_COMMITTER_DATE", date)
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@t")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@t")
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "{args:?}");
-        };
+        let git = |args: &[&str], date: &str| git_at(dir.path(), args, date);
         git(&["init", "-q"], "2024-01-01T00:00:00Z");
         std::fs::write(dir.path().join("doc.md"), "### `code.py::f`\n\nWhy f.\n").unwrap();
         std::fs::write(dir.path().join("code.py"), "def f():\n    return 1\n").unwrap();
@@ -971,11 +1057,7 @@ mod tests {
             line_end: 3,
             text: String::new(),
         };
-        let live = Live {
-            file: "code.py".into(),
-            start: 1,
-            end: 2,
-        };
+        let live = Live::single("code.py", 1, 2);
         (dir, vec![(row, live)])
     }
 
@@ -1014,5 +1096,223 @@ mod tests {
             "coarse results must be labelled and counted apart:\n{message}"
         );
         assert!(message.contains("[coarse]"), "{message}");
+    }
+
+    /// Adds `(id, file, start, end)` symbols to `store`.
+    fn insert_symbols(
+        store: &infigraph_core::graph::GraphStore,
+        rows: &[(&str, &str, usize, usize)],
+    ) {
+        let conn = store.connection().unwrap();
+        for (id, file, start, end) in rows {
+            conn.query(&format!(
+                "CREATE (:Symbol {{id: '{id}', name: '{id}', kind: 'Variable', file: '{file}', \
+                 start_line: {start}, end_line: {end}, signature_hash: '', language: 'typescript', \
+                 visibility: '', parent: '', docstring: '', complexity: 0, parameters: '', \
+                 return_type: ''}})"
+            ))
+            .unwrap();
+        }
+    }
+
+    /// A graph of `(id, file, start, end)` symbols.
+    fn symbols(
+        rows: &[(&str, &str, usize, usize)],
+    ) -> (tempfile::TempDir, infigraph_core::graph::GraphStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = infigraph_core::graph::GraphStore::open(
+            &dir.path().join(infigraph_core::graph::names::STEM),
+        )
+        .unwrap();
+        insert_symbols(&store, rows);
+        (dir, store)
+    }
+
+    #[test]
+    fn key_is_live_accepts_the_bare_key_of_a_group() {
+        // `doc_entry` create and rekey ask this before writing an entry.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".infigraph");
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let store = infigraph_core::graph::GraphStore::open(
+                &dir.join(infigraph_core::graph::names::STEM),
+            )
+            .unwrap();
+            insert_symbols(
+                &store,
+                &[
+                    ("a.ts::Obj::k#1", "a.ts", 2, 3),
+                    ("a.ts::Obj::k#2", "a.ts", 5, 6),
+                ],
+            );
+        }
+        assert!(key_is_live(root.path(), "a.ts::Obj::k").unwrap());
+        assert!(!key_is_live(root.path(), "a.ts::Obj::gone").unwrap());
+    }
+
+    fn resolved(store: &infigraph_core::graph::GraphStore, keys: &[&str]) -> HashMap<String, Live> {
+        let conn = store.connection().unwrap();
+        resolve(&LocalExec::new(&conn), keys).0
+    }
+
+    #[test]
+    fn doctor_stops_listing_a_key_that_names_a_group() {
+        let (_dir, store) = symbols(&[
+            ("a.ts::Obj::k#1", "a.ts", 2, 3),
+            ("a.ts::Obj::k#2", "a.ts", 5, 6),
+        ]);
+        let conn = store.connection().unwrap();
+        let (_, unresolved) = unresolved_keys(
+            &LocalExec::new(&conn),
+            &["a.ts::Obj::k", "a.ts::Obj::gone"],
+            usize::MAX,
+        );
+        let keys: Vec<&str> = unresolved.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["a.ts::Obj::gone"]);
+    }
+
+    #[test]
+    fn a_bare_key_names_the_group_of_its_members() {
+        let (_dir, store) = symbols(&[
+            ("a.ts::Obj::k#1", "a.ts", 2, 3),
+            ("a.ts::Obj::k#2", "a.ts", 5, 6),
+            ("a.ts::Obj::k#3", "a.ts", 8, 9),
+        ]);
+        let live = resolved(&store, &["a.ts::Obj::k"]);
+        assert_eq!(live["a.ts::Obj::k"].file, "a.ts");
+        assert_eq!(
+            live["a.ts::Obj::k"].spans,
+            vec![(2, 3), (5, 6), (8, 9)],
+            "every member's span"
+        );
+    }
+
+    #[test]
+    fn an_exact_bare_symbol_wins_over_the_group_of_the_same_name() {
+        let (_dir, store) = symbols(&[
+            ("a.ts::Obj::k", "a.ts", 9, 9),
+            ("a.ts::Obj::k#1", "a.ts", 2, 3),
+            ("a.ts::Obj::k#2", "a.ts", 5, 6),
+        ]);
+        assert_eq!(
+            resolved(&store, &["a.ts::Obj::k"])["a.ts::Obj::k"].spans,
+            [(9, 9)]
+        );
+    }
+
+    #[test]
+    fn an_ordinal_key_still_selects_one_member() {
+        let (_dir, store) = symbols(&[
+            ("a.ts::Obj::k#1", "a.ts", 2, 3),
+            ("a.ts::Obj::k#2", "a.ts", 5, 6),
+        ]);
+        assert_eq!(
+            resolved(&store, &["a.ts::Obj::k#2"])["a.ts::Obj::k#2"].spans,
+            [(5, 6)]
+        );
+    }
+
+    #[test]
+    fn groups_do_not_merge_across_owners_or_files() {
+        let (_dir, store) = symbols(&[
+            ("a.ts::A::k#1", "a.ts", 2, 3),
+            ("a.ts::A::k#2", "a.ts", 5, 6),
+            ("a.ts::B::k#1", "a.ts", 8, 8),
+            ("a.ts::B::k#2", "a.ts", 10, 10),
+            ("b.ts::A::k#1", "b.ts", 1, 1),
+            ("b.ts::A::k#2", "b.ts", 2, 2),
+        ]);
+        assert_eq!(
+            resolved(&store, &["a.ts::A::k"])["a.ts::A::k"].spans,
+            [(2, 3), (5, 6)],
+            "only the members of A in a.ts"
+        );
+    }
+
+    #[test]
+    fn a_nested_symbol_is_not_a_member_of_the_group() {
+        let (_dir, store) = symbols(&[
+            ("a.ts::Obj::k#1", "a.ts", 2, 3),
+            ("a.ts::Obj::k#1::inner", "a.ts", 2, 2),
+            ("a.ts::Obj::k#2", "a.ts", 5, 6),
+        ]);
+        assert_eq!(
+            resolved(&store, &["a.ts::Obj::k"])["a.ts::Obj::k"].spans,
+            [(2, 3), (5, 6)]
+        );
+    }
+
+    #[test]
+    fn one_member_is_not_a_group() {
+        let (_dir, store) = symbols(&[("a.ts::X::k#1", "a.ts", 2, 3)]);
+        assert!(!resolved(&store, &["a.ts::X::k"]).contains_key("a.ts::X::k"));
+    }
+
+    /// `code.py` with two members of one name, `f` at lines 1-2 and 3-4,
+    /// committed on 2024-01-01; then only the second body changes, on 2024-06-01.
+    fn group_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str], date: &str| git_at(dir.path(), args, date);
+        git(&["init", "-q"], "2024-01-01T00:00:00Z");
+        std::fs::write(dir.path().join("doc.md"), "### `code.py::f`\n\nWhy f.\n").unwrap();
+        std::fs::write(
+            dir.path().join("code.py"),
+            "def f():\n    return 1\ndef f():\n    return 2\n",
+        )
+        .unwrap();
+        git(&["add", "."], "2024-01-01T00:00:00Z");
+        git(&["commit", "-q", "-m", "one"], "2024-01-01T00:00:00Z");
+        std::fs::write(
+            dir.path().join("code.py"),
+            "def f():\n    return 1\ndef f():\n    return 3\n",
+        )
+        .unwrap();
+        git(&["commit", "-q", "-am", "two"], "2024-06-01T00:00:00Z");
+        dir
+    }
+
+    #[test]
+    fn a_group_is_stale_when_any_member_changed_not_only_the_first() {
+        let dir = group_repo();
+        let row = CodeLinkRow {
+            id: "doc.md#0".into(),
+            doc_file: "doc.md".into(),
+            kind: LinkKind::Documents,
+            target: "code.py::f".into(),
+            heading: "`code.py::f`".into(),
+            line_start: 1,
+            line_end: 3,
+            text: String::new(),
+        };
+        let state = |live: Live| {
+            judge(
+                dir.path(),
+                &[(row.clone(), live)],
+                Instant::now(),
+                SYNC_BUDGET,
+            )
+            .judged[0]
+                .state
+                .clone()
+        };
+        assert!(
+            matches!(
+                state(Live::single("code.py", 1, 2)),
+                infigraph_core::git_blame::SyncState::InSync
+            ),
+            "the first member alone is unchanged since the entry"
+        );
+        let grouped = Live {
+            file: "code.py".into(),
+            spans: vec![(1, 2), (3, 4)],
+        };
+        assert!(
+            matches!(
+                state(grouped),
+                infigraph_core::git_blame::SyncState::PossiblyStale { .. }
+            ),
+            "the second member changed after the entry"
+        );
     }
 }

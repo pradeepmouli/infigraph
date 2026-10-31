@@ -127,6 +127,13 @@ pub(crate) fn verdict(target: &str, code: &RangeBlame, entry: &RangeBlame, acks:
     }
 }
 
+/// The newest change among several ranges of one symbol (a group's members):
+/// the one a union of them was last changed by. Uncommitted wins over any
+/// commit, as it does in `compare`.
+pub(crate) fn newest(blames: Vec<RangeBlame>) -> Option<RangeBlame> {
+    blames.into_iter().max_by_key(|b| (b.dirty, b.time))
+}
+
 /// The outcome of [`judge`].
 pub(crate) struct Judgement {
     pub judged: Vec<Judged>,
@@ -162,7 +169,7 @@ pub(crate) fn judge(
         ranges
             .entry(live.file.as_str())
             .or_default()
-            .push((live.start, live.end));
+            .extend(live.spans.iter().copied());
         ranges
             .entry(row.doc_file.as_str())
             .or_default()
@@ -211,7 +218,13 @@ pub(crate) fn judge(
     let mut judged = Vec::new();
     let mut unknown = 0usize;
     for (row, live) in entries {
-        let exact_pair = lookup(&live.file, (live.start, live.end))
+        let code: Option<Vec<RangeBlame>> = live
+            .spans
+            .iter()
+            .map(|span| lookup(&live.file, *span))
+            .collect();
+        let exact_pair = code
+            .and_then(newest)
             .zip(lookup(&row.doc_file, (row.line_start, row.line_end)));
         let (pair, is_exact) = match exact_pair {
             Some(pair) => (Some(pair), true),
@@ -432,7 +445,7 @@ pub fn stale_docs(root: &Path, options: &Options) -> Report {
             git_blame::changes_since(
                 root,
                 &j.live.file,
-                (j.live.start, j.live.end),
+                j.live.hull(),
                 &entry.commit,
                 options.caps.commits,
                 GIT_TIMEOUT,
@@ -449,7 +462,7 @@ pub fn stale_docs(root: &Path, options: &Options) -> Report {
             doc_file: j.doc_file.clone(),
             doc_lines: j.doc_lines,
             code_file: j.live.file.clone(),
-            code_lines: (j.live.start, j.live.end),
+            code_lines: j.live.hull(),
             state: j.state.clone(),
             exact: j.exact,
             changes,
@@ -760,11 +773,7 @@ mod tests {
             key: key.to_string(),
             doc_file: "d.md".to_string(),
             doc_lines: (1, 2),
-            live: Live {
-                file: "a.py".to_string(),
-                start: 1,
-                end: 2,
-            },
+            live: Live::single("a.py", 1, 2),
             state: git_blame::compare(&at("b", code_time), &at("a", entry_time)),
             acknowledged: false,
             exact: true,
