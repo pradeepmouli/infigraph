@@ -27,6 +27,10 @@
 //!    a quoted member name is unquoted (`file::Flags::c-strings`, not
 //!    `'c-strings'`); a TypeScript namespace is an owner, nested ones in order
 //!    (`file::Pattern::Map`, `file::Literal::String::C`).
+//! 4: an object-literal member with a quoted key is named by its key and owned
+//!    by the literal it sits in (`file::ENRICH_SHAPES::unfielded-symbol-slot`),
+//!    not by scip-typescript's `'unfielded-symbol-slot'0` with no owner; a
+//!    member is a variable, not a function.
 
 use std::path::Path;
 
@@ -35,7 +39,7 @@ use super::query_exec::{LocalExec, QueryExec};
 use super::GraphStore;
 
 /// The scheme this binary writes.
-pub const ID_SCHEME: i64 = 3;
+pub const ID_SCHEME: i64 = 4;
 
 /// The scheme a graph is stamped with: 0 for one that predates the stamp (the
 /// row missing or NULL reads as 0). `None` when the query itself failed: that is

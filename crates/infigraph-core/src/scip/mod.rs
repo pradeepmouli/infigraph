@@ -1627,15 +1627,24 @@ pub fn use_language_registry(registry: Arc<crate::lang::LanguageRegistry>) {
 /// is the key and the indexer's per-file counter). The key is read from the
 /// file as it is now, the index may be older: a shifted line puts the position
 /// on another member, whose name is then not this moniker's.
+///
+/// scip-typescript spells a key that is not an identifier with its quotes, so
+/// the moniker's descriptor is `'a-b'0` or `"a-b"0` while `key` is `a-b`: both
+/// spellings are tried. `key` is the source's text between the quotes, which
+/// the moniker repeats as written (`'it\'s'0`).
 fn names_literal_key(scip_sym: &str, key: &str) -> bool {
+    let spellings = [key.to_string(), format!("'{key}'"), format!("\"{key}\"")];
     scip_descriptors(scip_sym)
         .and_then(|mut d| d.pop())
-        .and_then(|last| {
-            last.name
-                .strip_prefix(key)
-                .map(|counter| !counter.is_empty() && counter.bytes().all(|b| b.is_ascii_digit()))
+        .is_some_and(|last| {
+            spellings.iter().any(|spelled| {
+                last.name
+                    .strip_prefix(spelled.as_str())
+                    .is_some_and(|counter| {
+                        !counter.is_empty() && counter.bytes().all(|b| b.is_ascii_digit())
+                    })
+            })
         })
-        .unwrap_or(false)
 }
 
 /// scip-typescript names an object-literal member `<key><N>:` -- the key and
@@ -2008,7 +2017,11 @@ fn without_ordinal(id: &str) -> &str {
 /// reports none at all), read from the last descriptor of its moniker: a
 /// namespace is a module, a term (a property or variable) a variable, and a
 /// type a class (a moniker cannot tell a class from an interface or a type
-/// alias). A method is a method when a type owns it, else a function.
+/// alias). A meta descriptor (`:`) that is an object-literal member (a key
+/// and a counter, `is_literal_member_moniker`) is a property, so a variable,
+/// like a term. Other meta descriptors keep their kind: scip-python gives the
+/// file-level module `mod/__init__:`, which is not a variable. A method is a
+/// method when a type owns it, else a function.
 fn scip_kind_from_moniker(scip_sym: &str) -> SymbolKind {
     let Some(descriptors) = scip_descriptors(scip_sym) else {
         return SymbolKind::Function;
@@ -2019,6 +2032,7 @@ fn scip_kind_from_moniker(scip_sym: &str) -> SymbolKind {
     match last.kind {
         DescriptorKind::Namespace => SymbolKind::Module,
         DescriptorKind::Term => SymbolKind::Variable,
+        DescriptorKind::Meta if is_literal_member_moniker(scip_sym) => SymbolKind::Variable,
         DescriptorKind::Type => SymbolKind::Class,
         DescriptorKind::Method
             if before
@@ -3739,10 +3753,35 @@ mod tests {
             (format!("{ts}f()."), SymbolKind::Function),
             (format!("{ts}N/f()."), SymbolKind::Function),
             (format!("{ts}N/Map#"), SymbolKind::Class),
+            // An object-literal member is a meta descriptor: a variable, bare or quoted.
+            (format!("{ts}bare0:"), SymbolKind::Variable),
+            (
+                format!("{ts}`'unfielded-symbol-slot'0`:"),
+                SymbolKind::Variable,
+            ),
+            (format!("{ts}`\"dq-key\"0`:"), SymbolKind::Variable),
+            // scip-python's file-level module is a meta descriptor with no counter: not a member.
+            (format!("{ts}mod/__init__:"), SymbolKind::Function),
         ] {
             assert_eq!(scip_kind_from_moniker(&sym), want, "{sym}");
         }
         assert_eq!(scip_kind_from_moniker("garbage"), SymbolKind::Function);
+    }
+
+    #[test]
+    fn a_quoted_literal_key_matches_its_moniker_in_either_quote_style() {
+        let ts = "scip-typescript npm t 1.0.0 `a.ts`/";
+        assert!(names_literal_key(
+            &format!("{ts}`'unfielded-symbol-slot'0`:"),
+            "unfielded-symbol-slot"
+        ));
+        assert!(names_literal_key(&format!("{ts}`\"dq-key\"0`:"), "dq-key"));
+        assert!(names_literal_key(&format!("{ts}`'it\\'s'0`:"), "it\\'s"));
+        assert!(names_literal_key(&format!("{ts}bare0:"), "bare"));
+        assert!(
+            !names_literal_key(&format!("{ts}`'a-b'0`:"), "a"),
+            "a prefix of the key is not the key"
+        );
     }
 
     /// #176: INHERITS is keyless too.
