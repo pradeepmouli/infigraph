@@ -937,6 +937,97 @@ fn pair_edge_statement_with(
     )
 }
 
+/// The `{a, b}` literal list [`pair_edge_statement`] takes, for pairs of ids.
+pub(crate) fn pair_literals(pairs: &[(String, String)]) -> String {
+    pairs
+        .iter()
+        .map(|(src, dst)| format!("{{a: '{}', b: '{}'}}", escape(src), escape(dst)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Pairs per write statement in [`write_absent_edges`].
+const PAIRS_PER_WRITE: usize = 2000;
+
+/// Appends the `rel` edges of `pairs` that [`absent_edges`] lets through, in
+/// chunks. Every per-file and bulk writer of a keyless table calls this rather
+/// than writing its own pair list.
+pub(crate) fn write_absent_edges<S: AsRef<str>, D: AsRef<str>>(
+    conn: &Connection<'_>,
+    src_label: &str,
+    dst_label: &str,
+    rel: &str,
+    pairs: &[(S, D)],
+) -> Result<()> {
+    let owned: Vec<(String, String)> = pairs
+        .iter()
+        .map(|(src, dst)| (src.as_ref().to_string(), dst.as_ref().to_string()))
+        .collect();
+    let owned = absent_edges(conn, rel, src_label, dst_label, owned)?;
+    for chunk in owned.chunks(PAIRS_PER_WRITE) {
+        let _ = conn.query(&pair_edge_statement(
+            src_label,
+            dst_label,
+            rel,
+            &pair_literals(chunk),
+        ));
+    }
+    Ok(())
+}
+
+/// Source ids per existence query in [`absent_edges`].
+const EXISTING_SOURCES_PER_QUERY: usize = 1000;
+
+/// The `(source, target)` pairs of `table` the graph does not hold yet, each
+/// once, in their original order.
+///
+/// Every writer of a keyless edge table (CALLS, INHERITS, ...) comes through
+/// here, because such a table has no uniqueness: a COPY or CREATE appends
+/// whatever it is handed, and an edge written twice stays twice. The check
+/// covers the edges already in the graph and repeats inside `pairs`. It looks
+/// up only the batch's own sources, in chunks, so its cost follows the batch,
+/// not the size of the table.
+pub(crate) fn absent_edges(
+    conn: &Connection<'_>,
+    table: &str,
+    src_label: &str,
+    dst_label: &str,
+    pairs: Vec<(String, String)>,
+) -> Result<Vec<(String, String)>> {
+    if pairs.is_empty() {
+        return Ok(pairs);
+    }
+    let sources: Vec<&str> = pairs
+        .iter()
+        .map(|(src, _)| src.as_str())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let mut present: HashSet<(String, String)> = HashSet::new();
+    for chunk in sources.chunks(EXISTING_SOURCES_PER_QUERY) {
+        let ids: Vec<String> = chunk.iter().map(|s| format!("'{}'", escape(s))).collect();
+        let rows = conn
+            .query(&format!(
+                "MATCH (a:{src_label})-[:{table}]->(b:{dst_label}) WHERE a.id IN [{}] RETURN a.id, b.id",
+                ids.join(", ")
+            ))
+            .map_err(|e| anyhow::anyhow!("reading the existing {table} edges: {e}"))?;
+        for row in rows {
+            if row.len() >= 2 {
+                present.insert((
+                    raw_string(&row[0]).to_string(),
+                    raw_string(&row[1]).to_string(),
+                ));
+            }
+        }
+    }
+    let mut seen = present;
+    Ok(pairs
+        .into_iter()
+        .filter(|pair| seen.insert(pair.clone()))
+        .collect())
+}
+
 /// One parent to many children (CONTAINS, DEFINES): the parent by primary
 /// key, then each child id of `child_ids_literal` (already escaped, quoted)
 /// by primary-key lookup -- not `s.id IN [...]`, which full-scans the
@@ -1107,6 +1198,70 @@ mod tests {
             .and_then(|row| row.first().map(|v| v.to_string()))
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap()
+    }
+
+    fn write_calls(store: &super::super::GraphStore, pairs: &[(&str, &str)]) {
+        let conn = store.connection().unwrap();
+        super::write_absent_edges(&conn, "Symbol", "Symbol", "CALLS", pairs).unwrap();
+    }
+
+    #[test]
+    fn writing_the_same_pairs_again_adds_no_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_symbols(tmp.path(), 3);
+        let pairs = [("a.py::s0", "a.py::s1"), ("a.py::s1", "a.py::s2")];
+
+        write_calls(&store, &pairs);
+        write_calls(&store, &pairs);
+        write_calls(&store, &pairs);
+
+        assert_eq!(calls_edge_count(&store), 2, "one row per distinct pair");
+    }
+
+    #[test]
+    fn a_batch_repeating_a_pair_or_an_existing_edge_writes_only_the_new_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_symbols(tmp.path(), 3);
+        write_calls(&store, &[("a.py::s0", "a.py::s1")]);
+
+        let batch: Vec<(String, String)> = vec![
+            ("a.py::s0".into(), "a.py::s1".into()),
+            ("a.py::s0".into(), "a.py::s2".into()),
+            ("a.py::s0".into(), "a.py::s2".into()),
+        ];
+        let conn = store.connection().unwrap();
+        let fresh = super::absent_edges(&conn, "CALLS", "Symbol", "Symbol", batch).unwrap();
+        assert_eq!(
+            fresh,
+            vec![("a.py::s0".to_string(), "a.py::s2".to_string())],
+            "the existing edge and the in-batch repeat are both dropped"
+        );
+    }
+
+    #[test]
+    fn absent_edges_checks_every_source_chunk_not_only_the_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let n = super::EXISTING_SOURCES_PER_QUERY + 50;
+        let store = store_with_symbols(tmp.path(), n);
+        // A source in the second lookup chunk already has its edge.
+        let late = format!("a.py::s{}", n - 1);
+        write_calls(&store, &[(late.as_str(), "a.py::s0")]);
+
+        let batch: Vec<(String, String)> = (0..n)
+            .map(|i| (format!("a.py::s{i}"), "a.py::s0".to_string()))
+            .collect();
+        let conn = store.connection().unwrap();
+        let fresh = super::absent_edges(&conn, "CALLS", "Symbol", "Symbol", batch).unwrap();
+
+        assert_eq!(
+            fresh.len(),
+            n - 1,
+            "the edge from the second chunk's source must not be written again"
+        );
+        assert!(
+            fresh.iter().all(|(src, _)| src != &late),
+            "{late} already has its edge"
+        );
     }
 
     #[test]

@@ -204,55 +204,19 @@ impl GraphStore {
                 _ => {}
             }
         }
-        for (pairs, rel_type) in [
-            (&calls_pairs, "CALLS"),
-            (&inherits_pairs, "INHERITS"),
-            (&tested_by_pairs, "TESTED_BY"),
-            (&reads_pairs, "READS"),
-            (&writes_pairs, "WRITES"),
+        for (rel_type, pairs) in [
+            ("CALLS", &calls_pairs),
+            ("INHERITS", &inherits_pairs),
+            ("TESTED_BY", &tested_by_pairs),
+            ("READS", &reads_pairs),
+            ("WRITES", &writes_pairs),
         ] {
-            if pairs.is_empty() {
-                continue;
-            }
-            let pair_list: Vec<String> = pairs
-                .iter()
-                .map(|(a, b)| format!("{{a: '{}', b: '{}'}}", escape(a), escape(b)))
-                .collect();
-            let batch_rel = super::store_util::pair_edge_statement(
-                "Symbol",
-                "Symbol",
-                rel_type,
-                &pair_list.join(", "),
-            );
-            let _ = conn.query(&batch_rel);
+            super::store_util::write_absent_edges(conn, "Symbol", "Symbol", rel_type, pairs)?;
         }
-        if !imports_pairs.is_empty() {
-            let pair_list: Vec<String> = imports_pairs
-                .iter()
-                .map(|(a, b)| format!("{{a: '{}', b: '{}'}}", escape(a), escape(b)))
-                .collect();
-            let _ = conn.query(&super::store_util::pair_edge_statement(
-                "Module",
-                "Module",
-                "IMPORTS",
-                &pair_list.join(", "),
-            ));
-        }
+        super::store_util::write_absent_edges(conn, "Module", "Module", "IMPORTS", &imports_pairs)?;
         for (edge_name, pairs) in &custom_pairs {
-            if pairs.is_empty() {
-                continue;
-            }
             let _ = ensure_custom_edge_table(conn, edge_name);
-            let pair_list: Vec<String> = pairs
-                .iter()
-                .map(|(a, b)| format!("{{a: '{}', b: '{}'}}", escape(a), escape(b)))
-                .collect();
-            let _ = conn.query(&super::store_util::pair_edge_statement(
-                "Symbol",
-                "Symbol",
-                edge_name,
-                &pair_list.join(", "),
-            ));
+            super::store_util::write_absent_edges(conn, "Symbol", "Symbol", edge_name, pairs)?;
         }
 
         // Insert Statement nodes + HAS_STATEMENT edges
