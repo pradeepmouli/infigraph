@@ -134,38 +134,28 @@ impl GraphStore {
                 .push(e.file.as_str());
         }
 
-        // 6. All relation edges grouped by type
-        let mut calls_pairs: Vec<String> = Vec::new();
-        let mut inherits_pairs: Vec<String> = Vec::new();
-        let mut tested_by_pairs: Vec<String> = Vec::new();
-        let mut imports_pairs: Vec<String> = Vec::new();
-        let mut reads_pairs: Vec<String> = Vec::new();
-        let mut writes_pairs: Vec<String> = Vec::new();
-        let mut custom_pairs: HashMap<String, Vec<String>> = HashMap::new();
+        // 6. All relation edges grouped by type. Pairs stay as (source, target)
+        // until the write, so `absent_edges` checks real ids.
+        let mut calls_pairs: Vec<(String, String)> = Vec::new();
+        let mut inherits_pairs: Vec<(String, String)> = Vec::new();
+        let mut tested_by_pairs: Vec<(String, String)> = Vec::new();
+        let mut imports_pairs: Vec<(String, String)> = Vec::new();
+        let mut reads_pairs: Vec<(String, String)> = Vec::new();
+        let mut writes_pairs: Vec<(String, String)> = Vec::new();
+        let mut custom_pairs: HashMap<String, Vec<(String, String)>> = HashMap::new();
         for e in extractions {
             for rel in &e.relations {
+                let edge = || (rel.source_id.clone(), rel.target_id.clone());
                 match &rel.kind {
-                    RelationKind::Calls | RelationKind::CalledBy => calls_pairs.push(format!(
-                        "{{a: '{}', b: '{}'}}",
-                        escape(&rel.source_id),
-                        escape(&rel.target_id)
-                    )),
+                    RelationKind::Calls | RelationKind::CalledBy => calls_pairs.push(edge()),
                     RelationKind::Inherits | RelationKind::InheritedBy => {
-                        inherits_pairs.push(format!(
-                            "{{a: '{}', b: '{}'}}",
-                            escape(&rel.source_id),
-                            escape(&rel.target_id)
-                        ))
+                        inherits_pairs.push(edge())
                     }
-                    RelationKind::TestedBy | RelationKind::Tests => tested_by_pairs.push(format!(
-                        "{{a: '{}', b: '{}'}}",
-                        escape(&rel.source_id),
-                        escape(&rel.target_id)
-                    )),
+                    RelationKind::TestedBy | RelationKind::Tests => tested_by_pairs.push(edge()),
                     RelationKind::Imports | RelationKind::ImportedBy => {
                         // target_id is "{file}::{module_name}"; resolve the bare
                         // module name to the imported file's Module id. Skip
-                        // external/unresolvable imports (e.g. "fastapi") — they
+                        // external/unresolvable imports (e.g. "fastapi") -- they
                         // have no Module node in this project.
                         let module_name =
                             rel.target_id.rsplit("::").next().unwrap_or(&rel.target_id);
@@ -175,73 +165,34 @@ impl GraphStore {
                                 resolve_import_candidate(module_name, candidates)
                             {
                                 if target_file != rel.source_id {
-                                    imports_pairs.push(format!(
-                                        "{{a: '{}', b: '{}'}}",
-                                        escape(&rel.source_id),
-                                        escape(target_file)
-                                    ));
+                                    imports_pairs
+                                        .push((rel.source_id.clone(), target_file.to_string()));
                                 }
                             }
                         }
                     }
-                    RelationKind::Reads => reads_pairs.push(format!(
-                        "{{a: '{}', b: '{}'}}",
-                        escape(&rel.source_id),
-                        escape(&rel.target_id)
-                    )),
-                    RelationKind::Writes => writes_pairs.push(format!(
-                        "{{a: '{}', b: '{}'}}",
-                        escape(&rel.source_id),
-                        escape(&rel.target_id)
-                    )),
+                    RelationKind::Reads => reads_pairs.push(edge()),
+                    RelationKind::Writes => writes_pairs.push(edge()),
                     RelationKind::Custom(name) => {
-                        custom_pairs.entry(name.clone()).or_default().push(format!(
-                            "{{a: '{}', b: '{}'}}",
-                            escape(&rel.source_id),
-                            escape(&rel.target_id)
-                        ));
+                        custom_pairs.entry(name.clone()).or_default().push(edge());
                     }
                     _ => {}
                 }
             }
         }
-        for (pairs, rel_type) in [
-            (&calls_pairs, "CALLS"),
-            (&inherits_pairs, "INHERITS"),
-            (&tested_by_pairs, "TESTED_BY"),
-            (&reads_pairs, "READS"),
-            (&writes_pairs, "WRITES"),
+        for (rel_type, pairs) in [
+            ("CALLS", &calls_pairs),
+            ("INHERITS", &inherits_pairs),
+            ("TESTED_BY", &tested_by_pairs),
+            ("READS", &reads_pairs),
+            ("WRITES", &writes_pairs),
         ] {
-            for chunk in pairs.chunks(SYM_CHUNK) {
-                let _ = conn.query(&super::store_util::pair_edge_statement(
-                    "Symbol",
-                    "Symbol",
-                    rel_type,
-                    &chunk.join(", "),
-                ));
-            }
+            super::store_util::write_absent_edges(conn, "Symbol", "Symbol", rel_type, pairs)?;
         }
-        for chunk in imports_pairs.chunks(SYM_CHUNK) {
-            let _ = conn.query(&super::store_util::pair_edge_statement(
-                "Module",
-                "Module",
-                "IMPORTS",
-                &chunk.join(", "),
-            ));
-        }
+        super::store_util::write_absent_edges(conn, "Module", "Module", "IMPORTS", &imports_pairs)?;
         for (edge_name, pairs) in &custom_pairs {
-            if pairs.is_empty() {
-                continue;
-            }
             let _ = ensure_custom_edge_table(conn, edge_name);
-            for chunk in pairs.chunks(SYM_CHUNK) {
-                let _ = conn.query(&super::store_util::pair_edge_statement(
-                    "Symbol",
-                    "Symbol",
-                    edge_name,
-                    &chunk.join(", "),
-                ));
-            }
+            super::store_util::write_absent_edges(conn, "Symbol", "Symbol", edge_name, pairs)?;
         }
 
         // Statement nodes + HAS_STATEMENT edges

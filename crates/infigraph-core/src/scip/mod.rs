@@ -125,10 +125,6 @@ fn preload_symbol_edges(conn: &kuzu::Connection<'_>, table: &str) -> Result<Symb
     Ok(edges)
 }
 
-fn edge_exists(edges: &SymbolEdges, (src, dst): &(String, String)) -> bool {
-    edges.get(src).is_some_and(|targets| targets.contains(dst))
-}
-
 /// A symbol's enrichment as one comparable value (#178): a re-import skips
 /// the `SET` for a symbol whose docstring and scip_id already match, so an
 /// unchanged index stops rewriting every enriched row each round. A hash
@@ -557,7 +553,6 @@ fn import_scip_index_unrecorded(
     // from). See the sibling Symbol preload below for why a failure here must
     // propagate.
     let existing_calls = preload_symbol_edges(&conn, "CALLS")?;
-    let existing_inherits = preload_symbol_edges(&conn, "INHERITS")?;
     clock.lap("lock+preload edges");
 
     // Pre-load all symbols from graph into memory: (file, name) -> Vec<(start_line,
@@ -1315,7 +1310,7 @@ fn import_scip_index_unrecorded(
             }
 
             let edge = (container_id, target_id);
-            if !edge_exists(&existing_calls, &edge) && seen_edges.insert(edge.clone()) {
+            if seen_edges.insert(edge.clone()) {
                 calls_to_create.push(edge);
             }
         }
@@ -1323,6 +1318,13 @@ fn import_scip_index_unrecorded(
 
     // Bulk write CALLS edges via Parquet COPY FROM, dropping any bad-PK
     // record and retrying rather than falling back to UNWIND for the batch.
+    let calls_to_create = crate::graph::store_util::absent_edges(
+        &conn,
+        "CALLS",
+        "Symbol",
+        "Symbol",
+        calls_to_create,
+    )?;
     if !calls_to_create.is_empty() {
         let edge_pq = staging_parquet("infigraph_scip_calls");
         stats.references_added = calls_to_create.len();
@@ -1370,7 +1372,7 @@ fn import_scip_index_unrecorded(
                 }
 
                 let edge = (source_id.clone(), target_id);
-                if !edge_exists(&existing_inherits, &edge) && seen_inherits.insert(edge.clone()) {
+                if seen_inherits.insert(edge.clone()) {
                     inherits_to_create.push(edge);
                 }
             }
@@ -1379,6 +1381,13 @@ fn import_scip_index_unrecorded(
 
     // Bulk write INHERITS edges via Parquet COPY FROM, dropping any bad-PK
     // record and retrying rather than falling back to UNWIND for the batch.
+    let inherits_to_create = crate::graph::store_util::absent_edges(
+        &conn,
+        "INHERITS",
+        "Symbol",
+        "Symbol",
+        inherits_to_create,
+    )?;
     if !inherits_to_create.is_empty() {
         // Run-unique name (#139): two concurrent imports -- a user-run
         // `scip-enrich`/`index --full` alongside the daemon's own
@@ -3665,7 +3674,7 @@ mod tests {
 
         let edges = preload_symbol_edges(&conn, "CALLS").unwrap();
         assert!(
-            edge_exists(&edges, &(a.to_string(), b.to_string())),
+            edges.get(a).is_some_and(|targets| targets.contains(b)),
             "the preload must hold the ids exactly: {edges:?}"
         );
     }

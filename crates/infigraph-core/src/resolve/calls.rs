@@ -840,6 +840,9 @@ fn write_resolved_calls(
         stats,
     } = resolve_pairs(extractions, symbol_map, learned_store);
 
+    // Only the edges the graph does not hold yet: a re-resolution of a file
+    // whose edges were not deleted first would append every one again.
+    let pairs = crate::graph::store_util::absent_edges(conn, "CALLS", "Symbol", "Symbol", pairs)?;
     if !pairs.is_empty() {
         let pq_path = staging_parquet("infigraph_resolve_calls");
         copy_edges_with_bad_record_retry(store, "CALLS", pairs, "Symbol", "Symbol", &pq_path)?;

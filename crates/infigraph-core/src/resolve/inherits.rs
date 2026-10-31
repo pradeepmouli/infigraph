@@ -183,6 +183,14 @@ pub(crate) fn resolve_inherits(
         .into_iter()
         .map(|(a, b)| (a.clone(), b.clone()))
         .collect();
+    // Only the edges the graph does not hold yet: the upsert of the same file
+    // may already have written some of these (see `absent_edges`).
+    let conn = store.connection()?;
+    let pairs =
+        crate::graph::store_util::absent_edges(&conn, "INHERITS", "Symbol", "Symbol", pairs)?;
+    if pairs.is_empty() {
+        return Ok(0);
+    }
     let pq_path = staging_parquet("infigraph_resolve_inherits");
     copy_edges_with_bad_record_retry(store, "INHERITS", pairs, "Symbol", "Symbol", &pq_path)?;
 
