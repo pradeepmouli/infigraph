@@ -120,6 +120,37 @@ pub fn run_at_background_priority(command: &mut Command) {
     let _ = command;
 }
 
+/// On macOS, starts `command` in the system's background policy
+/// (`PRIO_DARWIN_BG`, what `taskpolicy -b` sets); elsewhere it changes nothing.
+///
+/// Nice alone does nothing there once every core is busy (measured: a nice 10
+/// spinner got the same share of the CPU as an ordinary one), while a
+/// background process is starved of CPU and has its disk I/O throttled. It has
+/// to be the *process* policy, set between fork and exec. A thread's QoS class
+/// is not inherited by what the thread spawns, and one set before `exec` is
+/// lost at it; the policy is kept by every thread the child starts afterwards
+/// and by all its descendants (node workers, rust-analyzer's proc-macro server,
+/// cargo and the build scripts it runs). Whether this puts the child on the
+/// efficiency cores was not observed, only that it is starved when the machine
+/// is busy -- so much so that a wall-clock timeout counts the starvation as a
+/// hang, which is why `[scip] background` can turn it off.
+pub fn join_background_policy(command: &mut Command) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: only async-signal-safe `setpriority` runs between fork and
+        // exec, and its failure is deliberately ignored.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setpriority(libc::PRIO_DARWIN_PROCESS as _, 0, libc::PRIO_DARWIN_BG);
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = command;
+}
+
 /// Whether `child` has exited, without reaping it: the exit status stays
 /// pending and the pid stays ours. That is what makes "signal the group, then
 /// reap" possible -- once a leader is reaped its pid is free to be reused, so
@@ -911,6 +942,81 @@ mod tests {
         assert!(
             nice > own,
             "the lowered child ({nice}) is not nicer than an ordinary one ({own})"
+        );
+    }
+
+    /// The scheduling priority `ps` shows for `pid` (lower is less urgent). The
+    /// only view of another process's background policy: `getpriority` answers 0
+    /// for any pid but our own. On macOS a process in the background policy
+    /// shows a far lower value than one that is only `nice`d.
+    #[cfg(target_os = "macos")]
+    fn scheduling_priority(pid: u32) -> i32 {
+        let out = Command::new("ps")
+            .args(["-o", "pri=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps runs");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("ps prints a priority")
+    }
+
+    /// The priority of a child that is only `nice`d, which is all the child got
+    /// before the background policy: the baseline a background child must beat.
+    #[cfg(target_os = "macos")]
+    fn nice_only_priority() -> i32 {
+        use std::os::unix::process::CommandExt;
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        // SAFETY: only async-signal-safe `setpriority` runs between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setpriority(libc::PRIO_PROCESS as _, 0, BACKGROUND_NICE);
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().expect("sleep starts");
+        let priority = scheduling_priority(child.id());
+        child.kill().ok();
+        child.wait().ok();
+        priority
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_background_child_and_what_it_starts_are_below_one_that_is_only_niced() {
+        use std::io::{BufRead, BufReader};
+        // `sh` starts a `sleep` and prints its pid: the grandchild.
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 30 & echo $!; wait"])
+            .stdout(std::process::Stdio::piped());
+        run_at_background_priority(&mut command);
+        join_background_policy(&mut command);
+        let mut child = command.spawn().expect("sh starts");
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let grandchild: u32 = line.trim().parse().expect("the sleep's pid");
+        let (child_priority, grandchild_priority) = (
+            scheduling_priority(child.id()),
+            scheduling_priority(grandchild),
+        );
+        // SAFETY: the grandchild is a process this test started.
+        unsafe { libc::kill(grandchild as _, libc::SIGKILL) };
+        child.kill().ok();
+        child.wait().ok();
+
+        let niced = nice_only_priority();
+        assert!(
+            child_priority < niced,
+            "the child ({child_priority}) is no lower than one that is only niced ({niced})"
+        );
+        assert!(
+            grandchild_priority < niced,
+            "what the child started ({grandchild_priority}) did not inherit the policy \
+             (a niced child shows {niced})"
         );
     }
 }

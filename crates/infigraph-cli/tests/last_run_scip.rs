@@ -60,6 +60,8 @@ fn enriching(root: &Path, home: &Path) -> Command {
         .env("HOME", home)
         .env(infigraph_core::BACKEND_ENV, infigraph_core::DAEMON_BACKEND)
         .env_remove(infigraph_core::scip_switch::enabled_env_name())
+        // These tests wait on the fake indexer against their own clocks.
+        .env(infigraph_core::scip_switch::background_env_name(), "0")
         .env_remove("INFIGRAPH_WATCH_DAEMON")
         .env_remove("INFIGRAPH_DOCS_ENABLED");
     command

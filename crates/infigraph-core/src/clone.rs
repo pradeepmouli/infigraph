@@ -20,6 +20,9 @@ const EXCLUDED_RELATIVE_PATHS: &[&str] = &[
     "docs.kuzu.lock",
     "config.lock",
     crate::scip::SCIP_ENRICH_LOCK,
+    // A build cache of the source's checkout, gigabytes of it: the destination
+    // makes its own.
+    crate::scip::RUST_ANALYZER_TARGET,
     "logs",
     crate::watch::producer::CANARY_FILE,
 ];

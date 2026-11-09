@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -2184,6 +2184,30 @@ pub fn scip_import_log_line(label: Option<&str>, stats: &ImportStats) -> String 
 /// The per-project lock around one SCIP enrichment (running the indexers and
 /// importing what they wrote).
 pub const SCIP_ENRICH_LOCK: &str = "scip-enrich.lock";
+
+/// The entry of a main checkout's `.infigraph/` that holds rust-analyzer's own
+/// build artifacts (see [`rust_analyzer_target_dir`]). A cache a full rebuild,
+/// a snapshot and a clone all leave alone.
+pub const RUST_ANALYZER_TARGET: &str = "ra-target";
+
+/// The `CARGO_TARGET_DIR` for rust-analyzer's SCIP run in `root`.
+///
+/// rust-analyzer reads a Rust workspace by running `cargo check` (for build
+/// scripts and proc macros), which takes cargo's lock on the target directory's
+/// build dir. Left to inherit the environment it shares that directory with the
+/// builds a person runs, and a foreground `cargo test` then waits for the
+/// indexer (measured: "Blocking waiting for file lock on build directory"). The
+/// indexer runs in the background class, so that wait is as long as the
+/// indexer's starvation. A directory of its own removes the contention at the
+/// price of one more set of build artifacts.
+///
+/// One per main checkout, not per worktree: the worktrees of a repository share
+/// it, since they share the dependencies it caches. A path outside git is its
+/// own main checkout.
+pub fn rust_analyzer_target_dir(root: &Path) -> PathBuf {
+    let main = crate::worktree::main_worktree_path(root).unwrap_or_else(|_| root.to_path_buf());
+    main.join(".infigraph").join(RUST_ANALYZER_TARGET)
+}
 
 /// What the loser of [`try_begin_enrichment`] says, to whichever log it writes
 /// to. A skipped enrichment is not a failure: it is logged, never recorded as a
@@ -4733,6 +4757,47 @@ mod enrichment_lock_tests {
         assert!(
             !tmp.path().join(".infigraph").exists(),
             "taking the lock must not create the project directory"
+        );
+    }
+
+    /// The worktrees of a repository share one rust-analyzer build cache, kept
+    /// with the main checkout; a directory outside git is its own main checkout.
+    #[test]
+    fn rust_analyzer_target_dir_is_one_per_main_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .unwrap();
+            assert!(status.success(), "{args:?}");
+        };
+        git(&main, &["init", "-q"]);
+        std::fs::write(main.join("a.txt"), "a").unwrap();
+        git(&main, &["add", "."]);
+        git(&main, &["commit", "-q", "-m", "one"]);
+        let linked = tmp.path().join("linked");
+        git(
+            &main,
+            &["worktree", "add", "-q", "-b", "b", linked.to_str().unwrap()],
+        );
+
+        let shared = rust_analyzer_target_dir(&main);
+        assert_eq!(rust_analyzer_target_dir(&linked), shared);
+        assert!(shared.ends_with(".infigraph/ra-target"), "{shared:?}");
+
+        let outside = tempfile::tempdir().unwrap();
+        assert_eq!(
+            rust_analyzer_target_dir(outside.path()),
+            outside.path().join(".infigraph").join("ra-target")
         );
     }
 }

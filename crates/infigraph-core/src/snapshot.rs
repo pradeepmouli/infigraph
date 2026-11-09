@@ -60,9 +60,14 @@ fn now_epoch_secs() -> u64 {
 /// and an in-progress restore's staging area (it holds a restore point's
 /// full content outside the snapshots pool precisely so pool operations
 /// like eviction can't touch it -- folding it into a new snapshot or
-/// deleting it mid-wipe would defeat that).
+/// deleting it mid-wipe would defeat that), and rust-analyzer's build cache
+/// (gigabytes of build artifacts that a graph rebuild does not invalidate and
+/// that take a long cold build to recreate).
 pub(crate) fn should_skip(name: &str) -> bool {
-    name == "index.lock" || name == RESTORE_STAGING_DIR || is_restore_pool_entry(name)
+    name == "index.lock"
+        || name == RESTORE_STAGING_DIR
+        || name == crate::scip::RUST_ANALYZER_TARGET
+        || is_restore_pool_entry(name)
 }
 
 /// An entry of `.infigraph/` that belongs to a restore pool: the snapshots

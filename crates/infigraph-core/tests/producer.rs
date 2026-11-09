@@ -182,6 +182,93 @@ async fn producer_feeds_the_queue_on_a_real_file_change() {
     handle.await.unwrap();
 }
 
+/// The thread that reads the event stream keeps the default QoS class. Indexing
+/// work runs in the background (see `child::run_at_background_priority`), but a
+/// slow reader makes `fseventsd` queue every event for us, and its memory grows
+/// with the backlog (6-10 GB here). So no part of the producer may be demoted,
+/// whatever else the daemon does to its other work.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn the_producer_never_runs_in_the_background_qos_class() {
+    // <sys/qos.h>. Declared here with a plain integer: the `libc` crate models
+    // the class as an enum, and a value outside it would be undefined behaviour.
+    const QOS_CLASS_UTILITY: u32 = 0x11;
+    const QOS_CLASS_BACKGROUND: u32 = 0x09;
+    extern "C" {
+        fn pthread_get_qos_class_np(
+            thread: libc::pthread_t,
+            class: *mut u32,
+            relative_priority: *mut libc::c_int,
+        ) -> libc::c_int;
+    }
+    fn current_qos() -> u32 {
+        let mut class = 0u32;
+        let mut relative: libc::c_int = 0;
+        // SAFETY: reads the calling thread's own class into two locals.
+        unsafe { pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut relative) };
+        class
+    }
+
+    /// A sink that records the class of the thread it is called on. The
+    /// producer calls `accept` for the attach rescan and `tick` on its timer,
+    /// both on its own thread.
+    struct QosRecorder(Arc<Mutex<Vec<u32>>>);
+    impl infigraph_core::watch::sink::WatchSink for QosRecorder {
+        fn name(&self) -> &'static str {
+            "qos-recorder"
+        }
+        fn domain(&self) -> infigraph_core::ignore_rules::Domain {
+            infigraph_core::ignore_rules::Domain::Docs
+        }
+        fn accept(&mut self, _batch: infigraph_core::watch::sink::WatchBatch) {
+            self.0.lock().unwrap().push(current_qos());
+        }
+        fn health(&self) -> infigraph_core::watch::sink::SinkHealth {
+            Default::default()
+        }
+        fn tick(&mut self) {
+            self.0.lock().unwrap().push(current_qos());
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    let classes = Arc::new(Mutex::new(Vec::<u32>::new()));
+    infigraph_core::watch::sink::request_attach(&root, Box::new(QosRecorder(Arc::clone(&classes))));
+
+    let queue = Arc::new(Mutex::new(IndexWorkQueue::new()));
+    let token = CancellationToken::new();
+    let (queue_clone, cfg, token_clone) = (Arc::clone(&queue), config(root.clone()), token.clone());
+    let handle = tokio::task::spawn(async move {
+        infigraph_core::watch::producer::run_producer(cfg, queue_clone, |_evt| {}, token_clone)
+            .await;
+    });
+
+    // The attach rescan and a few timer ticks.
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if classes.lock().unwrap().len() >= 3 {
+            break;
+        }
+    }
+    token.cancel();
+    handle.await.unwrap();
+
+    let classes = classes.lock().unwrap().clone();
+    assert!(
+        classes.len() >= 3,
+        "the producer called the sink {} time(s)",
+        classes.len()
+    );
+    for class in classes {
+        assert!(
+            class != QOS_CLASS_BACKGROUND && class != QOS_CLASS_UTILITY,
+            "the producer ran in a demoted QoS class (0x{class:x})"
+        );
+    }
+}
+
 /// Regression test for the language-registry filter. A file no language
 /// pack claims can never produce a `FileExtraction`, and `clear_dirty` only
 /// clears what a drain's extractions reported -- so marking one dirty makes

@@ -64,6 +64,8 @@ fn index(root: &Path, home: &Path, full: bool, enabled: bool) {
         infigraph_core::scip_switch::enabled_env_name(),
         if enabled { "1" } else { "0" },
     );
+    // The fake indexer has to get a turn within the test's own clock.
+    command.env(infigraph_core::scip_switch::background_env_name(), "0");
     assert_ok(&command.output().unwrap(), "index");
 }
 
