@@ -29,6 +29,13 @@ use regex::Regex;
 /// Walks that are deliberately not the project's source tree.
 const ALLOWED: &[(&str, &str, &str)] = &[
     (
+        "crates/infigraph-core/src/ignore_rules.rs",
+        "fsevents_exclusions",
+        "finds the directories the matchers SKIP (to tell FSEvents not to deliver them), so it \
+         must list what the walk would not enter; it asks the same two IgnoreMatchers and \
+         visits only directories the matchers keep",
+    ),
+    (
         "crates/infigraph-cli/src/artifacts/discovery.rs",
         "walk_files",
         "installed agent artifacts under the tool's own config directories (~/.claude, ...), \

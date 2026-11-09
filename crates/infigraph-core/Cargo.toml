@@ -35,7 +35,7 @@ scip = "0.10.0"
 protobuf = "3"
 tempfile = "3"
 # macos_kqueue enables the kqueue backend on macOS; notify selects inotify on Linux automatically.
-notify = "6"
+notify = "6"  # patched via [patch.crates-io]: see patches/notify-6.1.1-exclusions
 ureq = "2"
 usearch = "2.18"
 parquet = "58.3"

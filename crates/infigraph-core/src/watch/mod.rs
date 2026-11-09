@@ -394,6 +394,11 @@ pub fn log_stamp() -> String {
 /// needs no subscription of its own.
 pub(crate) const WATCHES_EACH_DIRECTORY: bool = !cfg!(target_os = "macos");
 
+/// Whether the backend can be told which directories not to deliver events from
+/// (`FSEventStreamSetExclusionPaths`, through the patched `notify` in
+/// `patches/notify-6.1.1-exclusions`). Only FSEvents has the call.
+pub(crate) const EXCLUDES_AT_THE_BACKEND: bool = cfg!(target_os = "macos");
+
 /// Subscribe `watcher` to every non-ignored directory under `root` (or, where
 /// [`WATCHES_EACH_DIRECTORY`] is false, to the whole tree at once).
 ///

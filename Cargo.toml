@@ -43,3 +43,7 @@ opt-level = 2
 # (dynamic CRT) on Windows MSVC, causing LNK2038 linker errors.
 [patch.crates-io]
 esaxx-rs = { path = "patches/esaxx-rs" }
+
+# notify 6.1.1 plus FSEventStreamSetExclusionPaths (macOS), so fseventsd stops delivering events
+# from subtrees the watcher would discard anyway. See patches/notify-6.1.1-exclusions/README.infigraph.md.
+notify = { path = "patches/notify-6.1.1-exclusions" }

@@ -760,6 +760,108 @@ impl IgnoreMatcher {
     }
 }
 
+/// The most directories FSEvents lets a stream exclude
+/// (`FSEventStreamSetExclusionPaths` returns false for a ninth).
+pub const FSEVENTS_MAX_EXCLUSIONS: usize = 8;
+
+/// Directories visited while looking for something to exclude, after which the
+/// search stops with what it has: on a tree this large the stream is the lesser cost.
+const EXCLUSION_SEARCH_DIR_LIMIT: usize = 50_000;
+
+/// Hot subdirectories of `.infigraph/` that are excluded although `.infigraph/` itself is not:
+/// the watcher's canary (`watch-canary`) and its dirty marks live directly in it, so it must keep
+/// delivering, while these three are written by builds and indexers all day and nothing reads
+/// their events.
+const INFIGRAPH_HOT_SUBDIRS: &[&str] = &["ra-target", "scip-tmp", "write-tmp"];
+
+/// Which candidate takes a scarce exclusion slot first: the directories measured to produce most
+/// events (a shared cargo target was 99.98% of one tree's), then by depth, then by path. Static on
+/// purpose: ranking by observed volume would change the set, and so restart the stream, as the
+/// load moves.
+const EXCLUSION_PRIORITY: &[&str] = &[
+    ".shared-target",
+    "target",
+    "node_modules",
+    "ra-target",
+    "write-tmp",
+    "scip-tmp",
+    ".git",
+    "scratchpad",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+    "vendor",
+];
+
+/// The directories under `root` an FSEvents stream can be told not to deliver events from, at most
+/// [`FSEVENTS_MAX_EXCLUSIONS`], most valuable first (the order is stable, so two calls on an
+/// unchanged tree compare equal).
+///
+/// A directory qualifies when **both** domains' matchers skip it (what the code walk and the
+/// document walk would not visit), so a sink that attaches later never loses an event it wanted.
+/// The excluded directory is the topmost skipped one: `scratchpad/` stands for everything in it.
+/// `.infigraph/` is never excluded, only its [`INFIGRAPH_HOT_SUBDIRS`]. A directory that is, contains
+/// or sits under an `[index] include` root is dropped, and so is a symlink (FSEvents reports real
+/// paths, so a link names nothing it could exclude). Paths are real paths under the canonical root.
+pub fn fsevents_exclusions(root: &Path) -> Vec<PathBuf> {
+    let Ok(root) = root.canonicalize() else {
+        return Vec::new();
+    };
+    let code = IgnoreMatcher::build(&root, Domain::Code);
+    let docs = IgnoreMatcher::build(&root, Domain::Docs);
+    let includes: Vec<&PathBuf> = code.includes.iter().chain(docs.includes.iter()).collect();
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut pending = vec![root.clone()];
+    let mut visited = 0usize;
+    while let Some(dir) = pending.pop() {
+        visited += 1;
+        if visited > EXCLUSION_SEARCH_DIR_LIMIT {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let path = entry.path();
+            if dir == root && entry.file_name() == ".infigraph" {
+                candidates.extend(
+                    INFIGRAPH_HOT_SUBDIRS
+                        .iter()
+                        .map(|name| path.join(name))
+                        .filter(|hot| hot.is_dir()),
+                );
+            } else if code.skips(&path, true) && docs.skips(&path, true) {
+                candidates.push(path);
+            } else {
+                pending.push(path);
+            }
+        }
+    }
+
+    candidates.retain(|candidate| {
+        !includes
+            .iter()
+            .any(|inc| candidate.starts_with(inc) || inc.starts_with(candidate))
+    });
+    let rank = |path: &PathBuf| {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        EXCLUSION_PRIORITY
+            .iter()
+            .position(|p| *p == name)
+            .unwrap_or(EXCLUSION_PRIORITY.len())
+    };
+    candidates.sort_by(|a, b| {
+        (rank(a), a.components().count(), a).cmp(&(rank(b), b.components().count(), b))
+    });
+    candidates.truncate(FSEVENTS_MAX_EXCLUSIONS);
+    candidates
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1691,6 +1793,192 @@ mod domain_tests {
         assert!(
             problems.iter().any(|p| p.setting.contains("[ignore] code")),
             "a bare string is the likely mistake and must not read as no patterns: {problems:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fsevents_exclusion_tests {
+    use super::*;
+    use std::fs;
+
+    fn mkdirs(root: &Path, dirs: &[&str]) {
+        for dir in dirs {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join("f.txt"), "x").unwrap();
+        }
+    }
+
+    /// The exclusions as paths relative to the canonical root, in the order returned.
+    fn relative(root: &Path, found: &[PathBuf]) -> Vec<String> {
+        let root = root.canonicalize().unwrap();
+        found
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&root)
+                    .unwrap_or_else(|_| panic!("{} is not under {}", p.display(), root.display()))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    fn project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".gitignore"), "scratchpad/\n").unwrap();
+        mkdirs(
+            dir.path(),
+            &[
+                "src",
+                "src/node_modules/pkg",
+                "docs",
+                "target/debug",
+                "node_modules/pkg",
+                "scratchpad/wt/target",
+                ".git/objects",
+                ".infigraph/ra-target",
+                ".infigraph/scip-tmp",
+                ".infigraph/write-tmp",
+                ".infigraph/other",
+            ],
+        );
+        dir
+    }
+
+    #[test]
+    fn it_names_the_topmost_skipped_directories_and_only_the_hot_part_of_infigraph() {
+        let dir = project();
+        let found = relative(dir.path(), &fsevents_exclusions(dir.path()));
+        let mut sorted = found.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            [
+                ".git",
+                ".infigraph/ra-target",
+                ".infigraph/scip-tmp",
+                ".infigraph/write-tmp",
+                "node_modules",
+                "scratchpad",
+                "src/node_modules",
+                "target",
+            ],
+            "scratchpad/ stands for its own target/; .infigraph/ itself and src/ are never excluded"
+        );
+        assert_eq!(
+            found[0], "target",
+            "the measured-hottest name takes the first slot"
+        );
+    }
+
+    #[test]
+    fn every_exclusion_is_a_directory_both_matchers_skip() {
+        let dir = project();
+        let code = IgnoreMatcher::build(dir.path(), Domain::Code);
+        let docs = IgnoreMatcher::build(dir.path(), Domain::Docs);
+        let found = fsevents_exclusions(dir.path());
+        assert!(!found.is_empty());
+        for excluded in &found {
+            assert!(
+                code.skips(excluded, true) && docs.skips(excluded, true),
+                "{} would be walked by one domain but its events are never delivered",
+                excluded.display()
+            );
+        }
+        let root = dir.path().canonicalize().unwrap();
+        for kept in ["src", "docs", ".infigraph"] {
+            assert!(
+                !found.contains(&root.join(kept)),
+                "{kept} holds events a sink wants (or, for .infigraph, the canary)"
+            );
+        }
+    }
+
+    #[test]
+    fn a_domain_only_one_matcher_skips_is_not_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        mkdirs(dir.path(), &["generated", "src", "target"]);
+        fs::create_dir_all(dir.path().join(".infigraph")).unwrap();
+        fs::write(
+            dir.path().join(".infigraph/config.toml"),
+            "[ignore]\ncode = [\"generated/\"]\n",
+        )
+        .unwrap();
+        let found = relative(dir.path(), &fsevents_exclusions(dir.path()));
+        assert_eq!(
+            found,
+            ["target"],
+            "generated/ is out of the code walk but a docs sink would still want its events"
+        );
+    }
+
+    #[test]
+    fn an_include_root_is_never_excluded_nor_what_contains_it() {
+        let dir = project_with_include("scratchpad/keep");
+        let found = relative(dir.path(), &fsevents_exclusions(dir.path()));
+        assert!(
+            !found.iter().any(|p| p == "scratchpad"),
+            "scratchpad/ contains the include root scratchpad/keep: {found:?}"
+        );
+        assert!(found.contains(&"target".to_string()), "{found:?}");
+
+        let under = project_with_include("node_modules");
+        let found = relative(under.path(), &fsevents_exclusions(under.path()));
+        assert!(
+            !found.iter().any(|p| p == "node_modules"),
+            "an include root is never excluded: {found:?}"
+        );
+    }
+
+    fn project_with_include(entry: &str) -> tempfile::TempDir {
+        let dir = project();
+        mkdirs(dir.path(), &["scratchpad/keep/src"]);
+        fs::write(
+            dir.path().join(".infigraph/config.toml"),
+            format!("[index]\ninclude = [\"{entry}\"]\n"),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn it_never_names_more_than_the_backend_accepts_and_keeps_the_priority_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let ignored: Vec<String> = (0..12).map(|n| format!("gen{n:02}")).collect();
+        fs::write(
+            dir.path().join(".gitignore"),
+            ignored
+                .iter()
+                .map(|d| format!("{d}/\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let names: Vec<&str> = ignored.iter().map(String::as_str).collect();
+        mkdirs(dir.path(), &names);
+        mkdirs(dir.path(), &["target", ".shared-target", "src"]);
+
+        let found = relative(dir.path(), &fsevents_exclusions(dir.path()));
+        assert_eq!(found.len(), FSEVENTS_MAX_EXCLUSIONS);
+        assert_eq!(&found[..2], [".shared-target", "target"]);
+        assert_eq!(found[2], "gen00", "the rest by depth, then path");
+        assert_eq!(
+            found,
+            relative(dir.path(), &fsevents_exclusions(dir.path())),
+            "an unchanged tree gives an equal set, or the producer would rebuild its stream for nothing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_not_an_exclusion() {
+        let dir = tempfile::tempdir().unwrap();
+        mkdirs(dir.path(), &["real/target"]);
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("node_modules"))
+            .unwrap();
+        let found = relative(dir.path(), &fsevents_exclusions(dir.path()));
+        assert!(
+            !found.iter().any(|p| p == "node_modules"),
+            "FSEvents reports real paths, so a link names nothing it could exclude: {found:?}"
         );
     }
 }
