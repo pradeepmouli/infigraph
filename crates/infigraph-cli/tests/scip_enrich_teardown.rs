@@ -82,6 +82,9 @@ fn cmd(home: &Path, root: &Path) -> Command {
         .env("HOME", home)
         .env(infigraph_core::BACKEND_ENV, "kuzu")
         .env("INFIGRAPH_NO_WATCH", "1")
+        // The fake indexer has to get a turn within these tests' own clocks; in
+        // the background policy a busy machine starves it for minutes.
+        .env(infigraph_core::scip_switch::background_env_name(), "0")
         .env_remove("INFIGRAPH_WATCH_DAEMON")
         .env_remove("INFIGRAPH_DOCS_ENABLED");
     c

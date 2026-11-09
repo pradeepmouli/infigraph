@@ -173,6 +173,7 @@ const DERIVED_NAMES: &[&str] = &[
     "scip-enrich.log",
     "scip-imports.json",
     "scip-tmp",
+    crate::scip::RUST_ANALYZER_TARGET,
     "daemon.log",
     "worktree-hook.log",
     crate::watch::producer::CANARY_FILE,
@@ -304,6 +305,7 @@ mod tests {
             "hnsw_index.usearch.meta",
             "write-tmp",
             "scip-tmp",
+            crate::scip::RUST_ANALYZER_TARGET,
             "scip-imports.json",
             "scip-enrich.log",
             "daemon.log",
@@ -392,6 +394,23 @@ mod tests {
         assert!(ig.join("index.lock").exists());
         assert!(!ig.join(crate::graph::names::STEM).exists());
         assert!(!ig.join("daemon.log").exists());
+    }
+
+    /// rust-analyzer's build cache outlives a graph rebuild: it takes a long
+    /// cold build to recreate (the graph engine's C++ among it) and a rebuilt
+    /// graph does not invalidate it.
+    #[test]
+    fn a_code_rebuild_wipe_keeps_the_rust_analyzer_build_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ig = tmp.path().join(".infigraph");
+        std::fs::create_dir_all(ig.join(crate::scip::RUST_ANALYZER_TARGET).join("debug")).unwrap();
+        std::fs::write(ig.join(crate::graph::names::STEM), "x").unwrap();
+        wipe_infigraph_preserving_index_lock(&ig).unwrap();
+        assert!(ig
+            .join(crate::scip::RUST_ANALYZER_TARGET)
+            .join("debug")
+            .exists());
+        assert!(!ig.join(crate::graph::names::STEM).exists());
     }
 
     #[test]

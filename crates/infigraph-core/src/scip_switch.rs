@@ -28,11 +28,17 @@ use crate::settings_file::ConfigScope;
 const CATEGORY: &str = "scip";
 const ENABLED: &str = "enabled";
 const DISABLE: &str = "disable";
+const BACKGROUND: &str = "background";
 
 crate::settings! {
     scip {
         enabled: Toggle = Toggle(true),
         disable: LanguageList = LanguageList(Vec::new()),
+        // Whether an indexer joins the system's background policy on macOS
+        // (`child::join_background_policy`), on top of the nice +10 it always
+        // gets. Off keeps it at nice +10: it finishes on a busy machine instead
+        // of being starved, at the cost of competing with what you are doing.
+        background: Toggle = Toggle(true),
     }
 }
 
@@ -186,6 +192,21 @@ pub fn scip_enabled(root: &Path) -> bool {
         .0
 }
 
+/// Whether the SCIP indexers for `root` run in the system's background policy
+/// (`[scip] background`, default on; only macOS has one). A value that does not
+/// parse is warned about once and reads as the default (on).
+pub fn indexers_in_background(root: &Path) -> bool {
+    Scip::resolve_or_default(RawScip::default(), ConfigScope::Project(root))
+        .background
+        .0
+}
+
+/// The env var that overrides [`indexers_in_background`], derived from the
+/// settings definition so a test fixture never spells it as a literal.
+pub fn background_env_name() -> String {
+    crate::settings::env_name(CATEGORY, BACKGROUND)
+}
+
 /// True for a graph SCIP has never enriched: its generation stamp is not
 /// positive. The daemon's staleness trigger skips such a graph (a project
 /// that never opted into SCIP must not start running external indexers), and
@@ -263,6 +284,30 @@ mod tests {
     #[test]
     fn the_env_name_comes_from_the_definition() {
         assert_eq!(enabled_env_name(), "INFIGRAPH_SCIP_ENABLED");
+        assert_eq!(background_env_name(), "INFIGRAPH_SCIP_BACKGROUND");
+    }
+
+    #[test]
+    fn indexers_run_in_the_background_unless_a_layer_says_otherwise() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(background_env_name());
+        let _home = PinnedHome::empty();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(indexers_in_background(tmp.path()), "on by default");
+
+        crate::settings_file::set_project_setting(
+            tmp.path(),
+            "scip",
+            "background",
+            toml_edit::value(false),
+        )
+        .unwrap();
+        assert!(!indexers_in_background(tmp.path()), "the project config");
+
+        std::env::set_var(background_env_name(), "1");
+        let overridden = indexers_in_background(tmp.path());
+        std::env::remove_var(background_env_name());
+        assert!(overridden, "the environment wins over the project config");
     }
 }
 

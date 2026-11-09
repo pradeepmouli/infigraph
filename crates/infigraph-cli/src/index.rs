@@ -1857,6 +1857,22 @@ fn indexer_command(
     // An indexer runs for minutes at several cores and nobody asked for it:
     // it yields to the person's editor and compiler.
     infigraph_core::child::run_at_background_priority(&mut command);
+    // On macOS that is not enough once every core is busy; unless the project
+    // or the person has said an indexer should finish rather than yield
+    // (`[scip] background = false`), it also joins the background policy, and
+    // is starved while the machine is busy.
+    if under_background_policy(root) {
+        infigraph_core::child::join_background_policy(&mut command);
+    }
+    // rust-analyzer runs `cargo check` to read a workspace. In the person's
+    // target directory, that holds cargo's build lock while it is starved, and
+    // their next `cargo test` waits for it.
+    if is_rust_analyzer(cmd) {
+        command.env(
+            "CARGO_TARGET_DIR",
+            infigraph_core::scip::rust_analyzer_target_dir(root),
+        );
+    }
 
     if let Some(flag) = output_flag {
         command.arg(flag).arg(output_path);
@@ -1883,6 +1899,34 @@ fn indexer_command(
         command.env("DOTNET_ROOT", &dotnet_root);
     }
     command
+}
+
+/// Whether the indexers of `root` run in the system's background policy: only
+/// macOS has one, and `[scip] background = false` turns it off. The one
+/// predicate behind [`indexer_command`] joining the policy and a timeout saying
+/// the indexer may have been starved.
+fn under_background_policy(root: &Path) -> bool {
+    cfg!(target_os = "macos") && infigraph_core::scip_switch::indexers_in_background(root)
+}
+
+/// What a timeout adds to its message when the indexer ran in the background
+/// policy: a starved indexer is not a hung one, and the switch is how to tell.
+fn background_timeout_note(background: bool) -> String {
+    if !background {
+        return String::new();
+    }
+    format!(
+        " under background priority; set [scip] background = false or {}=0 if the machine is \
+         under sustained load",
+        infigraph_core::scip_switch::background_env_name()
+    )
+}
+
+/// Whether `cmd` (a name on PATH or a path to the binary) is rust-analyzer.
+fn is_rust_analyzer(cmd: &str) -> bool {
+    Path::new(cmd)
+        .file_stem()
+        .is_some_and(|name| name == "rust-analyzer")
 }
 
 /// How long to wait, after the indexer is gone, for what it wrote to
@@ -2000,7 +2044,12 @@ enum IndexerFailure {
     Spawn(std::io::Error),
     Wait(std::io::Error),
     Exited(std::process::ExitStatus),
-    TimedOut(std::time::Duration),
+    /// `background`: it ran in the system's background policy, so a machine
+    /// under sustained load may have starved it rather than it hanging.
+    TimedOut {
+        after: std::time::Duration,
+        background: bool,
+    },
     /// It exited successfully but left no output behind.
     NoOutput,
     /// It exited successfully and left an output that cannot be imported: no
@@ -2016,7 +2065,12 @@ impl IndexerFailure {
         match self {
             IndexerFailure::Spawn(e) | IndexerFailure::Wait(e) => format!("could not run it: {e}"),
             IndexerFailure::Exited(s) => format!("exited with {s}"),
-            IndexerFailure::TimedOut(t) => format!("timed out after {t:?}"),
+            IndexerFailure::TimedOut { after, background } => {
+                format!(
+                    "timed out after {after:?}{}",
+                    background_timeout_note(*background)
+                )
+            }
             IndexerFailure::NoOutput => "exited 0 but left no output".to_string(),
             IndexerFailure::Rejected(r) => r.reason.to_string(),
         }
@@ -2106,9 +2160,10 @@ fn indexer_outcome_message(label: &str, outcome: &IndexerOutcome) -> Option<Stri
             Some(format!("Auto-SCIP: failed to run {label}: {e}"))
         }
         IndexerFailure::Exited(s) => Some(format!("Auto-SCIP: {label} exited with {s}{last}")),
-        IndexerFailure::TimedOut(t) => {
-            Some(format!("Auto-SCIP: {label} timed out after {t:?}{last}"))
-        }
+        IndexerFailure::TimedOut { after, background } => Some(format!(
+            "Auto-SCIP: {label} timed out after {after:?}{}{last}",
+            background_timeout_note(*background)
+        )),
         IndexerFailure::Rejected(r) => Some(format!(
             "Auto-SCIP: {label} {}{last}; its output was discarded",
             r.reason
@@ -2264,7 +2319,10 @@ async fn run_indexer(
                 }
                 // `group` drops at the end of this arm's scope and kills the
                 // whole group.
-                Err(_elapsed) => Err(IndexerFailure::TimedOut(timeout)),
+                Err(_elapsed) => Err(IndexerFailure::TimedOut {
+                    after: timeout,
+                    background: under_background_policy(root),
+                }),
             };
             // Dropping the group (below) is what closes the pipe after a
             // timeout; give the drain a moment to read what is left.
@@ -2394,6 +2452,67 @@ impl IndexerRun<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The timeouts in these tests are wall-clock and short. An indexer that
+    /// joined the system's background policy is starved on a busy machine and
+    /// misses them, which says nothing about what they check.
+    fn foreground_indexers() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            std::env::set_var(infigraph_core::scip_switch::background_env_name(), "0")
+        });
+    }
+
+    #[test]
+    fn a_timeout_under_the_background_policy_says_the_indexer_may_have_been_starved() {
+        let timed_out = |background| IndexerOutcome {
+            failure: Some(IndexerFailure::TimedOut {
+                after: std::time::Duration::from_secs(600),
+                background,
+            }),
+            stderr_tail: String::new(),
+        };
+
+        let starved = timed_out(true);
+        let logged = indexer_outcome_message("scip-x", &starved).unwrap();
+        assert!(
+            logged.contains("timed out after 600s under background priority"),
+            "{logged}"
+        );
+        assert!(
+            logged.contains("[scip] background = false")
+                && logged.contains("INFIGRAPH_SCIP_BACKGROUND=0"),
+            "the message does not say how to turn it off: {logged}"
+        );
+        let recorded = starved.verdict().unwrap_err();
+        assert!(
+            recorded.contains("under background priority"),
+            "the recorded problem does not say it: {recorded}"
+        );
+
+        let plain = timed_out(false);
+        assert!(!indexer_outcome_message("scip-x", &plain)
+            .unwrap()
+            .contains("background"));
+        assert!(!plain.verdict().unwrap_err().contains("background"));
+    }
+
+    #[test]
+    fn only_rust_analyzer_gets_a_target_directory_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out.scip");
+        let target = |cmd: &str| {
+            indexer_command(dir.path(), cmd, &[], None, None, &output)
+                .get_envs()
+                .find(|(key, _)| *key == "CARGO_TARGET_DIR")
+                .and_then(|(_, value)| value.map(PathBuf::from))
+        };
+        let own = infigraph_core::scip::rust_analyzer_target_dir(dir.path());
+        assert!(own.ends_with(".infigraph/ra-target"), "{}", own.display());
+        assert_eq!(target("rust-analyzer"), Some(own.clone()));
+        assert_eq!(target("/opt/homebrew/bin/rust-analyzer"), Some(own));
+        assert_eq!(target("scip-python"), None, "other indexers keep theirs");
+    }
 
     #[test]
     fn an_indexers_repeated_stderr_lines_are_shown_a_few_times_and_then_counted() {
@@ -2662,6 +2781,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_scip_indexer_cmd_async_reports_success_and_failure_like_today() {
+        foreground_indexers();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let output_path = root.join("out.scip");
@@ -2715,6 +2835,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_scip_indexer_cmd_async_times_out_a_hung_process() {
+        foreground_indexers();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let output_path = root.join("out.scip");
@@ -2764,6 +2885,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_timed_out_indexer_takes_its_grandchildren_and_only_them() {
+        foreground_indexers();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let pid_file = root.join("grandchild.pid");
@@ -2983,6 +3105,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_timed_out_indexer_leaves_no_index_scip_in_the_project_root() {
+        foreground_indexers();
         let tmp = tempfile::tempdir().unwrap();
         let outcome = run_leaving_default_output(
             tmp.path(),
@@ -2992,7 +3115,7 @@ mod tests {
         .await;
 
         assert!(
-            matches!(outcome.failure, Some(IndexerFailure::TimedOut(_))),
+            matches!(outcome.failure, Some(IndexerFailure::TimedOut { .. })),
             "{outcome:?}"
         );
         assert!(
@@ -3215,6 +3338,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_hung_scip_java_primary_times_out_and_the_fallback_runs() {
+        foreground_indexers();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         // Both build files, and settings.gradle: gradle is the primary.
@@ -3248,6 +3372,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn a_hung_scip_java_does_not_starve_a_sibling_indexer() {
+        foreground_indexers();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         std::fs::write(root.join("settings.gradle"), "").unwrap();
@@ -3310,6 +3435,7 @@ mod tests {
     /// result of the one that already ran.
     #[tokio::test]
     async fn run_cancellable_indexer_batch_stops_launching_after_cancellation() {
+        foreground_indexers();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let out1 = tmp.path().join("first.scip");

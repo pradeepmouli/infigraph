@@ -233,3 +233,21 @@ fn clone_excludes_the_enrichment_lock() {
     assert!(!dst.path().join(".infigraph/scip-enrich.lock").exists());
     assert!(dst.path().join(".infigraph/embeddings.bin").exists());
 }
+
+/// rust-analyzer's build cache is gigabytes of the source checkout's build
+/// artifacts: a clone (and so a new worktree) makes its own, not a copy.
+#[test]
+fn clone_excludes_the_rust_analyzer_build_cache() {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    write_file(
+        &src.path().join(".infigraph/ra-target/debug/deps/x.rlib"),
+        "build-bytes",
+    );
+    write_file(&src.path().join(".infigraph/embeddings.bin"), "emb-bytes");
+
+    clone_infigraph_dir(src.path(), dst.path()).unwrap();
+
+    assert!(!dst.path().join(".infigraph/ra-target").exists());
+    assert!(dst.path().join(".infigraph/embeddings.bin").exists());
+}
