@@ -33,6 +33,15 @@ const MAX_RESTARTS: u32 = 3;
 /// it finishes.
 type SharedWatcher = Arc<Mutex<RecommendedWatcher>>;
 
+/// One generation of the root subscription: the watcher, the receiver for its events, and the
+/// directories the backend was told not to deliver events from (always empty off macOS, and when
+/// the tree has nothing worth excluding).
+struct Subscription {
+    watcher: SharedWatcher,
+    rx: tokio_mpsc::UnboundedReceiver<notify::Result<Event>>,
+    exclusions: Vec<PathBuf>,
+}
+
 /// Everything a producer needs that is fixed for its whole lifetime. A
 /// struct rather than four more positional parameters because
 /// `run_write_coordinator` both spawns the initial producer and respawns
@@ -157,28 +166,31 @@ pub async fn run_producer(
     ));
     let mut dispatcher = Dispatcher::new(&root, vec![code_sink]);
 
-    let (mut watcher, mut rx) =
-        match create_watcher_unless_cancelled(&root, debounce_ms, &token).await {
-            None => return,
-            Some(Ok(pair)) => pair,
-            Some(Err(e)) => {
-                eprintln!("[watch-producer] failed to start watcher: {e}");
-                // Same event every other terminal path emits. Without it a
-                // producer whose watcher never started is indistinguishable,
-                // from the coordinator's side, from one that shut down cleanly
-                // on cancellation -- the task just completes and nothing says
-                // watching never actually began.
-                emit(
-                    &on_event,
-                    WatchEvent {
-                        kind: WatchEventKind::WatcherDied,
-                        path: root.clone(),
-                        has_cross_file_calls: false,
-                    },
-                );
-                return;
-            }
-        };
+    let Subscription {
+        mut watcher,
+        mut rx,
+        mut exclusions,
+    } = match create_watcher_unless_cancelled(&root, debounce_ms, &token).await {
+        None => return,
+        Some(Ok(subscription)) => subscription,
+        Some(Err(e)) => {
+            eprintln!("[watch-producer] failed to start watcher: {e}");
+            // Same event every other terminal path emits. Without it a
+            // producer whose watcher never started is indistinguishable,
+            // from the coordinator's side, from one that shut down cleanly
+            // on cancellation -- the task just completes and nothing says
+            // watching never actually began.
+            emit(
+                &on_event,
+                WatchEvent {
+                    kind: WatchEventKind::WatcherDied,
+                    path: root.clone(),
+                    has_cross_file_calls: false,
+                },
+            );
+            return;
+        }
+    };
     let mut restart_count: u32 = 0;
     // Registered, so nothing can fall between the two: events from here on
     // are seen, and this pass finds whatever happened before them.
@@ -243,9 +255,10 @@ pub async fn run_producer(
                         dispatcher.rescan_all_but("code");
                         match create_watcher_unless_cancelled(&root, debounce_ms, &token).await {
                             None => break,
-                            Some(Ok((new_watcher, new_rx))) => {
-                                watcher = new_watcher;
-                                rx = new_rx;
+                            Some(Ok(subscription)) => {
+                                watcher = subscription.watcher;
+                                rx = subscription.rx;
+                                exclusions = subscription.exclusions;
                             }
                             Some(Err(e)) => {
                                 eprintln!("[watch-producer] rebuilding the watcher failed: {e}");
@@ -278,6 +291,34 @@ pub async fn run_producer(
 
             _ = ignore_rebuild.tick() => {
                 dispatcher.triage_mut().rebuild();
+                // An edit to `.gitignore` or a new build directory changes what the backend
+                // should be told to leave out; the set is fixed when a stream is created, so a
+                // different one means a new stream, and a true-up for what the gap held.
+                if crate::watch::EXCLUDES_AT_THE_BACKEND {
+                    let fresh = fsevents_exclusions_off_task(&root).await;
+                    if fresh != exclusions {
+                        eprintln!(
+                            "[watch-producer] {} the set of directories the backend leaves out changed ({} -> {}); rebuilding the subscription",
+                            crate::watch::log_stamp(),
+                            exclusions.len(),
+                            fresh.len()
+                        );
+                        match create_watcher_unless_cancelled(&root, debounce_ms, &token).await {
+                            None => break,
+                            Some(Ok(subscription)) => {
+                                watcher = subscription.watcher;
+                                rx = subscription.rx;
+                                exclusions = subscription.exclusions;
+                                queue_true_up(&queue, "the backend's excluded directories changed");
+                                dispatcher.rescan_all_but("code");
+                                dropped.queued(std::time::Instant::now());
+                            }
+                            Some(Err(e)) => {
+                                eprintln!("[watch-producer] rebuilding the watcher failed: {e}");
+                            }
+                        }
+                    }
+                }
             }
 
             maybe_evt = rx.recv() => {
@@ -391,9 +432,10 @@ pub async fn run_producer(
                         }
                         match create_watcher_unless_cancelled(&root, debounce_ms, &token).await {
                             None => break,
-                            Some(Ok((new_watcher, new_rx))) => {
-                                watcher = new_watcher;
-                                rx = new_rx;
+                            Some(Ok(subscription)) => {
+                                watcher = subscription.watcher;
+                                rx = subscription.rx;
+                                exclusions = subscription.exclusions;
                                 eprintln!("[watch-producer] watcher restarted successfully");
                                 // Whatever changed while it was down.
                                 queue_true_up(&queue, "the watcher restarted");
@@ -639,12 +681,7 @@ async fn create_watcher_unless_cancelled(
     root: &Path,
     debounce_ms: u64,
     token: &CancellationToken,
-) -> Option<
-    anyhow::Result<(
-        SharedWatcher,
-        tokio_mpsc::UnboundedReceiver<notify::Result<Event>>,
-    )>,
-> {
+) -> Option<anyhow::Result<Subscription>> {
     let thread_root = root.to_path_buf();
     Registration::start(root, move || create_watcher(&thread_root, debounce_ms))
         .unless_cancelled(token)
@@ -659,13 +696,7 @@ async fn create_watcher_unless_cancelled(
 /// handler into the backend, so the handler (and with it the only sender)
 /// is dropped exactly when the synchronous version's `Sender` was, which is
 /// what produced `RecvTimeoutError::Disconnected` there.
-fn create_watcher(
-    root: &Path,
-    debounce_ms: u64,
-) -> anyhow::Result<(
-    SharedWatcher,
-    tokio_mpsc::UnboundedReceiver<notify::Result<Event>>,
-)> {
+fn create_watcher(root: &Path, debounce_ms: u64) -> anyhow::Result<Subscription> {
     let (tx, rx) = tokio_mpsc::unbounded_channel::<notify::Result<Event>>();
     // An unbounded sender never blocks, so this handler is safe to call from
     // notify's own (synchronous, non-async) backend thread.
@@ -675,6 +706,10 @@ fn create_watcher(
         },
         Config::default().with_poll_interval(Duration::from_millis(debounce_ms)),
     )?;
+    // Before the first `watch`, which is what creates the stream: the set is fixed for a stream's
+    // life. Best effort -- a refusal leaves the stream delivering everything, which the triage
+    // filters as it always did.
+    let exclusions = exclude_at_the_backend(&mut watcher, root);
     crate::watch::register_watch_dirs(&mut watcher, root)?.note(root, true);
     // The walk skips hidden directories, so inotify never sees the canary
     // there; one more subscription, and best effort (a project without
@@ -685,7 +720,41 @@ fn create_watcher(
             notify::RecursiveMode::NonRecursive,
         );
     }
-    Ok((Arc::new(Mutex::new(watcher)), rx))
+    Ok(Subscription {
+        watcher: Arc::new(Mutex::new(watcher)),
+        rx,
+        exclusions,
+    })
+}
+
+/// Tells the FSEvents stream `watcher` will create not to deliver events from the directories
+/// [`crate::ignore_rules::fsevents_exclusions`] names, and returns them (empty where the backend
+/// has no such call). Thousands of events a minute from a build directory otherwise queue in
+/// `fseventsd` for as long as this process reads slower than they arrive.
+#[cfg(target_os = "macos")]
+fn exclude_at_the_backend(watcher: &mut RecommendedWatcher, root: &Path) -> Vec<PathBuf> {
+    let exclusions = crate::ignore_rules::fsevents_exclusions(root);
+    match watcher.set_exclusion_paths(exclusions.clone()) {
+        Ok(()) => exclusions,
+        Err(e) => {
+            eprintln!("[watch-producer] could not set the backend's excluded directories: {e}");
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn exclude_at_the_backend(_watcher: &mut RecommendedWatcher, _root: &Path) -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// [`crate::ignore_rules::fsevents_exclusions`] on a blocking thread: it reads every directory
+/// the walk would enter, which must not hold up this task's events.
+async fn fsevents_exclusions_off_task(root: &Path) -> Vec<PathBuf> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::ignore_rules::fsevents_exclusions(&root))
+        .await
+        .unwrap_or_default()
 }
 
 /// Flushes the batch into the shared queue once its debounce window closes.
@@ -693,6 +762,102 @@ fn create_watcher(
 mod tests {
     use super::*;
     use notify::event::{CreateKind, Flag};
+
+    /// Drains `rx` until `seen` says it has what it waits for or `within` passes, then returns
+    /// every path the events named.
+    #[cfg(target_os = "macos")]
+    fn event_paths_until(
+        rx: &mut tokio_mpsc::UnboundedReceiver<notify::Result<Event>>,
+        within: Duration,
+        seen: impl Fn(&[PathBuf]) -> bool,
+    ) -> Vec<PathBuf> {
+        let deadline = std::time::Instant::now() + within;
+        let mut paths: Vec<PathBuf> = Vec::new();
+        while std::time::Instant::now() < deadline && !seen(&paths) {
+            while let Ok(Ok(event)) = rx.try_recv() {
+                paths.extend(event.paths);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Whatever the stream still held for the same moment.
+        std::thread::sleep(Duration::from_millis(500));
+        while let Ok(Ok(event)) = rx.try_recv() {
+            paths.extend(event.paths);
+        }
+        paths
+    }
+
+    /// The end-to-end half of the FSEvents exclusions, on the real backend: the stream the
+    /// producer builds is told to leave `target/` and `.infigraph/scip-tmp/` out, so a write in
+    /// either never reaches the receiver, while a sibling's and the canary's directory's do. The
+    /// control is a plain watcher on the same tree, which must see the excluded write -- without
+    /// it the test could pass against a stream that is simply deaf.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_backend_does_not_deliver_events_from_an_excluded_directory() {
+        assert!(
+            std::any::type_name::<RecommendedWatcher>().ends_with("FsEventWatcher"),
+            "this test is about the FSEvents backend, not kqueue: {}",
+            std::any::type_name::<RecommendedWatcher>()
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for dir in ["src", "target", ".infigraph/scip-tmp"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+
+        let Subscription {
+            watcher: _watcher,
+            mut rx,
+            exclusions,
+        } = create_watcher(&root, 100).unwrap();
+        assert_eq!(
+            exclusions,
+            vec![root.join("target"), root.join(".infigraph/scip-tmp")]
+        );
+
+        let (control_tx, mut control_rx) = tokio_mpsc::unbounded_channel();
+        let mut control = RecommendedWatcher::new(
+            move |evt| {
+                let _ = control_tx.send(evt);
+            },
+            Config::default(),
+        )
+        .unwrap();
+        control
+            .watch(&root, notify::RecursiveMode::Recursive)
+            .unwrap();
+        // The streams are scheduled on their own threads; let them start before writing.
+        std::thread::sleep(Duration::from_secs(1));
+
+        std::fs::write(root.join("target/built.o"), "x").unwrap();
+        std::fs::write(root.join(".infigraph/scip-tmp/out.scip"), "x").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn f() {}").unwrap();
+        std::fs::write(root.join(".infigraph/watch-canary"), "1").unwrap();
+
+        let wanted = |paths: &[PathBuf]| {
+            paths.iter().any(|p| p.ends_with("src/lib.rs"))
+                && paths.iter().any(|p| p.ends_with(".infigraph/watch-canary"))
+        };
+        let delivered = event_paths_until(&mut rx, Duration::from_secs(15), wanted);
+        assert!(
+            wanted(&delivered),
+            "the sibling's and the canary's events must still arrive: {delivered:?}"
+        );
+        assert!(
+            !delivered.iter().any(|p| p.starts_with(root.join("target"))
+                || p.starts_with(root.join(".infigraph/scip-tmp"))),
+            "an excluded directory's write reached the receiver: {delivered:?}"
+        );
+
+        let controlled = event_paths_until(&mut control_rx, Duration::from_secs(15), |paths| {
+            paths.iter().any(|p| p.starts_with(root.join("target")))
+        });
+        assert!(
+            controlled.iter().any(|p| p.starts_with(root.join("target"))),
+            "the control (no exclusions) never saw target/built.o, so the test proves nothing: {controlled:?}"
+        );
+    }
 
     #[test]
     fn a_rescan_request_or_an_unmodelled_kind_means_events_were_dropped() {

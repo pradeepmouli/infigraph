@@ -567,6 +567,57 @@ async fn a_healthy_watcher_sees_its_probes_and_queues_no_true_up_for_them() {
     assert_eq!(after - before, 1, "only the startup true-up");
 }
 
+/// The set of directories the backend is told to leave out is fixed when a stream is made, so a
+/// new one (here `dist/`, which the safety list skips) is picked up at the next matcher rebuild by
+/// making a new stream and queuing a true-up for the gap -- and an unchanged tree never does.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_new_excluded_directory_rebuilds_the_subscription_once_and_an_unchanged_tree_never() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+
+    let queue = Arc::new(Mutex::new(IndexWorkQueue::new()));
+    let token = CancellationToken::new();
+    let before = infigraph_core::watch::producer::true_ups_queued();
+    let mut cfg = config(root.clone());
+    cfg.ignore_rebuild_secs = 1;
+    let (queue_clone, token_clone) = (Arc::clone(&queue), token.clone());
+    let handle = tokio::task::spawn(async move {
+        infigraph_core::watch::producer::run_producer(cfg, queue_clone, |_evt| {}, token_clone)
+            .await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    let unchanged = infigraph_core::watch::producer::true_ups_queued() - before;
+
+    std::fs::create_dir_all(root.join("dist")).unwrap();
+    let mut rebuilt = 0;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        rebuilt = infigraph_core::watch::producer::true_ups_queued() - before;
+        if rebuilt > unchanged {
+            break;
+        }
+    }
+    // Another few matcher rebuilds: the set is the same now, so nothing more.
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    let settled = infigraph_core::watch::producer::true_ups_queued() - before;
+    token.cancel();
+    handle.await.unwrap();
+
+    assert_eq!(
+        unchanged, 1,
+        "only the startup true-up while nothing changed"
+    );
+    assert_eq!(
+        rebuilt, 2,
+        "dist/ appearing rebuilds the stream and true-ups once"
+    );
+    assert_eq!(settled, 2, "the same set does not rebuild again");
+}
+
 /// What the storm tests do for 30s while a producer watches a 1000-directory
 /// tree: write under a gitignored `target/`, and/or create and `rm -rf`
 /// directories under the watched tree, in a tight loop.
