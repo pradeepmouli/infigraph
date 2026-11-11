@@ -11,9 +11,12 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 /// The keyless edge tables and the labels of their endpoints.
-pub const KEYLESS_EDGE_TABLES: [(&str, &str, &str); 7] = [
+pub const KEYLESS_EDGE_TABLES: [(&str, &str, &str); 10] = [
     ("CALLS", "Symbol", "Symbol"),
     ("INHERITS", "Symbol", "Symbol"),
+    ("IMPLEMENTS", "Symbol", "Symbol"),
+    ("READS", "Symbol", "Symbol"),
+    ("WRITES", "Symbol", "Symbol"),
     ("TESTED_BY", "Symbol", "Symbol"),
     ("IMPORTS", "Module", "Module"),
     ("CONTAINS", "Module", "Symbol"),

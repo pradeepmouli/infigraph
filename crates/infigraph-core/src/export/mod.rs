@@ -93,44 +93,10 @@ pub fn export_cypher<W: Write>(backend: &dyn GraphBackend, writer: &mut W) -> Re
     }
     writeln!(writer)?;
 
-    // CALLS (Symbol -> Symbol)
-    let calls = backend.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
-    writeln!(writer, "// CALLS edges ({} edges)", calls.len())?;
-    for row in &calls {
-        let src = cypher_escape(&row[0]);
-        let dst = cypher_escape(&row[1]);
-        writeln!(
-            writer,
-            "MATCH (a:Symbol {{id: '{src}'}}), (b:Symbol {{id: '{dst}'}}) CREATE (a)-[:CALLS]->(b);"
-        )?;
-    }
-    writeln!(writer)?;
-
-    // INHERITS (Symbol -> Symbol)
-    let inherits =
-        backend.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
-    writeln!(writer, "// INHERITS edges ({} edges)", inherits.len())?;
-    for row in &inherits {
-        let src = cypher_escape(&row[0]);
-        let dst = cypher_escape(&row[1]);
-        writeln!(
-            writer,
-            "MATCH (a:Symbol {{id: '{src}'}}), (b:Symbol {{id: '{dst}'}}) CREATE (a)-[:INHERITS]->(b);"
-        )?;
-    }
-    writeln!(writer)?;
-
-    // TESTED_BY (Symbol -> Symbol)
-    let tested_by =
-        backend.raw_query("MATCH (a:Symbol)-[:TESTED_BY]->(b:Symbol) RETURN a.id, b.id")?;
-    writeln!(writer, "// TESTED_BY edges ({} edges)", tested_by.len())?;
-    for row in &tested_by {
-        let src = cypher_escape(&row[0]);
-        let dst = cypher_escape(&row[1]);
-        writeln!(
-            writer,
-            "MATCH (a:Symbol {{id: '{src}'}}), (b:Symbol {{id: '{dst}'}}) CREATE (a)-[:TESTED_BY]->(b);"
-        )?;
+    for (label, source, target) in backend.symbol_relationships()? {
+        let src = cypher_escape(&source);
+        let dst = cypher_escape(&target);
+        writeln!(writer, "MATCH (a:Symbol {{id: '{src}'}}), (b:Symbol {{id: '{dst}'}}) CREATE (a)-[:{label}]->(b);")?;
     }
 
     Ok(())
@@ -272,37 +238,12 @@ pub fn export_graphml<W: Write>(backend: &dyn GraphBackend, writer: &mut W) -> R
         edge_id += 1;
     }
 
-    let calls = backend.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
-    for row in &calls {
-        let src = xml_escape(&row[0]);
-        let dst = xml_escape(&row[1]);
+    for (label, source, target) in backend.symbol_relationships()? {
+        let src = xml_escape(&source);
+        let dst = xml_escape(&target);
         writeln!(
             writer,
-            r#"    <edge id="e{edge_id}" source="{src}" target="{dst}"><data key="d_label">CALLS</data></edge>"#
-        )?;
-        edge_id += 1;
-    }
-
-    let inherits =
-        backend.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
-    for row in &inherits {
-        let src = xml_escape(&row[0]);
-        let dst = xml_escape(&row[1]);
-        writeln!(
-            writer,
-            r#"    <edge id="e{edge_id}" source="{src}" target="{dst}"><data key="d_label">INHERITS</data></edge>"#
-        )?;
-        edge_id += 1;
-    }
-
-    let tested_by =
-        backend.raw_query("MATCH (a:Symbol)-[:TESTED_BY]->(b:Symbol) RETURN a.id, b.id")?;
-    for row in &tested_by {
-        let src = xml_escape(&row[0]);
-        let dst = xml_escape(&row[1]);
-        writeln!(
-            writer,
-            r#"    <edge id="e{edge_id}" source="{src}" target="{dst}"><data key="d_label">TESTED_BY</data></edge>"#
+            r#"    <edge id="e{edge_id}" source="{src}" target="{dst}"><data key="d_label">{label}</data></edge>"#
         )?;
         edge_id += 1;
     }
@@ -327,11 +268,7 @@ pub fn export_json<W: Write>(backend: &dyn GraphBackend, writer: &mut W) -> Resu
     // ── Collect edges ──
     let contains =
         backend.raw_query("MATCH (m:Module)-[:CONTAINS]->(s:Symbol) RETURN m.id, s.id")?;
-    let calls = backend.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
-    let inherits =
-        backend.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
-    let tested_by =
-        backend.raw_query("MATCH (a:Symbol)-[:TESTED_BY]->(b:Symbol) RETURN a.id, b.id")?;
+    let relationships = backend.symbol_relationships()?;
 
     // Build output using manual JSON to avoid adding serde_json as a dependency
     // (infigraph-core already has serde_json)
@@ -378,29 +315,26 @@ pub fn export_json<W: Write>(backend: &dyn GraphBackend, writer: &mut W) -> Resu
     writeln!(writer, "  ],")?;
     writeln!(writer, "  \"edges\": [")?;
 
-    let total_edges = contains.len() + calls.len() + inherits.len() + tested_by.len();
-    let mut edge_idx: usize = 0;
+    let total_edges = contains.len() + relationships.len();
 
-    let edge_sets: &[(&str, &Vec<Vec<String>>)] = &[
-        ("CONTAINS", &contains),
-        ("CALLS", &calls),
-        ("INHERITS", &inherits),
-        ("TESTED_BY", &tested_by),
-    ];
-
-    for (label, edges) in edge_sets {
-        for row in *edges {
-            let comma = if edge_idx + 1 < total_edges { "," } else { "" };
-            writeln!(
-                writer,
-                "    {{\"source\": \"{}\", \"target\": \"{}\", \"label\": \"{}\"}}{}",
-                json_escape(&row[0]),
-                json_escape(&row[1]),
-                label,
-                comma
-            )?;
-            edge_idx += 1;
-        }
+    let edge_sets = contains
+        .iter()
+        .map(|row| ("CONTAINS", row[0].as_str(), row[1].as_str()))
+        .chain(
+            relationships
+                .iter()
+                .map(|(label, source, target)| (label.as_str(), source.as_str(), target.as_str())),
+        );
+    for (edge_idx, (label, source, target)) in edge_sets.enumerate() {
+        let comma = if edge_idx + 1 < total_edges { "," } else { "" };
+        writeln!(
+            writer,
+            "    {{\"source\": \"{}\", \"target\": \"{}\", \"label\": \"{}\"}}{}",
+            json_escape(source),
+            json_escape(target),
+            label,
+            comma
+        )?;
     }
 
     writeln!(writer, "  ]")?;

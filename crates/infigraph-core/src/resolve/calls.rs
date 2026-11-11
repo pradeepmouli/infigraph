@@ -897,15 +897,13 @@ pub fn re_resolve_for_files(
     }
 
     for file in files {
-        let escaped = escape(file);
-        let _ = conn.query(&format!(
-            "MATCH (a:Symbol)-[r:CALLS]->(b:Symbol) WHERE a.file = '{}' DELETE r",
-            escaped
-        ));
-        let _ = conn.query(&format!(
-            "MATCH (a:Symbol)-[r:INHERITS]->(b:Symbol) WHERE a.file = '{}' DELETE r",
-            escaped
-        ));
+        for table in ["CALLS", "INHERITS", "IMPLEMENTS"] {
+            conn.query(&format!(
+                "MATCH (a:Symbol)-[r:{table}]->(b:Symbol) WHERE a.file = '{}' DELETE r",
+                escape(file)
+            ))
+            .map_err(|e| anyhow::anyhow!("clearing {table} before resolution: {e}"))?;
+        }
     }
 
     let mut symbol_map: HashMap<String, Vec<(String, String, String)>> = HashMap::new();

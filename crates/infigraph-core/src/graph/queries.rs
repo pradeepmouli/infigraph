@@ -203,9 +203,9 @@ impl<E: crate::graph::query_exec::QueryExec> GraphQuery<E> {
     /// Returns every place the symbol is called/used, for rename/refactor workflows.
     pub fn find_all_references(&self, symbol_id: &str) -> Result<Vec<ReferenceRow>> {
         let q = format!(
-            "MATCH (caller:Symbol)-[:CALLS]->(target:Symbol) \
+            "MATCH (caller:Symbol)-[:CALLS|READS|WRITES|INHERITS|IMPLEMENTS]->(target:Symbol) \
              WHERE target.id = '{}' \
-             RETURN caller.id, caller.name, caller.file, caller.start_line, target.id",
+             RETURN DISTINCT caller.id, caller.name, caller.file, caller.start_line, target.id",
             symbol_id.replace('\'', "\\'")
         );
         let result = self
@@ -323,7 +323,7 @@ impl<E: crate::graph::query_exec::QueryExec> GraphQuery<E> {
 
         // Ancestors: walk INHERITS edges upward
         let q_up = format!(
-            "MATCH (root:Symbol)-[:INHERITS* 1..{}]->(ancestor:Symbol) \
+            "MATCH (root:Symbol)-[:INHERITS|IMPLEMENTS* 1..{}]->(ancestor:Symbol) \
              WHERE root.id = '{}' \
              RETURN ancestor.id, ancestor.name, ancestor.kind, ancestor.file",
             max_depth, esc
@@ -346,7 +346,7 @@ impl<E: crate::graph::query_exec::QueryExec> GraphQuery<E> {
 
         // Descendants: walk INHERITS edges downward
         let q_down = format!(
-            "MATCH (descendant:Symbol)-[:INHERITS* 1..{}]->(root:Symbol) \
+            "MATCH (descendant:Symbol)-[:INHERITS|IMPLEMENTS* 1..{}]->(root:Symbol) \
              WHERE root.id = '{}' \
              RETURN descendant.id, descendant.name, descendant.kind, descendant.file",
             max_depth, esc

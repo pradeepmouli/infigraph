@@ -579,6 +579,15 @@ def get_settings():
 /// has the same base.py::BaseHandler, the cross-repo INHERITS bridge should fire.
 #[test]
 fn test_combined_graph_real_inherits_preserved() {
+    assert_cross_repo_heritage("INHERITS");
+}
+
+#[test]
+fn test_combined_graph_implements_preserved() {
+    assert_cross_repo_heritage("IMPLEMENTS");
+}
+
+fn assert_cross_repo_heritage(table: &str) {
     let _guard = COMBINED_LOCK.lock().unwrap();
     let home = tempfile::TempDir::new().unwrap();
     let orig_home = std::env::var("HOME").unwrap_or_default();
@@ -627,6 +636,15 @@ class BaseHandler:
     let ig_a = index_repo(&path_a);
     let ig_b = index_repo(&path_b);
 
+    if table == "IMPLEMENTS" {
+        let store = ig_a.store().unwrap();
+        let _write = store.write_lock().unwrap();
+        let conn = store.connection().unwrap();
+        conn.query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) CREATE (a)-[:IMPLEMENTS]->(b)")
+            .unwrap();
+        conn.query("MATCH ()-[r:INHERITS]->() DELETE r").unwrap();
+    }
+
     let mut registry = Registry {
         repos: HashMap::new(),
         groups: HashMap::new(),
@@ -670,15 +688,25 @@ class BaseHandler:
     // Cross-repo bridge should create INHERITS from lib-a::MyHandler to lib-b::BaseHandler.
     let cross_inherits = combined_query(
         "test-real-inherit",
-        "MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) \
+        &format!(
+            "MATCH (a:Symbol)-[:{table}]->(b:Symbol) \
          WHERE a.id STARTS WITH '[lib-a]' AND b.id STARTS WITH '[lib-b]' \
-         RETURN a.id, b.id",
+         RETURN a.id, b.id"
+        ),
     )
     .unwrap();
     assert!(
         !cross_inherits.is_empty(),
-        "MyHandler inheriting BaseHandler should bridge to lib-b's BaseHandler via same qualified key"
+        "MyHandler's {table} relation should bridge to lib-b's BaseHandler via the same qualified key"
     );
+    if table == "IMPLEMENTS" {
+        assert!(combined_query(
+            "test-real-inherit",
+            "MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id"
+        )
+        .unwrap()
+        .is_empty());
+    }
 
     std::env::set_var("HOME", &orig_home);
 }

@@ -2,6 +2,8 @@
 
 `spike/scip-tsrs` in `scratchpad/wt-docwatch`, based on `0870f460`. The Rust indexer calls the tsrs checker in its own process and writes SCIP through the same `scip` 0.10.0 bindings used by Infigraph.
 
+The published package and subsequent Infigraph work are covered in the [integration follow-up](INTEGRATION.md). The measurements below describe the original isolated spike.
+
 ## Build and project load
 
 | Item | Measured result |

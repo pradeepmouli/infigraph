@@ -506,10 +506,7 @@ mod disable_tests {
         assert_eq!(
             table,
             vec![
-                (
-                    "scip-typescript",
-                    vec!["typescript", "javascript", "tsx", "jsx"]
-                ),
+                ("scip-tsrs", vec!["typescript", "javascript", "tsx", "jsx"]),
                 ("scip-python", vec!["python"]),
                 ("rust-analyzer", vec!["rust"]),
                 ("scip-java", vec!["java", "kotlin", "scala"]),
@@ -535,15 +532,15 @@ mod disable_tests {
         let detected = set(&["typescript", "tsx", "python"]);
 
         let enabled = enabled_languages(tmp.path(), &detected);
-        assert!(enabled.contains("typescript"), "scip-typescript still runs");
+        assert!(enabled.contains("typescript"), "scip-tsrs still runs");
         assert!(!enabled.contains("tsx"));
         assert_eq!(
             still_served(tmp.path(), &detected),
             vec![StillServed {
-                indexer: "scip-typescript",
+                indexer: "scip-tsrs",
                 disabled: vec!["tsx".to_string()],
             }],
-            "doctor can say scip-typescript still runs for tsx"
+            "doctor can say scip-tsrs still runs for tsx"
         );
 
         project_disable(tmp.path(), &["tsx", "typescript"]);

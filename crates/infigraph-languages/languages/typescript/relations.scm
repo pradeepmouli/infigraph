@@ -30,7 +30,7 @@
 
 ; Class implements: class Foo implements Bar
 (class_declaration
-  name: (type_identifier) @inherit.child
+  name: (type_identifier) @implement.child
   (class_heritage
     (implements_clause
-      (_) @inherit.parent)))
+      (_) @implement.parent)))

@@ -381,11 +381,12 @@ impl CozoStore {
         params.insert("root".into(), DataValue::Str(symbol_id.into()));
 
         // Ancestors: unrolled layers walking INHERITS upward
-        let mut up_rules = String::new();
-        up_rules.push_str("layer_1[parent] := *inherits{child: $root, parent}\n");
+        let heritage = "heritage[child, parent] := *inherits{child, parent}\nheritage[child, parent] := *implements{child, parent}\n";
+        let mut up_rules = String::from(heritage);
+        up_rules.push_str("layer_1[parent] := heritage[$root, parent]\n");
         for d in 2..=max_depth {
             up_rules.push_str(&format!(
-                "layer_{d}[gp] := layer_{}[p], *inherits{{child: p, parent: gp}}\n",
+                "layer_{d}[gp] := layer_{}[p], heritage[p, gp]\n",
                 d - 1
             ));
         }
@@ -407,11 +408,11 @@ impl CozoStore {
             .collect();
 
         // Descendants: unrolled layers walking INHERITS downward
-        let mut down_rules = String::new();
-        down_rules.push_str("layer_1[child] := *inherits{child, parent: $root}\n");
+        let mut down_rules = String::from(heritage);
+        down_rules.push_str("layer_1[child] := heritage[child, $root]\n");
         for d in 2..=max_depth {
             down_rules.push_str(&format!(
-                "layer_{d}[gc] := layer_{}[p], *inherits{{child: gc, parent: p}}\n",
+                "layer_{d}[gc] := layer_{}[p], heritage[gc, p]\n",
                 d - 1
             ));
         }
@@ -1028,6 +1029,7 @@ impl CozoStore {
         // Delete other edges where source is in this file
         for (rel, col_a, col_b) in &[
             ("inherits", "child", "parent"),
+            ("implements", "child", "parent"),
             ("tested_by", "symbol_id", "test_id"),
             ("reads_rel", "reader", "target"),
             ("writes_rel", "writer", "target"),
@@ -1161,6 +1163,7 @@ impl CozoStore {
         // Insert relations grouped by type
         let mut calls_rows: Vec<(String, String, i64)> = Vec::new();
         let mut inherits_pairs: Vec<(String, String)> = Vec::new();
+        let mut implements_pairs: Vec<(String, String)> = Vec::new();
         let mut tested_by_pairs: Vec<(String, String)> = Vec::new();
         let mut imports_pairs: Vec<(String, String)> = Vec::new();
         let mut reads_pairs: Vec<(String, String)> = Vec::new();
@@ -1175,6 +1178,9 @@ impl CozoStore {
                 }
                 RelationKind::Inherits | RelationKind::InheritedBy => {
                     inherits_pairs.push((rel.source_id.clone(), rel.target_id.clone()));
+                }
+                RelationKind::Implements | RelationKind::ImplementedBy => {
+                    implements_pairs.push((rel.source_id.clone(), rel.target_id.clone()))
                 }
                 RelationKind::TestedBy | RelationKind::Tests => {
                     tested_by_pairs.push((rel.source_id.clone(), rel.target_id.clone()));
@@ -1200,6 +1206,7 @@ impl CozoStore {
 
         self.import_calls_with_lines(&calls_rows)?;
         self.import_edges("inherits", &inherits_pairs)?;
+        self.import_edges("implements", &implements_pairs)?;
         self.import_edges("tested_by", &tested_by_pairs)?;
         self.import_edges("imports", &imports_pairs)?;
         self.import_edges("reads_rel", &reads_pairs)?;
@@ -1666,6 +1673,7 @@ impl CozoStore {
             ("imports", "importer"),
             ("contains", "module_id"),
             ("inherits", "child"),
+            ("implements", "child"),
             ("tested_by", "symbol_id"),
             ("reads_rel", "reader"),
             ("writes_rel", "writer"),
@@ -1719,6 +1727,7 @@ const COZO_SCHEMA: &[&str] = &[
     ":create imports {importer: String, imported: String}",
     ":create contains {module_id: String, symbol_id: String}",
     ":create inherits {child: String, parent: String}",
+    ":create implements {child: String, parent: String}",
     ":create tested_by {symbol_id: String, test_id: String}",
     ":create reads_rel {reader: String, target: String}",
     ":create writes_rel {writer: String, target: String}",
@@ -1786,7 +1795,7 @@ const COZO_INDICES: &[&str] = &[
 fn edge_columns(relation: &str) -> (&'static str, &'static str) {
     match relation {
         "calls" => ("caller", "callee"),
-        "inherits" => ("child", "parent"),
+        "inherits" | "implements" => ("child", "parent"),
         "tested_by" => ("symbol_id", "test_id"),
         "contains" => ("module_id", "symbol_id"),
         "defines" => ("file_id", "symbol_id"),

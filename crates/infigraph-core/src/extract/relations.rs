@@ -83,15 +83,23 @@ pub fn extract_relations_with_custom_edges(
                     rel_kind = Some(RelationKind::Imports);
                     source_name = Some(file.to_string());
                 }
-                "inherit.child" => {
+                "inherit.child" | "implement.child" => {
                     source_name = Some(resolve_compound_node_text(node, source, decompose_query));
                     if rel_kind.is_none() {
-                        rel_kind = Some(RelationKind::Inherits);
+                        rel_kind = Some(if cap_name.starts_with("implement.") {
+                            RelationKind::Implements
+                        } else {
+                            RelationKind::Inherits
+                        });
                     }
                 }
-                "inherit.parent" => {
+                "inherit.parent" | "implement.parent" => {
                     target_name = Some(resolve_compound_node_text(node, source, decompose_query));
-                    rel_kind = Some(RelationKind::Inherits);
+                    rel_kind = Some(if cap_name.starts_with("implement.") {
+                        RelationKind::Implements
+                    } else {
+                        RelationKind::Inherits
+                    });
                 }
                 other => {
                     // Check for custom edge captures: "{capture}.source", "{capture}.target",

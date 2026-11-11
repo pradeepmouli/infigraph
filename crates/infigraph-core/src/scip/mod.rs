@@ -16,6 +16,7 @@ use crate::graph::store_util::{
 use crate::graph::GraphStore;
 use crate::model::{Span, SymbolKind};
 
+mod metadata;
 mod snapshot;
 pub use snapshot::{changed_since, remove_scratch, snapshot_path, write_snapshot};
 
@@ -86,7 +87,7 @@ fn make_ids_unique(
                 .map(|n| format!("{base}#{n}"))
                 .find(|id| !existing.contains(id) && !taken.contains_key(id))
                 .expect("an unbounded range has a free ordinal");
-            renamed.push((row.7.clone(), free.clone()));
+            renamed.push((metadata::symbol_key(&row.3, &row.7), free.clone()));
             row.0 = free;
         }
         taken.insert(row.0.clone(), (row.7.clone(), row.4));
@@ -151,15 +152,16 @@ fn scip_ledger_path(infigraph_dir: &Path) -> std::path::PathBuf {
     infigraph_dir.join("scip-imports.json")
 }
 
+// Increment when the same SCIP input must be replayed under new import
+// semantics. The ledger predates revisions; a missing revision is stale.
+const SCIP_IMPORT_REVISION: u64 = 1;
+
 /// The language tags each SCIP indexer serves, by indexer binary: the one
 /// table both the CLI's download catalog (`scip_download::CATALOG`) and the
 /// `[scip] disable` check read. A tag is a language name as the extractor
 /// stores it (`Symbol.language`).
 pub const INDEXER_LANGUAGES: &[(&str, &[&str])] = &[
-    (
-        "scip-typescript",
-        &["typescript", "javascript", "tsx", "jsx"],
-    ),
+    ("scip-tsrs", &["typescript", "javascript", "tsx", "jsx"]),
     ("scip-python", &["python"]),
     ("rust-analyzer", &["rust"]),
     ("scip-java", &["java", "kotlin", "scala"]),
@@ -226,6 +228,10 @@ pub fn scip_import_is_redundant(
     };
     entry.get("hash").and_then(serde_json::Value::as_u64) == Some(hash)
         && entry
+            .get("importer_revision")
+            .and_then(serde_json::Value::as_u64)
+            == Some(SCIP_IMPORT_REVISION)
+        && entry
             .get("scip_generation")
             .and_then(serde_json::Value::as_i64)
             == Some(current_scip_generation)
@@ -276,6 +282,7 @@ pub fn record_scip_import(
             serde_json::json!({
                 "hash": hash,
                 "scip_generation": stamped_scip_generation,
+                "importer_revision": SCIP_IMPORT_REVISION,
             }),
         );
     }
@@ -553,6 +560,7 @@ fn import_scip_index_unrecorded(
     // from). See the sibling Symbol preload below for why a failure here must
     // propagate.
     let existing_calls = preload_symbol_edges(&conn, "CALLS")?;
+    let existing_implementations = preload_symbol_edges(&conn, "IMPLEMENTS")?;
     clock.lap("lock+preload edges");
 
     // Pre-load all symbols from graph into memory: (file, name) -> Vec<(start_line,
@@ -661,6 +669,18 @@ fn import_scip_index_unrecorded(
         .into_iter()
         .filter(|d| !stale.contains(&d.relative_path))
         .collect();
+    let document_languages: HashMap<&str, String> = documents
+        .iter()
+        .map(|doc| {
+            let language = match doc.language.to_ascii_lowercase().as_str() {
+                "typescriptreact" => "tsx".to_owned(),
+                "javascriptreact" => "jsx".to_owned(),
+                "" => "scip".to_owned(),
+                other => other.to_owned(),
+            };
+            (doc.relative_path.as_str(), language)
+        })
+        .collect();
     clock.lap("preload files");
     stats.files_skipped = skipped.len();
     stats.files_stale = stale.len();
@@ -759,7 +779,12 @@ fn import_scip_index_unrecorded(
                 continue;
             }
             let scip_sym = &occ.symbol;
-            if scip_sym.starts_with("local ") || scip_sym.starts_with('<') {
+            let si = sym_info_map.get(scip_sym.as_str());
+            let local_id = scip_sym
+                .starts_with("local ")
+                .then(|| si.and_then(|si| metadata::local_id(file, si, &sym_info_map)))
+                .flatten();
+            if scip_sym.starts_with('<') || (scip_sym.starts_with("local ") && local_id.is_none()) {
                 continue;
             }
             if is_member_of_known_symbol(scip_sym, &scip_sym_to_file_name) {
@@ -787,13 +812,10 @@ fn import_scip_index_unrecorded(
                 .filter(|member| names_literal_key(scip_sym, &member.name));
             let name = match literal {
                 Some(member) => member.name.clone(),
+                None if local_id.is_some() => si.unwrap().display_name.clone(),
                 None => scip_sym_to_name(scip_sym),
             };
-            let si = sym_info_map.get(scip_sym.as_str());
-            let docstring = si
-                .and_then(|s| s.documentation.first())
-                .map(|s| s.as_str())
-                .unwrap_or("");
+            let docstring = metadata::documentation(si);
 
             let key = (file.clone(), name.clone());
             // Among same-named candidates, pick the ONE whose span contains this
@@ -818,15 +840,31 @@ fn import_scip_index_unrecorded(
             // and the second would merge into the first (889 sittir rows).
             // The id a literal member's own tree-sitter row would carry: the
             // best of several same-line candidates.
+            let owner_bound = local_id.is_some()
+                || (literal.is_none() && si.is_some_and(|info| !info.enclosing_symbol.is_empty()));
             let own_id = literal
                 .as_ref()
-                .map(|member| qualified_id(file, &member.owners, &name));
+                .map(|member| qualified_id(file, &member.owners, &name))
+                .or_else(|| local_id.clone())
+                .or_else(|| owner_bound.then(|| scip_symbol_id(file, scip_sym, &name)));
+            // An interface member absent from the AST must not enrich the
+            // only same-named class method. Rich SCIP metadata constrains
+            // both containment matching and the lone-candidate fallback.
+            let same_owner = |id: &str| {
+                !owner_bound
+                    || own_id
+                        .as_ref()
+                        .is_some_and(|own| without_ordinal(id) == without_ordinal(own))
+            };
             // Best candidate first: the row an earlier import gave THIS moniker,
             // then one with no moniker yet, then (a merged declaration, whose
             // two monikers share a row) one carrying another's. A row this pass
             // already gave another moniker is never a candidate, so sibling
             // members never share one.
             let rank = |s: u32, e: u32, id: &String| -> Option<u8> {
+                if !same_owner(id) {
+                    return None;
+                }
                 if made_in_pass
                     .get(&(id.clone(), s))
                     .is_some_and(|moniker| moniker != scip_sym)
@@ -840,6 +878,9 @@ fn import_scip_index_unrecorded(
                 let taken = enriched_in_pass
                     .get(&(id.clone(), s))
                     .is_some_and(|m| m != scip_sym);
+                if local_id.is_some() && taken {
+                    return None;
+                }
                 if literal.is_some() {
                     if taken {
                         return None;
@@ -850,7 +891,9 @@ fn import_scip_index_unrecorded(
                     return match moniker {
                         Some(moniker) => (moniker == scip_sym).then_some(0),
                         None => (span.start_line == s
-                            && existing.get(id).is_some_and(|e| e.kind == "method"))
+                            && existing
+                                .get(id)
+                                .is_some_and(|e| e.kind.eq_ignore_ascii_case("method")))
                         .then_some(if Some(id) == own_id.as_ref() { 1 } else { 2 }),
                     };
                 }
@@ -882,12 +925,14 @@ fn import_scip_index_unrecorded(
                 .min_by_key(|(r, ..)| *r)
                 .map(|(_, s, id)| (s, id.clone()))
                 .or_else(|| {
-                    if literal.is_some() {
+                    if literal.is_some() || local_id.is_some() {
                         return None;
                     }
                     file_name_to_ids.get(&key).and_then(|c| {
                         if c.len() == 1 {
-                            c.first().map(|(s, _, id)| (*s, id.clone()))
+                            c.first()
+                                .filter(|(_, _, id)| same_owner(id))
+                                .map(|(s, _, id)| (*s, id.clone()))
                         } else {
                             None
                         }
@@ -897,12 +942,12 @@ fn import_scip_index_unrecorded(
             if let Some((matched_start, sid)) = matched {
                 enriched_in_pass.insert((sid.clone(), matched_start), scip_sym.clone());
                 if existing.get(&sid).map(|e| e.enrichment)
-                    != Some(enrichment_hash(docstring, scip_sym))
+                    != Some(enrichment_hash(&docstring, scip_sym))
                 {
                     enrichments.push((sid.clone(), docstring.to_string(), scip_sym.clone()));
                     stats.symbols_enriched += 1;
                 }
-                scip_sym_to_ts_id.insert(scip_sym.clone(), sid);
+                scip_sym_to_ts_id.insert(metadata::symbol_key(file, scip_sym), sid);
             } else {
                 let kind = match si.map(|s| s.kind.enum_value_or_default()) {
                     Some(indexer_kind)
@@ -914,24 +959,27 @@ fn import_scip_index_unrecorded(
                 };
                 let sym_id = match literal {
                     Some(member) => qualified_id(file, &member.owners, &name),
-                    None => scip_symbol_id(file, scip_sym, &name),
+                    None => local_id.unwrap_or_else(|| scip_symbol_id(file, scip_sym, &name)),
                 };
+                let (sl, _, el, _) = metadata::declaration_range(occ);
+                let declared_start = scip_line_to_1based(sl);
+                let declared_end = scip_line_to_1based(el);
                 new_symbols.push((
                     sym_id.clone(),
                     name.clone(),
                     kind.as_str().to_string(),
                     file.clone(),
-                    span.start_line,
-                    span.end_line,
+                    declared_start,
+                    declared_end,
                     docstring.to_string(),
                     scip_sym.clone(),
                 ));
                 stats.symbols_added += 1;
-                made_in_pass.insert((sym_id.clone(), span.start_line), scip_sym.clone());
-                scip_sym_to_ts_id.insert(scip_sym.clone(), sym_id.clone());
+                made_in_pass.insert((sym_id.clone(), declared_start), scip_sym.clone());
+                scip_sym_to_ts_id.insert(metadata::symbol_key(file, scip_sym), sym_id.clone());
                 made_name_to_ids.entry(key).or_default().push((
-                    span.start_line,
-                    span.end_line,
+                    declared_start,
+                    declared_end,
                     sym_id.clone(),
                 ));
             }
@@ -990,7 +1038,10 @@ fn import_scip_index_unrecorded(
             for (n, i) in idxs.into_iter().enumerate() {
                 let new_id = format!("{base}#{}", existing_count + n + 1);
                 new_symbols[i].0 = new_id.clone();
-                scip_sym_to_ts_id.insert(new_symbols[i].7.clone(), new_id);
+                scip_sym_to_ts_id.insert(
+                    metadata::symbol_key(&new_symbols[i].3, &new_symbols[i].7),
+                    new_id,
+                );
             }
         }
     }
@@ -1086,7 +1137,15 @@ fn import_scip_index_unrecorded(
                 .collect();
             let n = remaining.len();
             let empty_str: Vec<&str> = vec![""; n];
-            let scip_lang: Vec<&str> = vec!["scip"; n];
+            let scip_lang: Vec<&str> = remaining
+                .iter()
+                .map(|row| {
+                    document_languages
+                        .get(row.3.as_str())
+                        .map(String::as_str)
+                        .unwrap_or("scip")
+                })
+                .collect();
             let pub_vis: Vec<&str> = vec!["public"; n];
             let zeros: Vec<i64> = vec![0; n];
             let empty_str2: Vec<&str> = vec![""; n];
@@ -1190,7 +1249,7 @@ fn import_scip_index_unrecorded(
                     .iter()
                     .map(|(id, name, kind, file, start, end, doc, scip_id)| {
                         format!(
-                            "{{id: '{}', name: '{}', kind: '{}', file: '{}', sl: {}, el: {}, doc: '{}', scip: '{}'}}",
+                            "{{id: '{}', name: '{}', kind: '{}', file: '{}', sl: {}, el: {}, doc: '{}', scip: '{}', lang: '{}'}}",
                             escape(id),
                             escape(name),
                             escape(kind),
@@ -1198,12 +1257,13 @@ fn import_scip_index_unrecorded(
                             start,
                             end,
                             escape(doc),
-                            escape(scip_id)
+                            escape(scip_id),
+                            document_languages.get(file.as_str()).map(String::as_str).unwrap_or("scip")
                         )
                     })
                     .collect();
                 let _ = conn.query(&format!(
-                    "UNWIND [{}] AS s CREATE (:Symbol {{id: s.id, name: s.name, kind: s.kind, file: s.file, start_line: s.sl, end_line: s.el, signature_hash: '', language: 'scip', visibility: 'public', parent: '', docstring: s.doc, complexity: 0, parameters: '', return_type: '', scip_id: s.scip}})",
+                    "UNWIND [{}] AS s CREATE (:Symbol {{id: s.id, name: s.name, kind: s.kind, file: s.file, start_line: s.sl, end_line: s.el, signature_hash: '', language: s.lang, visibility: 'public', parent: '', docstring: s.doc, complexity: 0, parameters: '', return_type: '', scip_id: s.scip}})",
                     rows.join(", ")
                 ));
             }
@@ -1240,51 +1300,116 @@ fn import_scip_index_unrecorded(
 
     clock.lap("symbol COPY+enrich");
 
-    // Pass 2: build CALLS edges from references (all in-memory)
-    let mut calls_to_create: Vec<(String, String)> = Vec::new();
-    let mut seen_edges: std::collections::HashSet<(String, String)> =
-        std::collections::HashSet::new();
+    // Metadata enriches node attributes only after final ids (including any
+    // ordinal collision fixes) are known. Local ids stay raw in scip_id, while
+    // every internal lookup keys them by the document as required by SCIP.
+    let mut kinds = HashMap::new();
+    let mut non_containers = std::collections::HashSet::new();
+    let mut parent_updates = Vec::new();
+    for doc in &documents {
+        for info in &doc.symbols {
+            let key = metadata::symbol_key(&doc.relative_path, &info.symbol);
+            let kind = info.kind.enum_value_or_default();
+            if kind != symbol_information::Kind::UnspecifiedKind {
+                kinds.insert(key.clone(), kind);
+            }
+            let Some(id) = scip_sym_to_ts_id.get(&key) else {
+                continue;
+            };
+            if kind != symbol_information::Kind::UnspecifiedKind
+                && !metadata::is_container(scip_kind_to_prism(&kind).as_str())
+                && !existing
+                    .get(id)
+                    .is_some_and(|e| metadata::is_container(&e.kind))
+            {
+                non_containers.insert(id.as_str());
+            }
+            let parent = scip_sym_to_ts_id.get(&metadata::symbol_key(
+                &doc.relative_path,
+                &info.enclosing_symbol,
+            ));
+            if info.symbol.starts_with("local ")
+                || (!existing_symbol_ids.contains(id) && parent.is_some())
+            {
+                parent_updates.push((
+                    id.clone(),
+                    parent.cloned().unwrap_or_default(),
+                    info.symbol.starts_with("local "),
+                ));
+            }
+        }
+    }
+    let mut gate = store.growth_gate(1);
+    for chunk in parent_updates.chunks(CHUNK) {
+        gate.tick()?;
+        let _phase = crate::write_phase::enter(&"scip-import: scope metadata", chunk.len() as u64);
+        let values: Vec<_> = chunk
+            .iter()
+            .map(|(id, parent, local)| {
+                format!(
+                    "{{id: '{}', parent: '{}', visibility: '{}'}}",
+                    escape(id),
+                    escape(parent),
+                    if *local { "private" } else { "public" }
+                )
+            })
+            .collect();
+        conn.query(&format!("UNWIND [{}] AS e MATCH (s:Symbol) WHERE s.id = e.id SET s.parent = e.parent, s.visibility = e.visibility", values.join(", ")))
+            .context("SCIP import: writing enclosing symbols")?;
+    }
 
+    // Only explicit metadata narrows the legacy containment lookup. A
+    // kind-less object property may own an initializer call, while a typed
+    // local variable must not steal references from its enclosing function.
+    for symbols in file_symbols.values_mut() {
+        symbols.retain(|(_, _, id)| !non_containers.contains(id.as_str()));
+    }
+
+    // Pass 2: occurrences retain the distinction between calls and reads /
+    // writes. A named local variable cannot become a call or a caller just
+    // because its token shares a line with a function body.
+    let mut reference_edges: std::collections::BTreeMap<
+        &str,
+        std::collections::HashSet<(String, String)>,
+    > = Default::default();
     for doc in &documents {
         let file = &doc.relative_path;
-
         for occ in &doc.occurrences {
-            if (occ.symbol_roles & SymbolRole::Definition as i32) != 0 {
+            if (occ.symbol_roles & SymbolRole::Definition as i32) != 0
+                || occ.symbol.starts_with('<')
+            {
                 continue;
             }
-            if occ.symbol.starts_with("local ") || occ.symbol.starts_with('<') {
-                continue;
-            }
-
             let ref_line = scip_line_to_1based(occurrence_range(occ).0);
-
-            let container_id = if let Some(syms) = file_symbols.get(file.as_str()) {
-                syms.iter()
+            let container = file_symbols.get(file).and_then(|symbols| {
+                symbols
+                    .iter()
                     .find(|(start, end, _)| ref_line >= *start && ref_line <= *end)
                     .map(|(_, _, id)| id.clone())
-            } else {
-                None
-            };
-            let Some(container_id) = container_id else {
+            });
+            let Some(container_id) = container else {
                 continue;
             };
-
-            // Direct, exact lookup via the SCIP moniker itself -- built once in
-            // Pass 1 as each definition was correlated to its tree-sitter
-            // symbol, so this never suffers the (file, name) collision the old
-            // two-step scip_sym_to_file_name -> file_name_to_ids chain did.
-            let Some(target_id) = scip_sym_to_ts_id.get(&occ.symbol).cloned() else {
+            let key = metadata::symbol_key(file, &occ.symbol);
+            let Some(target_id) = scip_sym_to_ts_id.get(&key).cloned() else {
                 continue;
             };
-
             if container_id == target_id {
                 continue;
             }
-
+            let kind = if existing
+                .get(&target_id)
+                .is_some_and(|e| e.kind.eq_ignore_ascii_case("Function"))
+            {
+                Some(symbol_information::Kind::Function)
+            } else {
+                kinds.get(&key).copied()
+            };
+            let tables = metadata::reference_tables(kind, occ.symbol_roles);
             // Detect SCIP correction: if tree-sitter had a CALLS edge from
             // container_id to a *different* target for the same call name,
             // SCIP is overriding it — record as a learned pattern.
-            if project_root.is_some() {
+            if tables.contains(&"CALLS") && project_root.is_some() {
                 if let Some(existing_targets) = existing_calls.get(&container_id) {
                     let call_name = target_id.rsplit("::").next().unwrap_or(&target_id);
                     let target_file = target_id
@@ -1309,102 +1434,119 @@ fn import_scip_index_unrecorded(
                 }
             }
 
-            let edge = (container_id, target_id);
-            if seen_edges.insert(edge.clone()) {
-                calls_to_create.push(edge);
+            for &table in tables {
+                reference_edges
+                    .entry(table)
+                    .or_default()
+                    .insert((container_id.clone(), target_id.clone()));
             }
         }
     }
-
-    // Bulk write CALLS edges via Parquet COPY FROM, dropping any bad-PK
-    // record and retrying rather than falling back to UNWIND for the batch.
-    let calls_to_create = crate::graph::store_util::absent_edges(
-        &conn,
-        "CALLS",
-        "Symbol",
-        "Symbol",
-        calls_to_create,
-    )?;
-    if !calls_to_create.is_empty() {
-        let edge_pq = staging_parquet("infigraph_scip_calls");
-        stats.references_added = calls_to_create.len();
-        let _phase =
-            crate::write_phase::enter(&"scip-import: COPY CALLS", stats.references_added as u64);
+    for (table, edges) in reference_edges {
+        let pairs = crate::graph::store_util::absent_edges(
+            &conn,
+            table,
+            "Symbol",
+            "Symbol",
+            edges.into_iter().collect(),
+        )?;
+        stats.references_added += pairs.len();
+        if pairs.is_empty() {
+            continue;
+        }
+        let _phase = crate::write_phase::enter(&"scip-import: reference edges", pairs.len() as u64);
         copy_edges_with_bad_record_retry(
             store,
-            "CALLS",
-            calls_to_create,
+            table,
+            pairs,
             "Symbol",
             "Symbol",
-            &edge_pq,
+            &staging_parquet("infigraph_scip_references"),
         )?;
     }
 
-    // Pass 3: build INHERITS edges from SCIP's compiler-verified is_implementation
-    // relationships (class/interface/trait implementation and inheritance).
-    // Mapped onto the same RelationKind::Inherits used by tree-sitter's
-    // @inherit.child/@inherit.parent captures, since no language's relations.scm
-    // currently distinguishes extends from implements.
-    let mut inherits_to_create: Vec<(String, String)> = Vec::new();
-    let mut seen_inherits: std::collections::HashSet<(String, String)> =
-        std::collections::HashSet::new();
-
+    // Pass 3: is_implementation covers both heritage and member contracts in
+    // the SCIP protocol. Explicit kinds distinguish class->interface and
+    // member implementations from type inheritance. Legacy metadata falls
+    // back to INHERITS as before.
+    let mut relationships: std::collections::BTreeMap<
+        &str,
+        std::collections::HashSet<(String, String)>,
+    > = Default::default();
     for doc in &documents {
-        for si in &doc.symbols {
-            if si.symbol.starts_with("local ") || si.symbol.starts_with('<') {
-                continue;
-            }
-            // Same direct scip_sym_to_ts_id lookup as Pass 2 -- see its comment.
-            let Some(source_id) = scip_sym_to_ts_id.get(&si.symbol).cloned() else {
+        for info in &doc.symbols {
+            let key = metadata::symbol_key(&doc.relative_path, &info.symbol);
+            let Some(source) = scip_sym_to_ts_id.get(&key) else {
                 continue;
             };
-
-            for rel in &si.relationships {
+            for rel in &info.relationships {
                 if !rel.is_implementation {
                     continue;
                 }
-                let Some(target_id) = scip_sym_to_ts_id.get(&rel.symbol).cloned() else {
+                let target_key = metadata::symbol_key(&doc.relative_path, &rel.symbol);
+                let Some(target) = scip_sym_to_ts_id.get(&target_key) else {
                     continue;
                 };
-
-                if source_id == target_id {
+                if source == target {
                     continue;
                 }
-
-                let edge = (source_id.clone(), target_id);
-                if seen_inherits.insert(edge.clone()) {
-                    inherits_to_create.push(edge);
-                }
+                // TypeScript also permits `implements SomeClass`. In that
+                // case both SCIP kinds are Class; the AST carries the keyword.
+                let table = if existing_implementations
+                    .get(source)
+                    .is_some_and(|targets| targets.contains(target))
+                {
+                    "IMPLEMENTS"
+                } else {
+                    metadata::implementation_table(
+                        kinds.get(&key).copied(),
+                        kinds.get(&target_key).copied(),
+                    )
+                };
+                relationships
+                    .entry(table)
+                    .or_default()
+                    .insert((source.clone(), target.clone()));
             }
         }
     }
-
-    // Bulk write INHERITS edges via Parquet COPY FROM, dropping any bad-PK
-    // record and retrying rather than falling back to UNWIND for the batch.
-    let inherits_to_create = crate::graph::store_util::absent_edges(
-        &conn,
-        "INHERITS",
-        "Symbol",
-        "Symbol",
-        inherits_to_create,
-    )?;
-    if !inherits_to_create.is_empty() {
-        // Run-unique name (#139): two concurrent imports -- a user-run
-        // `scip-enrich`/`index --full` alongside the daemon's own
-        // staleness-triggered enrichment -- must not COPY from, or delete,
-        // each other's edge file. `copy_edges_with_bad_record_retry` removes
-        // it when done, so nothing accumulates on the happy path.
-        let edge_pq = staging_parquet("infigraph_scip_inherits");
-        stats.relations_added = inherits_to_create.len();
+    // Remove precisely the legacy misclassified pairs when a rich producer
+    // proves them to be implementations. Other inheritance stays untouched.
+    if let Some(pairs) = relationships.get("IMPLEMENTS") {
+        for chunk in pairs.iter().collect::<Vec<_>>().chunks(CHUNK) {
+            let _phase =
+                crate::write_phase::enter(&"scip-import: correct heritage", chunk.len() as u64);
+            let rows: Vec<_> = chunk
+                .iter()
+                .map(|(source, target)| {
+                    format!("{{a: '{}', b: '{}'}}", escape(source), escape(target))
+                })
+                .collect();
+            conn.query(&format!("UNWIND [{}] AS p MATCH (a:Symbol)-[r:INHERITS]->(b:Symbol) WHERE a.id = p.a AND b.id = p.b DELETE r", rows.join(", ")))
+                .context("SCIP import: correcting implementation edges")?;
+        }
+    }
+    for (table, edges) in relationships {
+        let pairs = crate::graph::store_util::absent_edges(
+            &conn,
+            table,
+            "Symbol",
+            "Symbol",
+            edges.into_iter().collect(),
+        )?;
+        stats.relations_added += pairs.len();
+        if pairs.is_empty() {
+            continue;
+        }
         let _phase =
-            crate::write_phase::enter(&"scip-import: COPY INHERITS", stats.relations_added as u64);
+            crate::write_phase::enter(&"scip-import: implementation edges", pairs.len() as u64);
         copy_edges_with_bad_record_retry(
             store,
-            "INHERITS",
-            inherits_to_create,
+            table,
+            pairs,
             "Symbol",
             "Symbol",
-            &edge_pq,
+            &staging_parquet("infigraph_scip_implementations"),
         )?;
     }
 
@@ -2056,7 +2198,7 @@ fn scip_kind_to_prism(kind: &symbol_information::Kind) -> SymbolKind {
         Interface => SymbolKind::Interface,
         Trait | TypeClass => SymbolKind::Trait,
         Enum | EnumMember => SymbolKind::Enum,
-        Module | Namespace | Package => SymbolKind::Module,
+        File | Module | Namespace | Package => SymbolKind::Module,
         Variable | StaticVariable | Field | Property | SelfParameter | Parameter => {
             SymbolKind::Variable
         }
@@ -2134,7 +2276,7 @@ impl std::fmt::Display for ImportStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "enriched {} symbols, {} new symbols, {} references, {} inherits edges, \
+            "enriched {} symbols, {} new symbols, {} references, {} type relationships, \
              {} corrections learned ({} files processed, {} skipped: no File node{}{})",
             self.symbols_enriched,
             self.symbols_added,
@@ -4714,6 +4856,234 @@ mod tests {
         let again = import_defs(&env, "t.ts", &[(&a, 1), (&b, 5)]);
         assert_eq!(again.symbols_added, 0, "matched rows stay matched");
         assert_eq!(ids_in_line_order(&env), vec!["t.ts::A::m", "t.ts::B::m"]);
+    }
+    #[test]
+    fn an_importer_update_replays_an_unchanged_scip() {
+        let directory = tempfile::tempdir().unwrap();
+        record_scip_import(directory.path(), "scip-tsrs", 123, 9);
+        assert!(scip_import_is_redundant(
+            directory.path(),
+            "scip-tsrs",
+            123,
+            9
+        ));
+        let path = scip_ledger_path(directory.path());
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        ledger
+            .get_mut("scip-tsrs")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("importer_revision");
+        std::fs::write(&path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+        assert!(!scip_import_is_redundant(
+            directory.path(),
+            "scip-tsrs",
+            123,
+            9
+        ));
+    }
+
+    #[test]
+    fn rich_scip_imports_scoped_locals_and_distinguishes_contracts_from_inheritance() {
+        use scip::types::symbol_information::Kind;
+        use scip::types::{MultiLineRange, SingleLineRange};
+        let env = TestEnv::new();
+        env.add_file("a.ts");
+        env.add_file("b.ts");
+        // Mirror the real AST gap: the class method is indexed, while the
+        // same-named interface signature will be discovered only by SCIP.
+        {
+            let _lock = env.store.write_lock().unwrap();
+            let conn = env.store.connection().unwrap();
+            conn.query("CREATE (:Symbol {id: 'a.ts::Parent::run', name: 'run', kind: 'Method', file: 'a.ts', start_line: 1, end_line: 1, signature_hash: '', language: 'typescript', visibility: 'public', parent: 'a.ts::Parent', docstring: '', complexity: 0, parameters: '', return_type: '', scip_id: ''})").unwrap();
+            conn.query("MATCH (f:File {id: 'a.ts'}), (s:Symbol {id: 'a.ts::Parent::run'}) CREATE (f)-[:DEFINES]->(s)").unwrap();
+        }
+        let global = |file: &str, descriptor: &str| {
+            format!("scip-typescript npm native-test 1.0.0 `{file}`/{descriptor}")
+        };
+        let parent = global("a.ts", "Parent#");
+        let contract = global("a.ts", "Contract#");
+        let child = global("a.ts", "Child#");
+        let widget = global("a.ts", "Widget#");
+        let abstract_run = format!("{contract}run().");
+        let run = format!("{widget}run().");
+        let one = global("a.ts", "one().");
+        let two = global("b.ts", "two().");
+        let related = |symbol: &str| Relationship {
+            symbol: symbol.into(),
+            is_implementation: true,
+            ..Default::default()
+        };
+        let info = |symbol: &str,
+                    name: &str,
+                    kind: Kind,
+                    owner: &str,
+                    relationships: Vec<Relationship>| SymbolInformation {
+            symbol: symbol.into(),
+            display_name: name.into(),
+            kind: kind.into(),
+            enclosing_symbol: owner.into(),
+            relationships,
+            ..Default::default()
+        };
+        let occurrence = |symbol: &str, line: i32, roles: i32, extent: Option<i32>| {
+            let mut occurrence = Occurrence {
+                symbol: symbol.into(),
+                symbol_roles: roles,
+                ..Default::default()
+            };
+            occurrence.set_single_line_range(SingleLineRange {
+                line,
+                start_character: 0,
+                end_character: 3,
+                ..Default::default()
+            });
+            if let Some(end_line) = extent {
+                occurrence.set_multi_line_enclosing_range(MultiLineRange {
+                    start_line: line,
+                    start_character: 0,
+                    end_line,
+                    end_character: 1,
+                    ..Default::default()
+                });
+            }
+            occurrence
+        };
+        let definition = SymbolRole::Definition as i32;
+        let mut a = Document {
+            language: "TypeScript".into(),
+            relative_path: "a.ts".into(),
+            symbols: vec![
+                info(&parent, "Parent", Kind::Class, "", vec![]),
+                info(&contract, "Contract", Kind::Interface, "", vec![]),
+                info(
+                    &child,
+                    "Child",
+                    Kind::Interface,
+                    "",
+                    vec![related(&contract)],
+                ),
+                info(
+                    &widget,
+                    "Widget",
+                    Kind::Class,
+                    "",
+                    vec![related(&parent), related(&child)],
+                ),
+                info(&abstract_run, "run", Kind::Method, &contract, vec![]),
+                info(
+                    &run,
+                    "run",
+                    Kind::Method,
+                    &widget,
+                    vec![related(&abstract_run)],
+                ),
+                info(&one, "one", Kind::Function, "", vec![]),
+                info("local 0", "count", Kind::Variable, &one, vec![]),
+                info("local 99", "", Kind::UnspecifiedKind, &one, vec![]),
+            ],
+            occurrences: vec![
+                occurrence(&parent, 0, definition, None),
+                occurrence(&contract, 2, definition, None),
+                occurrence(&abstract_run, 3, definition, None),
+                occurrence(&child, 4, definition, None),
+                occurrence(&widget, 5, definition, Some(8)),
+                occurrence(&run, 6, definition, Some(7)),
+                occurrence(&one, 10, definition, Some(16)),
+                occurrence("local 0", 11, definition, None),
+                // A same-line read must belong to the enclosing function,
+                // even though the variable's token is the narrowest span.
+                occurrence(
+                    "local 0",
+                    11,
+                    SymbolRole::ReadAccess as i32 | SymbolRole::WriteAccess as i32,
+                    None,
+                ),
+                occurrence("local 99", 13, definition, None),
+            ],
+            ..Default::default()
+        };
+        a.symbols[6].documentation = vec!["Computes a result.".into()];
+        a.symbols[6].signature_documentation =
+            protobuf::MessageField::some(scip::types::Signature {
+                language: "TypeScript".into(),
+                text: "function one(): number".into(),
+                ..Default::default()
+            });
+        let b = Document {
+            language: "TypeScript".into(),
+            relative_path: "b.ts".into(),
+            symbols: vec![
+                info(&two, "two", Kind::Function, "", vec![]),
+                info("local 0", "count", Kind::Variable, &two, vec![]),
+            ],
+            occurrences: vec![
+                occurrence(&two, 0, definition, Some(4)),
+                occurrence("local 0", 1, definition, None),
+                occurrence("local 0", 2, 0, None),
+            ],
+            ..Default::default()
+        };
+        let index = Index {
+            documents: vec![a, b],
+            ..Default::default()
+        };
+        let path = env._dir.path().join("index.scip");
+        std::fs::write(&path, index.write_to_bytes().unwrap()).unwrap();
+        import_scip_index(&path, &env.store, None).unwrap();
+        assert_eq!(
+            edge_pairs(&env, "READS", "id"),
+            vec![
+                ("a.ts::one".into(), "a.ts::one::count".into()),
+                ("b.ts::two".into(), "b.ts::two::count".into())
+            ]
+        );
+        assert_eq!(
+            edge_pairs(&env, "WRITES", "id"),
+            vec![("a.ts::one".into(), "a.ts::one::count".into())]
+        );
+        assert!(edge_pairs(&env, "CALLS", "id").is_empty());
+        assert_eq!(
+            edge_pairs(&env, "IMPLEMENTS", "id"),
+            vec![
+                ("a.ts::Widget".into(), "a.ts::Child".into()),
+                ("a.ts::Widget::run".into(), "a.ts::Contract::run".into())
+            ]
+        );
+        assert_eq!(
+            edge_pairs(&env, "INHERITS", "id"),
+            vec![
+                ("a.ts::Child".into(), "a.ts::Contract".into()),
+                ("a.ts::Widget".into(), "a.ts::Parent".into())
+            ]
+        );
+        let conn = env.store.connection().unwrap();
+        let rows: Vec<_> = conn.query("MATCH (s:Symbol) WHERE s.name = 'count' RETURN s.id, s.parent, s.visibility, s.language ORDER BY s.id").unwrap().collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(raw_string(&rows[0][1]), "a.ts::one");
+        assert_eq!(raw_string(&rows[1][1]), "b.ts::two");
+        assert!(rows.iter().all(|r| raw_string(&r[2]) == "private"));
+        assert!(rows.iter().all(|r| raw_string(&r[3]) == "typescript"));
+        let prose: Vec<_> = conn
+            .query("MATCH (s:Symbol {id: 'a.ts::one'}) RETURN s.docstring")
+            .unwrap()
+            .collect();
+        assert!(raw_string(&prose[0][0])
+            .contains("Computes a result.\n\n```TypeScript\nfunction one(): number\n```"));
+        let query = crate::graph::GraphQuery::new(&conn);
+        let hierarchy = query.get_type_hierarchy("a.ts::Widget", 4).unwrap();
+        assert_eq!(hierarchy.ancestors.len(), 3);
+        assert_eq!(
+            query.find_all_references("b.ts::two::count").unwrap().len(),
+            1
+        );
+        drop(conn);
+        let stats = import_scip_index(&path, &env.store, None).unwrap();
+        assert_eq!(stats.symbols_added, 0);
+        assert_eq!(stats.references_added, 0);
+        assert_eq!(stats.relations_added, 0);
     }
 }
 

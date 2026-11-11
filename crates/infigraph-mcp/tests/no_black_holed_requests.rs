@@ -30,6 +30,7 @@ fn error_message(reply: &Value) -> &str {
 }
 
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "requires the debug-build stall hook")]
 fn a_call_past_its_deadline_is_answered_and_the_worker_restarted() {
     let mut s = start(&[("INFIGRAPH_MCP_CALL_TIMEOUT_SECS", "2")]);
     let first = registered_worker(&s.instances, None);
@@ -59,6 +60,7 @@ fn a_call_past_its_deadline_is_answered_and_the_worker_restarted() {
 }
 
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "requires the debug-build stall hook")]
 fn a_call_in_flight_when_the_worker_crashes_is_answered_naming_the_crash() {
     let mut s = start(&[]);
     // A served call first: the worker is up and registered after it.

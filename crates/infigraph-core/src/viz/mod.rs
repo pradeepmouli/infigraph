@@ -102,29 +102,8 @@ fn query_nodes(backend: &dyn GraphBackend) -> Result<Vec<VizNode>> {
 fn query_edges(backend: &dyn GraphBackend) -> Result<Vec<VizEdge>> {
     let mut edges = Vec::new();
 
-    // CALLS edges
-    let call_rows = backend.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
-    for row in &call_rows {
-        if row.len() >= 2 {
-            edges.push(VizEdge {
-                from: row[0].clone(),
-                to: row[1].clone(),
-                rel_type: "CALLS".to_string(),
-            });
-        }
-    }
-
-    // INHERITS edges
-    let inherit_rows =
-        backend.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
-    for row in &inherit_rows {
-        if row.len() >= 2 {
-            edges.push(VizEdge {
-                from: row[0].clone(),
-                to: row[1].clone(),
-                rel_type: "INHERITS".to_string(),
-            });
-        }
+    for (rel_type, from, to) in backend.symbol_relationships()? {
+        edges.push(VizEdge { from, to, rel_type });
     }
 
     // CONTAINS edges (Module -> Symbol)
@@ -164,7 +143,9 @@ fn query_symbol_subgraph(
         let esc = id.replace('\'', "\\'");
 
         // Outgoing CALLS
-        let q = format!("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) WHERE a.id = '{esc}' RETURN b.id");
+        let q = format!(
+            "MATCH (a:Symbol)-[:CALLS|READS|WRITES]->(b:Symbol) WHERE a.id = '{esc}' RETURN b.id"
+        );
         if let Ok(rows) = backend.raw_query(&q) {
             for row in &rows {
                 if let Some(nid) = row.first() {
@@ -175,7 +156,9 @@ fn query_symbol_subgraph(
             }
         }
         // Incoming CALLS (callers)
-        let q = format!("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) WHERE b.id = '{esc}' RETURN a.id");
+        let q = format!(
+            "MATCH (a:Symbol)-[:CALLS|READS|WRITES]->(b:Symbol) WHERE b.id = '{esc}' RETURN a.id"
+        );
         if let Ok(rows) = backend.raw_query(&q) {
             for row in &rows {
                 if let Some(nid) = row.first() {
@@ -186,7 +169,7 @@ fn query_symbol_subgraph(
             }
         }
         // INHERITS both directions
-        let q = format!("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) WHERE a.id = '{esc}' OR b.id = '{esc}' RETURN a.id, b.id");
+        let q = format!("MATCH (a:Symbol)-[:INHERITS|IMPLEMENTS]->(b:Symbol) WHERE a.id = '{esc}' OR b.id = '{esc}' RETURN a.id, b.id");
         if let Ok(rows) = backend.raw_query(&q) {
             for row in &rows {
                 for nid in row {
@@ -225,25 +208,9 @@ fn query_symbol_subgraph(
     let mut edges = Vec::new();
     let id_set: HashSet<&str> = visited.iter().map(|s| s.as_str()).collect();
 
-    let call_rows = backend.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
-    for row in &call_rows {
-        if row.len() >= 2 && id_set.contains(row[0].as_str()) && id_set.contains(row[1].as_str()) {
-            edges.push(VizEdge {
-                from: row[0].clone(),
-                to: row[1].clone(),
-                rel_type: "CALLS".to_string(),
-            });
-        }
-    }
-    let inherit_rows =
-        backend.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
-    for row in &inherit_rows {
-        if row.len() >= 2 && id_set.contains(row[0].as_str()) && id_set.contains(row[1].as_str()) {
-            edges.push(VizEdge {
-                from: row[0].clone(),
-                to: row[1].clone(),
-                rel_type: "INHERITS".to_string(),
-            });
+    for (rel_type, from, to) in backend.symbol_relationships()? {
+        if id_set.contains(from.as_str()) && id_set.contains(to.as_str()) {
+            edges.push(VizEdge { from, to, rel_type });
         }
     }
 
@@ -335,6 +302,7 @@ fn build_edges_json(edges: &[VizEdge]) -> String {
             let color = match e.rel_type.as_str() {
                 "CALLS" => "#3498DB",
                 "INHERITS" => "#E74C3C",
+                "IMPLEMENTS" => "#8E44AD",
                 "CONTAINS" => "#7F8C8D",
                 _ => "#95A5A6",
             };

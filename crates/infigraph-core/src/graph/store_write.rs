@@ -178,6 +178,7 @@ impl GraphStore {
         // Batch insert relationships grouped by type
         let mut calls_pairs: Vec<(&str, &str)> = Vec::new();
         let mut inherits_pairs: Vec<(&str, &str)> = Vec::new();
+        let mut implements_pairs: Vec<(&str, &str)> = Vec::new();
         let mut tested_by_pairs: Vec<(&str, &str)> = Vec::new();
         let mut imports_pairs: Vec<(&str, &str)> = Vec::new();
         let mut reads_pairs: Vec<(&str, &str)> = Vec::new();
@@ -190,6 +191,9 @@ impl GraphStore {
                 }
                 RelationKind::Inherits | RelationKind::InheritedBy => {
                     inherits_pairs.push((&rel.source_id, &rel.target_id))
+                }
+                RelationKind::Implements | RelationKind::ImplementedBy => {
+                    implements_pairs.push((&rel.source_id, &rel.target_id))
                 }
                 RelationKind::TestedBy | RelationKind::Tests => {
                     tested_by_pairs.push((&rel.source_id, &rel.target_id))
@@ -211,6 +215,7 @@ impl GraphStore {
         for (rel_type, pairs) in [
             ("CALLS", &calls_pairs),
             ("INHERITS", &inherits_pairs),
+            ("IMPLEMENTS", &implements_pairs),
             ("TESTED_BY", &tested_by_pairs),
             ("READS", &reads_pairs),
             ("WRITES", &writes_pairs),

@@ -138,6 +138,7 @@ impl GraphStore {
         // until the write, so `absent_edges` checks real ids.
         let mut calls_pairs: Vec<(String, String)> = Vec::new();
         let mut inherits_pairs: Vec<(String, String)> = Vec::new();
+        let mut implements_pairs: Vec<(String, String)> = Vec::new();
         let mut tested_by_pairs: Vec<(String, String)> = Vec::new();
         let mut imports_pairs: Vec<(String, String)> = Vec::new();
         let mut reads_pairs: Vec<(String, String)> = Vec::new();
@@ -150,6 +151,9 @@ impl GraphStore {
                     RelationKind::Calls | RelationKind::CalledBy => calls_pairs.push(edge()),
                     RelationKind::Inherits | RelationKind::InheritedBy => {
                         inherits_pairs.push(edge())
+                    }
+                    RelationKind::Implements | RelationKind::ImplementedBy => {
+                        implements_pairs.push(edge())
                     }
                     RelationKind::TestedBy | RelationKind::Tests => tested_by_pairs.push(edge()),
                     RelationKind::Imports | RelationKind::ImportedBy => {
@@ -183,6 +187,7 @@ impl GraphStore {
         for (rel_type, pairs) in [
             ("CALLS", &calls_pairs),
             ("INHERITS", &inherits_pairs),
+            ("IMPLEMENTS", &implements_pairs),
             ("TESTED_BY", &tested_by_pairs),
             ("READS", &reads_pairs),
             ("WRITES", &writes_pairs),

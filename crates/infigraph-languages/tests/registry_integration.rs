@@ -357,7 +357,13 @@ fn test_extraction_typescript_inheritance_produces_edges() {
         extraction.relations
     );
     assert!(
-        has_edge("Square", "Drawable"),
+        extraction
+            .relations
+            .iter()
+            .any(|r| r.kind == RelationKind::Implements
+                && r.source_id.ends_with("::Square")
+                && r.target_id.ends_with("::Drawable"))
+            && !has_edge("Square", "Drawable"),
         "class implements: {:?}",
         extraction.relations
     );

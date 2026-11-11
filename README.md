@@ -930,7 +930,7 @@ Infigraph natively imports [SCIP](https://sourcegraph.com/blog/announcing-scip) 
 
 ```bash
 # Generate SCIP index with an existing indexer
-scip-typescript index --cwd .          # TypeScript/JavaScript
+scip-tsrs index --infer-tsconfig       # TypeScript/JavaScript (follows tsconfig project references)
 scip-python index --cwd .              # Python
 scip-java index                        # Java/Kotlin
 scip-go --cwd .                        # Go
@@ -939,6 +939,8 @@ infigraph scip-import --index index.scip
 ```
 
 **Languages with dedicated SCIP indexers:** TypeScript, JavaScript, Python, Java, Kotlin, Go, Rust (rust-analyzer), C# (scip-dotnet), Ruby (scip-ruby), Scala
+
+TypeScript and JavaScript use [scip-tsrs](https://github.com/daikonic-org/scip-tsrs), a native indexer that follows `tsconfig.json` project references and emits standard SCIP. Its metadata enriches named local variables, documentation, and value references; interface implementations and class inheritance retain distinct graph relationships. Native downloads support Apple silicon macOS and Linux on ARM64 and x86-64.
 
 **Languages via lsp-to-scip bridge:** C/C++, Zig, Swift, Dart, Elixir, PHP, Lua, Haskell, F#, Clojure, Erlang, Perl, OCaml, and any language with an LSP server
 

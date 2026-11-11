@@ -21,6 +21,7 @@ pub(crate) enum DownloadStrategy {
     GithubRelease {
         owner: &'static str,
         repo: &'static str,
+        tag: Option<&'static str>,
         asset_pattern: fn(&str, &str) -> Option<String>,
     },
     NpmInstall {
@@ -35,6 +36,24 @@ pub(crate) enum DownloadStrategy {
     DartPubInstall {
         package: &'static str,
     },
+}
+
+// This prerelease is pinned: /releases/latest deliberately excludes prereleases.
+const SCIP_TSRS_TAG: &str = "v0.2.1";
+
+fn scip_tsrs_asset(os: &str, arch: &str) -> Option<String> {
+    let target_os = match os {
+        "macos" if arch == "aarch64" => "apple-darwin",
+        "linux" => "unknown-linux-gnu",
+        _ => return None,
+    };
+    if !matches!(arch, "aarch64" | "x86_64") {
+        return None;
+    }
+    Some(format!(
+        "scip-tsrs-{}-{arch}-{target_os}.tar.gz",
+        SCIP_TSRS_TAG.trim_start_matches('v')
+    ))
 }
 
 fn scip_go_asset(os: &str, arch: &str) -> Option<String> {
@@ -98,11 +117,14 @@ fn scip_java_asset(_os: &str, _arch: &str) -> Option<String> {
 
 pub(crate) static CATALOG: &[ScipIndexer] = &[
     ScipIndexer {
-        binary_name: "scip-typescript",
+        binary_name: "scip-tsrs",
         scip_args: &["index", "--infer-tsconfig"],
         output_flag: Some("--output"),
-        download: DownloadStrategy::NpmInstall {
-            package: "@sourcegraph/scip-typescript",
+        download: DownloadStrategy::GithubRelease {
+            owner: "daikonic-org",
+            repo: "scip-tsrs",
+            tag: Some(SCIP_TSRS_TAG),
+            asset_pattern: scip_tsrs_asset,
         },
     },
     ScipIndexer {
@@ -120,6 +142,7 @@ pub(crate) static CATALOG: &[ScipIndexer] = &[
         download: DownloadStrategy::GithubRelease {
             owner: "rust-lang",
             repo: "rust-analyzer",
+            tag: None,
             asset_pattern: rust_analyzer_asset,
         },
     },
@@ -130,6 +153,7 @@ pub(crate) static CATALOG: &[ScipIndexer] = &[
         download: DownloadStrategy::GithubRelease {
             owner: "sourcegraph",
             repo: "scip-java",
+            tag: None,
             asset_pattern: scip_java_asset,
         },
     },
@@ -140,6 +164,7 @@ pub(crate) static CATALOG: &[ScipIndexer] = &[
         download: DownloadStrategy::GithubRelease {
             owner: "sourcegraph",
             repo: "scip-go",
+            tag: None,
             asset_pattern: scip_go_asset,
         },
     },
@@ -150,6 +175,7 @@ pub(crate) static CATALOG: &[ScipIndexer] = &[
         download: DownloadStrategy::GithubRelease {
             owner: "sourcegraph",
             repo: "scip-ruby",
+            tag: None,
             asset_pattern: scip_ruby_asset,
         },
     },
@@ -168,6 +194,7 @@ pub(crate) static CATALOG: &[ScipIndexer] = &[
         download: DownloadStrategy::GithubRelease {
             owner: "sourcegraph",
             repo: "scip-clang",
+            tag: None,
             asset_pattern: scip_clang_asset,
         },
     },
@@ -305,10 +332,17 @@ pub(crate) fn ensure_indexer(indexer: &ScipIndexer) -> Option<PathBuf> {
         DownloadStrategy::GithubRelease {
             owner,
             repo,
+            tag,
             asset_pattern,
-        } => {
-            download_github_release(owner, repo, asset_pattern, indexer.binary_name, &bin_dir).ok()
-        }
+        } => download_github_release(
+            owner,
+            repo,
+            *tag,
+            asset_pattern,
+            indexer.binary_name,
+            &bin_dir,
+        )
+        .ok(),
         DownloadStrategy::NpmInstall { package } => install_via_npm(package, indexer.binary_name),
         DownloadStrategy::DotnetTool { package } => {
             install_via_dotnet(package, indexer.binary_name)
@@ -355,6 +389,7 @@ fn which_path(cmd: &str) -> Option<PathBuf> {
 fn download_github_release(
     owner: &str,
     repo: &str,
+    tag: Option<&str>,
     asset_pattern: &dyn Fn(&str, &str) -> Option<String>,
     binary_name: &str,
     dest_dir: &Path,
@@ -367,7 +402,10 @@ fn download_github_release(
 
     println!("Auto-SCIP: downloading {binary_name} from github.com/{owner}/{repo}...");
 
-    let api_url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
+    let release = tag
+        .map(|tag| format!("tags/{tag}"))
+        .unwrap_or_else(|| "latest".into());
+    let api_url = format!("https://api.github.com/repos/{owner}/{repo}/releases/{release}");
 
     let download_url = match fetch_release_asset_url(&api_url, &expected_asset) {
         Ok(url) => url,
@@ -401,7 +439,14 @@ fn download_github_release(
         if !status.success() {
             return Err("tar extraction failed".to_string());
         }
-        let extracted = dest_dir.join(binary_name);
+        let nested = dest_dir
+            .join(expected_asset.trim_end_matches(".tar.gz"))
+            .join(binary_name);
+        let extracted = if nested.is_file() {
+            nested
+        } else {
+            dest_dir.join(binary_name)
+        };
         if extracted.exists() && extracted != dest {
             std::fs::rename(&extracted, &dest).map_err(|e| format!("rename failed: {e}"))?;
         }
@@ -1337,7 +1382,7 @@ mod tests {
         let result = indexers_for_languages(&detected);
         assert_eq!(result.len(), 3);
         let names: Vec<&str> = result.iter().map(|i| i.binary_name).collect();
-        assert!(names.contains(&"scip-typescript"));
+        assert!(names.contains(&"scip-tsrs"));
         assert!(names.contains(&"scip-python"));
         assert!(names.contains(&"rust-analyzer"));
     }
@@ -1352,6 +1397,16 @@ mod tests {
 
     #[test]
     fn test_asset_pattern_platforms() {
+        assert_eq!(
+            scip_tsrs_asset("macos", "aarch64"),
+            Some("scip-tsrs-0.2.1-aarch64-apple-darwin.tar.gz".into())
+        );
+        assert_eq!(
+            scip_tsrs_asset("linux", "x86_64"),
+            Some("scip-tsrs-0.2.1-x86_64-unknown-linux-gnu.tar.gz".into())
+        );
+        assert_eq!(scip_tsrs_asset("windows", "x86_64"), None);
+        assert_eq!(scip_tsrs_asset("macos", "x86_64"), None);
         assert_eq!(
             scip_go_asset("macos", "aarch64"),
             Some("scip-go-darwin-arm64.tar.gz".to_string())

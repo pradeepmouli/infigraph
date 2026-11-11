@@ -1,8 +1,21 @@
-//! Age-based cleanup for run-unique scratch files (#139, #204): a producer
+//! Names and age-based cleanup for run-unique scratch files (#139, #204): a producer
 //! removes its own files, and this is the backstop for one that crashed.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+/// A process ID, timestamp, and process counter. The counter guarantees
+/// distinct names even when several calls share one clock tick.
+pub fn run_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}-{nanos}-{sequence}", std::process::id())
+}
 
 /// Remove files in `dir` older than `age` whose extension is one of
 /// `extensions`. Anything younger belongs, or may belong, to a run still in

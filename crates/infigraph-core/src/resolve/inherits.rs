@@ -16,6 +16,28 @@ pub(crate) fn resolve_inherits(
     symbol_map: &HashMap<String, Vec<(String, String, String)>>,
     _witness: &WriteLock,
 ) -> Result<usize> {
+    Ok(resolve_type_relation_kind(
+        store,
+        extractions,
+        symbol_map,
+        _witness,
+        RelationKind::Inherits,
+    )? + resolve_type_relation_kind(
+        store,
+        extractions,
+        symbol_map,
+        _witness,
+        RelationKind::Implements,
+    )?)
+}
+
+fn resolve_type_relation_kind(
+    store: &GraphStore,
+    extractions: &[FileExtraction],
+    symbol_map: &HashMap<String, Vec<(String, String, String)>>,
+    _witness: &WriteLock,
+    kind: RelationKind,
+) -> Result<usize> {
     let mut resolved_pairs: Vec<(String, String)> = Vec::new();
 
     // Span size per symbol id, used to prefer a real definition over a
@@ -51,7 +73,7 @@ pub(crate) fn resolve_inherits(
             .collect();
 
         for rel in &ext.relations {
-            if rel.kind != RelationKind::Inherits {
+            if rel.kind != kind {
                 continue;
             }
 
@@ -187,12 +209,12 @@ pub(crate) fn resolve_inherits(
     // may already have written some of these (see `absent_edges`).
     let conn = store.connection()?;
     let pairs =
-        crate::graph::store_util::absent_edges(&conn, "INHERITS", "Symbol", "Symbol", pairs)?;
+        crate::graph::store_util::absent_edges(&conn, kind.as_str(), "Symbol", "Symbol", pairs)?;
     if pairs.is_empty() {
         return Ok(0);
     }
     let pq_path = staging_parquet("infigraph_resolve_inherits");
-    copy_edges_with_bad_record_retry(store, "INHERITS", pairs, "Symbol", "Symbol", &pq_path)?;
+    copy_edges_with_bad_record_retry(store, kind.as_str(), pairs, "Symbol", "Symbol", &pq_path)?;
 
     Ok(count)
 }

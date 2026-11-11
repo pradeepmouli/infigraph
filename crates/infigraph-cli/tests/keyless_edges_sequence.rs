@@ -101,7 +101,7 @@ fn touch(root: &Path, name: &str, step: usize) {
 }
 
 fn enrichment_available() -> bool {
-    ["scip-typescript"].iter().all(|tool| {
+    ["scip-tsrs"].iter().all(|tool| {
         std::process::Command::new("which")
             .arg(tool)
             .output()

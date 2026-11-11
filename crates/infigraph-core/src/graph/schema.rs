@@ -1,3 +1,13 @@
+/// Symbol-to-symbol dependency and type relationships shared by graph readers.
+pub const SYMBOL_EDGE_TABLES: &[&str] = &[
+    "CALLS",
+    "INHERITS",
+    "IMPLEMENTS",
+    "TESTED_BY",
+    "READS",
+    "WRITES",
+];
+
 pub const MIGRATIONS: &[&str] = &[
     "ALTER TABLE Symbol ADD parameters STRING DEFAULT ''",
     "ALTER TABLE Symbol ADD return_type STRING DEFAULT ''",
@@ -150,6 +160,7 @@ pub const CREATE_SCHEMA: &[&str] = &[
     "CREATE REL TABLE IF NOT EXISTS IMPORTS(FROM Module TO Module)",
     "CREATE REL TABLE IF NOT EXISTS CONTAINS(FROM Module TO Symbol)",
     "CREATE REL TABLE IF NOT EXISTS INHERITS(FROM Symbol TO Symbol)",
+    "CREATE REL TABLE IF NOT EXISTS IMPLEMENTS(FROM Symbol TO Symbol)",
     "CREATE REL TABLE IF NOT EXISTS TESTED_BY(FROM Symbol TO Symbol)",
     "CREATE REL TABLE IF NOT EXISTS READS(FROM Symbol TO Symbol)",
     "CREATE REL TABLE IF NOT EXISTS WRITES(FROM Symbol TO Symbol)",
