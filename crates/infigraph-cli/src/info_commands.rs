@@ -768,7 +768,7 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     // the project has documents (they are opt-in; a missing store answers
     // "not indexed"). Only a store that exists but will not open fails it,
     // and then the daemon still serves the code graph.
-    let docs_reads = match infigraph_docs::daemon_source::daemon_row_source(root) {
+    let docs_reads = match infigraph_docs::daemon_source::daemon_read_sources(root) {
         Ok(source) => Some(source),
         Err(e) => {
             // Reported to clients through the status socket (#75); `set`

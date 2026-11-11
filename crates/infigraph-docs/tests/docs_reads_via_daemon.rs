@@ -13,6 +13,64 @@ use infigraph_core::graph::GraphStore;
 use infigraph_docs::store::DocStore;
 
 #[test]
+fn document_ranking_runs_on_the_daemon_and_returns_matches_without_vectors() {
+    use infigraph_docs::chunk::{chunk_document, ChunkStrategy};
+    use infigraph_docs::extract::{DocFormat, ExtractedDoc};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    seed_one_document(root);
+    let doc = ExtractedDoc {
+        file: "a.md".into(),
+        title: Some("Shared cache".into()),
+        content_hash: "cache-v1".into(),
+        format: DocFormat::Markdown,
+        text: "# Shared cache\nSearch data is shared by daemon clients.".into(),
+        page_count: None,
+    };
+    let chunks = chunk_document(
+        &doc,
+        "a.md",
+        &doc.content_hash,
+        ChunkStrategy::HeadingBounded,
+    );
+    {
+        let store = DocStore::open(&root.join(".infigraph/docs.kuzu")).unwrap();
+        store
+            .upsert_all_parquet(&[&doc], &chunks.iter().collect::<Vec<_>>())
+            .unwrap();
+    }
+    let docs = infigraph_docs::daemon_source::daemon_read_sources(root).unwrap();
+    let service = ReadService::start_serving(
+        root,
+        graph_source(root),
+        Some(docs),
+        2,
+        Arc::new(infigraph_core::daemon::liveness::Liveness::new()),
+        None,
+    )
+    .unwrap();
+    let results = infigraph_core::daemon::search::docs(
+        root,
+        infigraph_core::search::service::DocSearchRequest {
+            query: "shared cache".into(),
+            limit: 5,
+            alpha: 0.0,
+        },
+    )
+    .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].doc_file, "a.md");
+    assert!(results[0].text.contains("daemon clients"));
+    let encoded = serde_json::to_string(&results).unwrap();
+    assert!(!encoded.contains("embeddings"));
+    assert!(
+        encoded.len() < 4096,
+        "only matching chunks cross the socket"
+    );
+    service.shutdown();
+}
+
+#[test]
 fn document_reads_are_served_by_the_daemon_read_service() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

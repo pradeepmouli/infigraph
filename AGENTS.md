@@ -6,6 +6,8 @@ This file provides guidance to AI coding agents (Claude Code, Codex, ...) when w
 
 For any non-trivial analysis, review, or investigation (not routine edits), end with a **confidence** (High/Medium/Low) and a **recommendation** (e.g. merge/hold/needs more info) so the result is decision-ready.
 
+After a review or one-shot task, save required progress and release client connections, leases and temporary sessions you created through their owning host's supported lifecycle. This includes Infigraph and other MCP servers. A final answer does not close host-owned stdio transports. Do not kill shared servers or disconnect another session's clients. Infigraph's idle search-cache eviction bounds retained data while a transport remains connected; it is separate from disconnection and daemon lease expiry (see `docs/MCP-LIFECYCLE.md`).
+
 ## What this is
 
 Infigraph is an AST-powered code intelligence engine: indexes codebases (62 languages) into a persistent embedded graph database (LadybugDB) with Cypher queries, hybrid search, cross-file call resolution, and MCP tools for AI coding agents. Rust workspace, zero LLM dependency, fully local/offline.

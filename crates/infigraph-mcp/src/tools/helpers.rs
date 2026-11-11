@@ -320,17 +320,7 @@ fn find_infigraph_cli_on_path() -> Option<std::path::PathBuf> {
 /// Narrowest, not first: symbols nest (a method inside its class inside its
 /// file's module), and the first match in row order is usually the outermost
 /// one, which says nothing about where the line actually is (#167).
-pub fn find_containing_symbol<'id>(
-    intervals: &[(&str, usize, usize, &'id str)],
-    file: &str,
-    line: usize,
-) -> Option<&'id str> {
-    intervals
-        .iter()
-        .filter(|(f, start, end, _)| *f == file && *start <= line && line <= *end)
-        .min_by_key(|(_, start, end, _)| end - start)
-        .map(|(_, _, _, id)| *id)
-}
+pub use infigraph_core::search::find_containing_symbol;
 
 pub fn save_analysis(path: &str, tool_name: &str, content: &str) -> Result<String> {
     let root = PathBuf::from(path);

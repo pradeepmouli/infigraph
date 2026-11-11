@@ -16,6 +16,7 @@ pub fn now_secs() -> u64 {
 
 pub struct Liveness {
     leases: AtomicUsize,
+    active_reads: AtomicUsize,
     pub(crate) last_activity: AtomicU64,
     /// Who holds them, for `ps` and the daemon log. Informational only: the
     /// count above is what decides anything.
@@ -33,6 +34,7 @@ impl Liveness {
     pub fn new() -> Self {
         Self {
             leases: AtomicUsize::new(0),
+            active_reads: AtomicUsize::new(0),
             last_activity: AtomicU64::new(now_secs()),
             owners: std::sync::Mutex::new(Vec::new()),
         }
@@ -84,6 +86,19 @@ impl Liveness {
         self.leases.load(Ordering::SeqCst)
     }
 
+    pub fn begin_read(self: &std::sync::Arc<Self>) -> ReadUse {
+        self.active_reads.fetch_add(1, Ordering::SeqCst);
+        ReadUse(self.clone())
+    }
+
+    pub fn no_clients_or_reads(&self) -> bool {
+        self.leases() == 0 && !self.reads_in_flight()
+    }
+
+    pub fn reads_in_flight(&self) -> bool {
+        self.active_reads.load(Ordering::SeqCst) > 0
+    }
+
     /// `None` while any lease is held -- a leased daemon is never idle.
     pub fn idle_for(&self, now_secs: u64) -> Option<Duration> {
         if self.leases() > 0 {
@@ -91,6 +106,14 @@ impl Liveness {
         }
         let last = self.last_activity.load(Ordering::SeqCst);
         Some(Duration::from_secs(now_secs.saturating_sub(last)))
+    }
+}
+
+#[must_use = "hold the read guard until the request finishes"]
+pub struct ReadUse(std::sync::Arc<Liveness>);
+impl Drop for ReadUse {
+    fn drop(&mut self) {
+        self.0.active_reads.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

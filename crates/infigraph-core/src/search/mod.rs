@@ -9,7 +9,7 @@ use crate::byte_reader::ByteReader;
 use crate::embed::{self, EmbedProvider};
 
 /// A search result with combined score.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SearchResult {
     pub symbol_id: String,
     pub name: String,
@@ -502,4 +502,18 @@ pub fn read_lines_from_file(path: &Path, start_line: u32, end_line: u32) -> Resu
         return Ok(String::new());
     }
     Ok(lines[start..end].join("\n"))
+}
+
+pub mod service;
+
+pub fn find_containing_symbol<'id>(
+    intervals: &[(&str, usize, usize, &'id str)],
+    file: &str,
+    line: usize,
+) -> Option<&'id str> {
+    intervals
+        .iter()
+        .filter(|(f, start, end, _)| *f == file && *start <= line && line <= *end)
+        .min_by_key(|(_, start, end, _)| end - start)
+        .map(|(_, _, _, id)| *id)
 }

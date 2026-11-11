@@ -9,19 +9,7 @@ use infigraph_core::embed::{cosine_similarity, doc_embedder, load_embeddings_cac
 use crate::backend::DocBackend;
 use infigraph_core::byte_reader::ByteReader;
 
-#[derive(Debug, Clone)]
-pub struct DocSearchResult {
-    pub chunk_id: String,
-    pub doc_file: String,
-    pub heading: Option<String>,
-    pub text: String,
-    pub score: f32,
-    pub bm25_score: f32,
-    pub vector_score: f32,
-    pub start_offset: usize,
-    pub end_offset: usize,
-    pub page: Option<usize>,
-}
+pub use infigraph_core::search::service::DocSearchResult;
 
 const K1: f32 = 1.2;
 const B: f32 = 0.75;
@@ -193,6 +181,19 @@ pub fn hybrid_doc_search(
     limit: usize,
     alpha: f32,
 ) -> Result<Vec<DocSearchResult>> {
+    if infigraph_core::validated_backend()? == infigraph_core::BackendChoice::Daemon
+        && !infigraph_core::graph::daemon_kuzu_backend::direct_reads_enabled()
+        && !infigraph_core::daemon::lease::is_self_daemon(root)
+    {
+        return infigraph_core::daemon::search::docs(
+            root,
+            infigraph_core::search::service::DocSearchRequest {
+                query: query.into(),
+                limit,
+                alpha,
+            },
+        );
+    }
     #[cfg(feature = "remote")]
     if infigraph_core::daemon::lifecycle::is_remote_backend() {
         return hybrid_doc_search_remote(query, store, limit, alpha);

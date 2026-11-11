@@ -25,6 +25,28 @@ pub struct ReadRequest {
     pub chunk_size: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchFrame {
+    pub search: crate::search::service::SearchRequest,
+}
+
+impl DaemonOp for SearchFrame {
+    type Reply = crate::search::service::SearchReply;
+    const KEEPS_ALIVE: bool = true;
+    const ACKED: bool = false;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocSearchFrame {
+    pub doc_search: crate::search::service::DocSearchRequest,
+}
+
+impl DaemonOp for DocSearchFrame {
+    type Reply = Vec<crate::search::service::DocSearchResult>;
+    const KEEPS_ALIVE: bool = true;
+    const ACKED: bool = false;
+}
+
 /// A lease (#38, #124): sent as the first and only frame on a connection the
 /// client holds for as long as it uses the daemon. The daemon answers nothing;
 /// the connection exists so its EOF -- which the kernel delivers even when the
@@ -247,6 +269,8 @@ pub enum ClientFrame {
     Status(StatusFrame),
     Control(ControlFrame),
     Write(WriteFrame),
+    Search(SearchFrame),
+    DocSearch(DocSearchFrame),
 }
 
 impl ClientFrame {
@@ -260,6 +284,8 @@ impl ClientFrame {
             ClientFrame::Status(_) => Some(StatusFrame::KEEPS_ALIVE),
             ClientFrame::Control(_) => Some(ControlFrame::KEEPS_ALIVE),
             ClientFrame::Write(_) => Some(WriteFrame::KEEPS_ALIVE),
+            ClientFrame::Search(_) => Some(SearchFrame::KEEPS_ALIVE),
+            ClientFrame::DocSearch(_) => Some(DocSearchFrame::KEEPS_ALIVE),
         }
     }
 }

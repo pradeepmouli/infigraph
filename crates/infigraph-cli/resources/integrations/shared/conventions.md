@@ -12,6 +12,9 @@
 - **Onboarding:** `list_projects` (don't re-index what is already indexed), then `index_project`, `get_architecture`, `get_stats`.
 - **Multi-repo:** `group_create`, `group_add` for each repo, `group_index`, `group_sync`, `group_link`.
 
+### Finishing a review or one-shot task
+Save required progress, then release connections, leases and temporary sessions you explicitly created, using the owning host's supported disconnect lifecycle. This applies to Infigraph and other MCP servers. Returning a final answer does not close a host-owned stdio pipe. Do not kill a shared server or disconnect another session's clients. Hosts must release their own temporary contexts; an agent instruction cannot close a transport the host still owns.
+
 ### Subagents in an Infigraph-indexed project
 Agent types without MCP access fall back to grep and glob. Do not spawn them for code tasks:
 - **Explore:** use `search` (with `regex=true` to enumerate) and `get_symbols_in_file` directly.
