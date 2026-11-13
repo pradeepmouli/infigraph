@@ -18,6 +18,7 @@ struct GroupFixture {
     orig_home: String,
     orig_watch_daemon: Option<String>,
     orig_index_threads: Option<String>,
+    orig_no_watch: Option<std::ffi::OsString>,
 }
 
 static GROUP_FIXTURE: OnceLock<GroupFixture> = OnceLock::new();
@@ -38,6 +39,19 @@ fn group_fixture() -> &'static GroupFixture {
         // is controlled solely by INFIGRAPH_BACKEND=daemon now.)
         let orig_watch_daemon = std::env::var("INFIGRAPH_BACKEND").ok();
         std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
+
+        // This fixture owns in-process MCP watchers. CLI index children must
+        // not also start detached watchers after indexing the same store:
+        // that adds an unrelated ownership conflict to the wrapper timing.
+        // Local MCP watchers are explicit and do not use this CLI opt-out.
+        let orig_no_watch = std::env::var_os("INFIGRAPH_NO_WATCH");
+        std::env::set_var("INFIGRAPH_NO_WATCH", "1");
+        // NO_WATCH does not stop SCIP enrichment: `infigraph index` still
+        // detaches a `scip-enrich` child for these Python projects, and that
+        // child holds the graph's writer lock while its indexer runs. Under
+        // load the next fixture call then fails with "locked by another
+        // infigraph process". None of this test's assertions reads SCIP output.
+        support::disable_scip_enrichment();
 
         // One thread for every indexer this fixture starts (the spawned
         // `infigraph index`, the in-process watcher). The test compares the
@@ -174,6 +188,7 @@ def create_user(data):
             orig_home,
             orig_watch_daemon,
             orig_index_threads,
+            orig_no_watch,
         }
     })
 }
@@ -501,6 +516,11 @@ fn test_groups_watch_perf() {
     match &fix.orig_index_threads {
         Some(v) => std::env::set_var("INFIGRAPH_INDEX_MAX_THREADS", v),
         None => std::env::remove_var("INFIGRAPH_INDEX_MAX_THREADS"),
+    }
+
+    match &fix.orig_no_watch {
+        Some(v) => std::env::set_var("INFIGRAPH_NO_WATCH", v),
+        None => std::env::remove_var("INFIGRAPH_NO_WATCH"),
     }
 
     // Restore INFIGRAPH_BACKEND

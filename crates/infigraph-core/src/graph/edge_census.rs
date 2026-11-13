@@ -11,9 +11,13 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 /// The keyless edge tables and the labels of their endpoints.
-pub const KEYLESS_EDGE_TABLES: [(&str, &str, &str); 7] = [
+pub const KEYLESS_EDGE_TABLES: [(&str, &str, &str); 11] = [
     ("CALLS", "Symbol", "Symbol"),
     ("INHERITS", "Symbol", "Symbol"),
+    ("IMPLEMENTS", "Symbol", "Symbol"),
+    ("READS", "Symbol", "Symbol"),
+    ("WRITES", "Symbol", "Symbol"),
+    ("REFERENCES", "Symbol", "Symbol"),
     ("TESTED_BY", "Symbol", "Symbol"),
     ("IMPORTS", "Module", "Module"),
     ("CONTAINS", "Module", "Symbol"),
@@ -102,16 +106,34 @@ impl Census {
     }
 }
 
-/// Counts each keyless table in turn through `count`, and stops starting new
-/// tables once `budget` is spent. A table not started goes into `not_checked`,
-/// so a partial census says which tables it did not look at.
+/// The keyless tables this graph holds, by asking its catalog through `run`.
+///
+/// A table no writer has created yet (`REFERENCES`, `IMPLEMENTS` on an older
+/// graph) has no rows, so leaving it out of the census is exact. A read-only
+/// open never runs the schema DDL, so this asks each time. Pass the result to
+/// [`census`].
+pub fn present_keyless_tables(
+    run: impl FnOnce(&str) -> Result<Vec<Vec<String>>>,
+) -> Result<Vec<&'static str>> {
+    let names: Vec<&'static str> = KEYLESS_EDGE_TABLES.iter().map(|(t, _, _)| *t).collect();
+    crate::graph::schema::present_tables(&names, run)
+}
+
+/// Counts each keyless table in `present` in turn through `count`, and stops
+/// starting new tables once `budget` is spent. A table not started goes into
+/// `not_checked`, so a partial census says which tables it did not look at.
+/// A table `present` leaves out is not counted and not reported as unchecked.
 pub fn census(
     budget: Duration,
+    present: &[&str],
     mut count: impl FnMut(&str, &str, &str) -> Result<TableCount>,
 ) -> Result<Census> {
     let started = Instant::now();
     let mut out = Census::default();
     for (table, src, dst) in KEYLESS_EDGE_TABLES {
+        if !present.contains(&table) {
+            continue;
+        }
         if started.elapsed() >= budget {
             out.not_checked.push(table);
             continue;
@@ -164,9 +186,16 @@ mod tests {
         );
     }
 
+    fn all_names() -> Vec<&'static str> {
+        KEYLESS_EDGE_TABLES.iter().map(|(t, _, _)| *t).collect()
+    }
+
     #[test]
     fn a_census_with_every_table_inside_the_budget_counts_them_all() {
-        let c = census(Duration::from_secs(60), |t, _, _| Ok(count_of(t, 2, 2))).unwrap();
+        let c = census(Duration::from_secs(60), &all_names(), |t, _, _| {
+            Ok(count_of(t, 2, 2))
+        })
+        .unwrap();
         assert_eq!(c.counted.len(), KEYLESS_EDGE_TABLES.len());
         assert!(c.not_checked.is_empty());
         assert_eq!(c.extra(), 0);
@@ -174,7 +203,10 @@ mod tests {
 
     #[test]
     fn a_census_past_its_budget_says_which_tables_it_did_not_check() {
-        let c = census(Duration::ZERO, |t, _, _| Ok(count_of(t, 1, 1))).unwrap();
+        let c = census(Duration::ZERO, &all_names(), |t, _, _| {
+            Ok(count_of(t, 1, 1))
+        })
+        .unwrap();
         assert!(c.counted.is_empty());
         assert_eq!(
             c.not_checked,
@@ -183,6 +215,23 @@ mod tests {
                 .map(|(t, _, _)| *t)
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// An older graph has no REFERENCES table. The census leaves it out: it is
+    /// neither counted nor reported as unchecked, and nothing fails.
+    #[test]
+    fn a_table_the_graph_lacks_is_left_out_not_failed_or_unchecked() {
+        let present: Vec<&str> = all_names()
+            .into_iter()
+            .filter(|t| *t != "REFERENCES")
+            .collect();
+        let c = census(Duration::from_secs(60), &present, |t, _, _| {
+            Ok(count_of(t, 1, 1))
+        })
+        .unwrap();
+        assert!(c.counted.iter().all(|t| t.table != "REFERENCES"));
+        assert_eq!(c.counted.len(), KEYLESS_EDGE_TABLES.len() - 1);
+        assert!(c.not_checked.is_empty());
     }
 
     #[test]

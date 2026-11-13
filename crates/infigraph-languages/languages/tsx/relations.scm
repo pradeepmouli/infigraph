@@ -27,3 +27,12 @@
   (class_heritage
     (extends_clause
       value: (identifier) @inherit.parent)))
+
+; Interface inheritance and implementation use distinct edge kinds.
+(interface_declaration
+  name: (type_identifier) @inherit.child
+  (extends_type_clause type: (_) @inherit.parent))
+
+(class_declaration
+  name: (type_identifier) @implement.child
+  (class_heritage (implements_clause (_) @implement.parent)))

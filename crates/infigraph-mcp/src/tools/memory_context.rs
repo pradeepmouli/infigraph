@@ -430,85 +430,43 @@ fn gather_l3_hybrid(
     path: &str,
     limit: usize,
 ) -> Result<Vec<ScoredItem>> {
-    let rows = backend.raw_query(
-        "MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring, s.start_line, s.end_line",
-    )?;
-
-    if rows.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let docs: Vec<(String, String)> = rows
-        .iter()
-        .map(|row| {
-            let id = row[0].clone();
-            let text = if row.get(4).is_some_and(|s| !s.is_empty()) {
-                format!("{} {}: {}", row[2], row[1], row[4])
-            } else {
-                format!("{} {}", row[2], row[1])
-            };
-            (id, text)
-        })
-        .collect();
-
-    let bm25_index = infigraph_core::search::BM25Index::build(docs.clone());
-    let embedder = embed::best_embedder();
-    let emb_path = PathBuf::from(path)
-        .join(".infigraph")
-        .join("embeddings.bin");
-    let symbol_embeddings: Vec<(String, Vec<f32>)> = if emb_path.exists() {
-        let all: HashMap<String, Vec<f32>> = embed::load_embeddings_cached(&emb_path)?
-            .into_iter()
-            .collect();
-        docs.iter()
-            .filter_map(|(id, text)| {
-                all.get(id)
-                    .cloned()
-                    .or_else(|| embedder.embed(text).ok())
-                    .map(|emb| (id.clone(), emb))
-            })
-            .collect()
-    } else {
-        docs.iter()
-            .map(|(id, text)| (id.clone(), embedder.embed(text).unwrap_or_default()))
-            .collect()
+    use infigraph_core::search::service::{CacheKey, SearchMode, SearchRequest};
+    let root = std::path::Path::new(path);
+    let request = SearchRequest {
+        mode: SearchMode::Context,
+        query: query.into(),
+        limit,
+        kind: None,
+        file_pattern: None,
+        regex: false,
     };
-
-    let oversample = limit * 2;
-    let tg_dir = PathBuf::from(path).join(".infigraph");
-    let hnsw_path = tg_dir.join("hnsw_index.usearch");
-    let raw = infigraph_core::search::compute_raw_scores(
-        query,
-        &bm25_index,
-        embedder.as_ref(),
-        &symbol_embeddings,
-        oversample,
-        Some(&hnsw_path),
-        Some(&emb_path),
-    )?;
-
-    let keyword_results = infigraph_core::search::combine_scores(&raw, 0.3, limit);
-    let semantic_results = infigraph_core::search::combine_scores(&raw, 0.85, limit);
-
-    let mut merged: HashMap<String, infigraph_core::search::SearchResult> = HashMap::new();
-    for r in keyword_results.into_iter().chain(semantic_results) {
-        merged
-            .entry(r.symbol_id.clone())
-            .and_modify(|existing| {
-                if r.score > existing.score {
-                    *existing = r.clone();
-                }
-            })
-            .or_insert(r);
-    }
-
-    let mut results: Vec<infigraph_core::search::SearchResult> = merged.into_values().collect();
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    results.truncate(limit);
+    let reply = if infigraph_core::validated_backend()? == infigraph_core::BackendChoice::Daemon
+        && !infigraph_core::graph::daemon_kuzu_backend::direct_reads_enabled()
+    {
+        infigraph_core::daemon::search::symbols(root, request)?
+    } else {
+        let remote = infigraph_core::daemon::lifecycle::is_remote_backend();
+        let key = if remote {
+            CacheKey::remote(root, super::search::remote_cache_key())
+        } else {
+            CacheKey::local(root, 0, 0)
+        };
+        infigraph_core::search::service::execute(key, &request, || {
+            let data = if remote {
+                super::search::get_search_data_remote(path)?
+            } else {
+                let rows = backend.get_symbols_for_search()?;
+                infigraph_core::search::service::data_from_rows(
+                    root,
+                    rows,
+                    backend.current_ast_generation().ok(),
+                )?
+            };
+            Ok((data, true))
+        })?
+    };
+    let (results, rows): (Vec<_>, Vec<_>) =
+        reply.matches.into_iter().map(|m| (m.result, m.row)).unzip();
 
     let row_map: HashMap<&str, &Vec<String>> =
         rows.iter().map(|row| (row[0].as_str(), row)).collect();

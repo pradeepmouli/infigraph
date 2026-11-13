@@ -384,6 +384,7 @@ impl Neo4jBackend {
         // query text rather than a bound parameter.
         let mut calls_pairs: Vec<HashMap<String, String>> = Vec::new();
         let mut inherits_pairs: Vec<HashMap<String, String>> = Vec::new();
+        let mut implements_pairs: Vec<HashMap<String, String>> = Vec::new();
         let mut tested_by_pairs: Vec<HashMap<String, String>> = Vec::new();
         let mut imports_pairs: Vec<HashMap<String, String>> = Vec::new();
         let mut reads_pairs: Vec<HashMap<String, String>> = Vec::new();
@@ -400,6 +401,8 @@ impl Neo4jBackend {
                 crate::model::RelationKind::Inherits | crate::model::RelationKind::InheritedBy => {
                     inherits_pairs.push(m)
                 }
+                crate::model::RelationKind::Implements
+                | crate::model::RelationKind::ImplementedBy => implements_pairs.push(m),
                 crate::model::RelationKind::TestedBy | crate::model::RelationKind::Tests => {
                     tested_by_pairs.push(m)
                 }
@@ -417,6 +420,7 @@ impl Neo4jBackend {
         for (pairs, rel_type) in [
             (&calls_pairs, "CALLS"),
             (&inherits_pairs, "INHERITS"),
+            (&implements_pairs, "IMPLEMENTS"),
             (&tested_by_pairs, "TESTED_BY"),
             (&reads_pairs, "READS"),
             (&writes_pairs, "WRITES"),
@@ -901,11 +905,14 @@ impl GraphBackend for Neo4jBackend {
     }
 
     fn transitive_impact(&self, id: &str, max_depth: u32) -> Result<Vec<ImpactRow>> {
+        // Neo4j has no catalog to read, and a relationship type with no edges
+        // matches no rows rather than failing, so the static list is exact here.
         let rows = self.run_query(
             query(&format!(
-                "MATCH (s:Symbol {{id: $id}})<-[:CALLS*1..{}]-(caller:Symbol) \
+                "MATCH (s:Symbol {{id: $id}})<-[:{}*1..{}]-(caller:Symbol) \
                  RETURN DISTINCT caller.id AS id, caller.name AS name, \
                         caller.file AS file, caller.kind AS kind",
+                crate::graph::schema::DEPENDENCY_EDGE_TABLES.join("|"),
                 max_depth
             ))
             .param("id", id.to_string()),
@@ -925,11 +932,13 @@ impl GraphBackend for Neo4jBackend {
 
     fn find_all_references(&self, id: &str) -> Result<Vec<ReferenceRow>> {
         let rows = self.run_query(
-            query(
-                "MATCH (ref:Symbol)-[r:CALLS|IMPORTS|INHERITS]->(target:Symbol {id: $id}) \
+            query(&format!(
+                // Static list, as in `transitive_impact`: no catalog here (see there).
+                "MATCH (ref:Symbol)-[r:{}]->(target:Symbol {{id: $id}}) \
                  RETURN ref.id AS caller_id, ref.name AS caller_name, \
                         ref.file AS file, ref.start_line AS line, target.id AS target_id",
-            )
+                crate::graph::schema::DEPENDENCY_EDGE_TABLES.join("|")
+            ))
             .param("id", id.to_string()),
         )?;
         Ok(rows
@@ -1029,7 +1038,7 @@ impl GraphBackend for Neo4jBackend {
 
         let ancestor_rows = self.run_query(
             query(&format!(
-                "MATCH (s:Symbol {{id: $id}})-[:INHERITS*1..{}]->(anc:Symbol) \
+                "MATCH (s:Symbol {{id: $id}})-[:INHERITS|IMPLEMENTS*1..{}]->(anc:Symbol) \
                  RETURN DISTINCT anc.id AS id, anc.name AS name, anc.kind AS kind, anc.file AS file",
                 max_depth
             ))
@@ -1038,7 +1047,7 @@ impl GraphBackend for Neo4jBackend {
 
         let descendant_rows = self.run_query(
             query(&format!(
-                "MATCH (desc:Symbol)-[:INHERITS*1..{}]->(s:Symbol {{id: $id}}) \
+                "MATCH (desc:Symbol)-[:INHERITS|IMPLEMENTS*1..{}]->(s:Symbol {{id: $id}}) \
                  RETURN DISTINCT desc.id AS id, desc.name AS name, desc.kind AS kind, desc.file AS file",
                 max_depth
             ))
@@ -1783,6 +1792,7 @@ impl GraphBackend for Neo4jBackend {
 
         let mut calls_pairs: Vec<HashMap<String, String>> = Vec::new();
         let mut inherits_pairs: Vec<HashMap<String, String>> = Vec::new();
+        let mut implements_pairs: Vec<HashMap<String, String>> = Vec::new();
         let mut tested_by_pairs: Vec<HashMap<String, String>> = Vec::new();
         let mut imports_pairs: Vec<HashMap<String, String>> = Vec::new();
         let mut reads_pairs: Vec<HashMap<String, String>> = Vec::new();
@@ -1799,6 +1809,8 @@ impl GraphBackend for Neo4jBackend {
                     }
                     crate::model::RelationKind::Inherits
                     | crate::model::RelationKind::InheritedBy => inherits_pairs.push(m),
+                    crate::model::RelationKind::Implements
+                    | crate::model::RelationKind::ImplementedBy => implements_pairs.push(m),
                     crate::model::RelationKind::TestedBy | crate::model::RelationKind::Tests => {
                         tested_by_pairs.push(m)
                     }
@@ -1830,6 +1842,7 @@ impl GraphBackend for Neo4jBackend {
         for (pairs, rel_type) in [
             (&calls_pairs, "CALLS"),
             (&inherits_pairs, "INHERITS"),
+            (&implements_pairs, "IMPLEMENTS"),
             (&tested_by_pairs, "TESTED_BY"),
             (&reads_pairs, "READS"),
             (&writes_pairs, "WRITES"),
@@ -2401,7 +2414,13 @@ impl GraphBackend for Neo4jBackend {
             let inherits: Vec<_> = ext
                 .relations
                 .iter()
-                .filter(|r| r.kind == crate::model::RelationKind::Inherits)
+                .filter(|r| {
+                    matches!(
+                        r.kind,
+                        crate::model::RelationKind::Inherits
+                            | crate::model::RelationKind::Implements
+                    )
+                })
                 .collect();
             for rel in inherits {
                 let target_name = rel.target_id.rsplit("::").next().unwrap_or(&rel.target_id);
@@ -2419,11 +2438,12 @@ impl GraphBackend for Neo4jBackend {
                         }];
                         let _ = self.block_on(
                             self.graph.run(
-                                query(
+                                query(&format!(
                                     "UNWIND $batch AS p \
-                                 MATCH (a:Symbol {id: p.src}), (b:Symbol {id: p.tgt}) \
-                                 MERGE (a)-[:INHERITS]->(b)",
-                                )
+                                 MATCH (a:Symbol {{id: p.src}}), (b:Symbol {{id: p.tgt}}) \
+                                 MERGE (a)-[:{}]->(b)",
+                                    rel.kind.as_str()
+                                ))
                                 .param("batch", batch),
                             ),
                         );
@@ -2750,7 +2770,7 @@ impl GraphBackend for Neo4jBackend {
                 escaped
             ));
             let _ = self.run_void(&format!(
-                "MATCH (a:Symbol)-[r:INHERITS]->(b:Symbol) WHERE a.file = '{}' DELETE r",
+                "MATCH (a:Symbol)-[r:INHERITS|IMPLEMENTS]->(b:Symbol) WHERE a.file = '{}' DELETE r",
                 escaped
             ));
         }

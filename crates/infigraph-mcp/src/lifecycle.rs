@@ -189,12 +189,26 @@ pub fn exit_between_calls(code: i32) -> ! {
 pub fn spawn_self_watch() {
     std::thread::spawn(|| {
         let mut watch = infigraph_core::watchdog::SelfWatch::new("mcp");
+        let cache_idle = infigraph_core::idle_cache::idle_timeout();
         loop {
             std::thread::sleep(Duration::from_secs(1));
+            // Connected-but-unused clients must not pin whole-project caches.
+            // A tool owns SERVING for its entire call; leave active calls alone.
+            if let Ok(_between_calls) = SERVING.try_write() {
+                let released =
+                    usize::from(crate::tools::search::evict_idle_search_cache(cache_idle))
+                        + infigraph_core::embed::evict_idle_caches(cache_idle);
+                if released > 0 {
+                    crate::mcp_log(
+                        "CACHE",
+                        &format!("released {released} idle search/vector caches"),
+                    );
+                }
+            }
             match watch.check(std::time::Instant::now()) {
                 infigraph_core::watchdog::Action::DropCaches => {
                     crate::tools::search::drop_search_cache();
-                    infigraph_core::embed::invalidate_hnsw_cache();
+                    infigraph_core::embed::invalidate_caches();
                 }
                 infigraph_core::watchdog::Action::Restart(why) => {
                     crate::mcp_log("WATCHDOG", &format!("{why} -- restarting the worker"));

@@ -42,10 +42,16 @@ fn advertised_tools_match_mcp_tool_names() {
 #[test]
 fn dispatch_handles_all_mcp_tool_names() {
     support::disable_background_watchers();
-    let project = support::TestProject::new();
-    let args = json!({ "path": project.path_string() });
     for tool_name in infigraph_mcp::MCP_TOOL_NAMES {
+        let project = support::TestProject::new();
+        let args = json!({ "path": project.path_string() });
         let result = infigraph_mcp::dispatch_tool(tool_name, &args);
+        // Each dispatch is independent. Explicit watch operations and
+        // ordinary reads can start an in-process watcher; do not leave it
+        // for doctor to mistake for a daemon with a read socket. Close
+        // only this fixture's watchers after every operation.
+        let _ = infigraph_mcp::tools::watch::tool_stop_watch(&args);
+        let _ = infigraph_mcp::tools::docs::tool_stop_watch_docs(&args);
         if let Err(e) = result {
             let msg = e.to_string();
             assert!(

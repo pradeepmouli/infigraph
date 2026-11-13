@@ -373,9 +373,9 @@ pub fn review_with_group(
                     continue;
                 }
             }
-            // Check for cross-repo INHERITS (interface implemented in another repo)
+            // Check for cross-repo subtypes and interface implementations.
             let inh_query = format!(
-                "MATCH (s:Symbol)-[:INHERITS]->(p:Symbol) \
+                "MATCH (s:Symbol)-[:INHERITS|IMPLEMENTS]->(p:Symbol) \
                  WHERE p.name = '{escaped_name}' OR \
                  EXISTS {{ MATCH (m:Symbol) WHERE m.name = '{escaped_name}' AND m.parent = p.id }} \
                  RETURN s.name LIMIT 1"
@@ -873,7 +873,7 @@ fn find_dead_code_in_changed_files(
          WHERE s.file IN [{files_in}] \
          AND s.kind IN ['Function', 'Method'] \
          AND NOT EXISTS {{ MATCH ()-[:CALLS]->(s) }} \
-         AND NOT EXISTS {{ MATCH (p:Symbol)<-[:INHERITS]-() WHERE p.file = s.file AND p.kind IN ['Class', 'Interface', 'Trait'] }} \
+         AND NOT EXISTS {{ MATCH (p:Symbol)<-[:INHERITS|IMPLEMENTS]-() WHERE p.file = s.file AND p.kind IN ['Class', 'Interface', 'Trait'] }} \
          AND NOT s.name STARTS WITH 'test' \
          AND NOT s.name STARTS WITH 'Test' \
          AND NOT s.name = 'main' \

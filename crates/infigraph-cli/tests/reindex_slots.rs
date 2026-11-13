@@ -90,6 +90,16 @@ fn a_full_reindex_waits_for_the_machines_slot_and_runs_when_it_is_free() {
     let read = run(&root, &home, "daemon", &["stats"]);
     assert_ok(&read, "a read while the rebuild waits");
 
+    // The daemon can report its state before the client's next status poll.
+    // Keep the slot held until that independently observed notice arrives.
+    assert!(
+        eventually(BUDGET, || {
+            support::stdio::captured_text(&home, "index.err")
+                .contains("waiting for a machine-wide slot")
+        }),
+        "the client never said it was waiting"
+    );
+
     // The other rebuild ends. This one runs, and says it had waited.
     drop(other_daemons_rebuild);
     let done = asked.wait().unwrap();
@@ -97,10 +107,6 @@ fn a_full_reindex_waits_for_the_machines_slot_and_runs_when_it_is_free() {
     assert!(
         done.success(),
         "index --full after the slot was freed: {done:?}\n{said}"
-    );
-    assert!(
-        said.contains("waiting for a machine-wide slot"),
-        "the client never said it was waiting:\n{said}"
     );
     assert!(
         eventually(BUDGET, || !doctor(&root, &home).contains(key)),

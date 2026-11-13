@@ -2246,9 +2246,10 @@ fn doctor_passes_when_every_keyless_table_holds_one_row_per_pair() {
         .find(|c| c.status == CheckStatus::Pass)
         .unwrap_or_else(|| panic!("no pass result: {checks:?}"));
     assert!(
-        passed
-            .message
-            .contains("7 keyless edge tables hold one row per pair"),
+        passed.message.contains(&format!(
+            "{} keyless edge tables hold one row per pair",
+            infigraph_core::graph::edge_census::KEYLESS_EDGE_TABLES.len()
+        )),
         "{}",
         passed.message
     );

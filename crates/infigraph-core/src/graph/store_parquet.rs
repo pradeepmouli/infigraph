@@ -282,6 +282,7 @@ impl GraphStore {
             std::collections::HashSet::new();
         let mut calls_pairs: Vec<(String, String)> = Vec::new();
         let mut inh_pairs: Vec<(String, String)> = Vec::new();
+        let mut implements_pairs: Vec<(String, String)> = Vec::new();
         let mut test_pairs: Vec<(String, String)> = Vec::new();
         let mut imp_pairs: Vec<(String, String)> = Vec::new();
         let mut reads_pairs: Vec<(String, String)> = Vec::new();
@@ -391,6 +392,9 @@ impl GraphStore {
                                 if inh_seen.insert((src.clone(), tgt.clone())) =>
                             {
                                 inh_pairs.push((src, tgt));
+                            }
+                            RelationKind::Implements | RelationKind::ImplementedBy => {
+                                implements_pairs.push((src, tgt));
                             }
                             RelationKind::TestedBy | RelationKind::Tests
                                 if test_seen.insert((src.clone(), tgt.clone())) =>
@@ -573,6 +577,7 @@ impl GraphStore {
             ("DEFINES", &defines_pairs, "File", "Symbol"),
             ("CALLS", &calls_pairs, "Symbol", "Symbol"),
             ("INHERITS", &inh_pairs, "Symbol", "Symbol"),
+            ("IMPLEMENTS", &implements_pairs, "Symbol", "Symbol"),
             ("TESTED_BY", &test_pairs, "Symbol", "Symbol"),
             ("IMPORTS", &imp_pairs, "Module", "Module"),
             ("READS", &reads_pairs, "Symbol", "Symbol"),

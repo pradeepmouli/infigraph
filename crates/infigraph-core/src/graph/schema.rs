@@ -1,3 +1,72 @@
+/// Symbol-to-symbol dependency and type relationships shared by graph readers.
+pub const SYMBOL_EDGE_TABLES: &[&str] = &[
+    "CALLS",
+    "INHERITS",
+    "IMPLEMENTS",
+    "TESTED_BY",
+    "READS",
+    "WRITES",
+    "REFERENCES",
+];
+
+/// The edge tables a change to a symbol reaches: whoever calls, reads, writes,
+/// subclasses or implements it, and whoever names it as a type or a constant
+/// (`REFERENCES`, written only by the SCIP import). Readers that answer "what
+/// depends on this" take their relationship list from here, so a new table is
+/// added once. Callers, callees and dead-code checks stay on `CALLS`.
+pub const DEPENDENCY_EDGE_TABLES: &[&str] = &[
+    "CALLS",
+    "INHERITS",
+    "IMPLEMENTS",
+    "READS",
+    "WRITES",
+    "REFERENCES",
+];
+
+/// The tables among `wanted` that this graph holds, as a Cypher relationship-type
+/// list (`A|B`). `run` executes one read query and returns its rows.
+///
+/// A table no writer has created yet (`REFERENCES` or `IMPLEMENTS` on a graph
+/// built before they existed) has no edges, so leaving it out of the pattern is
+/// exact. The schema DDL runs only on a writer's open, so a read-only open never
+/// creates it; the graph's own catalog answers instead, one read per call.
+/// Errors when none of `wanted` is present.
+pub fn present_tables<'a>(
+    wanted: &[&'a str],
+    run: impl FnOnce(&str) -> anyhow::Result<Vec<Vec<String>>>,
+) -> anyhow::Result<Vec<&'a str>> {
+    // `show_tables` rows are (id, name, type, database name, comment).
+    let catalog = run("CALL show_tables() RETURN *")?;
+    Ok(wanted
+        .iter()
+        .copied()
+        .filter(|table| {
+            catalog
+                .iter()
+                .any(|row| row.get(1).map(String::as_str) == Some(*table))
+        })
+        .collect())
+}
+
+pub fn present_edge_tables(
+    wanted: &[&str],
+    run: impl FnOnce(&str) -> anyhow::Result<Vec<Vec<String>>>,
+) -> anyhow::Result<String> {
+    let present = present_tables(wanted, run)?;
+    anyhow::ensure!(
+        !present.is_empty(),
+        "none of the edge tables {wanted:?} exists in this graph"
+    );
+    Ok(present.join("|"))
+}
+
+/// `DEPENDENCY_EDGE_TABLES` as the graph holds them. See [`present_edge_tables`].
+pub fn dependency_rel_types(
+    run: impl FnOnce(&str) -> anyhow::Result<Vec<Vec<String>>>,
+) -> anyhow::Result<String> {
+    present_edge_tables(DEPENDENCY_EDGE_TABLES, run)
+}
+
 pub const MIGRATIONS: &[&str] = &[
     "ALTER TABLE Symbol ADD parameters STRING DEFAULT ''",
     "ALTER TABLE Symbol ADD return_type STRING DEFAULT ''",
@@ -150,9 +219,11 @@ pub const CREATE_SCHEMA: &[&str] = &[
     "CREATE REL TABLE IF NOT EXISTS IMPORTS(FROM Module TO Module)",
     "CREATE REL TABLE IF NOT EXISTS CONTAINS(FROM Module TO Symbol)",
     "CREATE REL TABLE IF NOT EXISTS INHERITS(FROM Symbol TO Symbol)",
+    "CREATE REL TABLE IF NOT EXISTS IMPLEMENTS(FROM Symbol TO Symbol)",
     "CREATE REL TABLE IF NOT EXISTS TESTED_BY(FROM Symbol TO Symbol)",
     "CREATE REL TABLE IF NOT EXISTS READS(FROM Symbol TO Symbol)",
     "CREATE REL TABLE IF NOT EXISTS WRITES(FROM Symbol TO Symbol)",
+    "CREATE REL TABLE IF NOT EXISTS REFERENCES(FROM Symbol TO Symbol)",
     "CREATE REL TABLE IF NOT EXISTS MEMBER_OF(FROM Symbol TO Cluster)",
     "CREATE REL TABLE IF NOT EXISTS SIMILAR_TO(FROM Symbol TO Symbol, score FLOAT)",
     "CREATE REL TABLE IF NOT EXISTS BRIDGE_TO(FROM Symbol TO Symbol, bridge_kind STRING, detail STRING)",

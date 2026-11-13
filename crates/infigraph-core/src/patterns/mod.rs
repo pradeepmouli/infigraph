@@ -144,12 +144,12 @@ fn strip_quotes(s: &str) -> String {
 // High confidence when the method name contains create/build/make/factory.
 
 fn detect_factory(backend: &dyn GraphBackend) -> Vec<PatternMatch> {
-    // Find methods that call constructors/classes that have INHERITS edges
+    // Products may extend a base class or implement a contract.
     let query = "\
         MATCH (creator:Symbol)-[:CALLS]->(product:Symbol) \
         WHERE creator.kind = 'Method' \
         AND product.kind IN ['Class', 'Function'] \
-        AND EXISTS { MATCH (product)-[:INHERITS]->(:Symbol) } \
+        AND EXISTS { MATCH (product)-[:INHERITS|IMPLEMENTS]->(:Symbol) } \
         RETURN DISTINCT creator.parent, creator.name, creator.file, product.name, product.file";
 
     let rows = match backend.raw_query(query) {
@@ -383,11 +383,11 @@ fn detect_observer(backend: &dyn GraphBackend) -> Vec<PatternMatch> {
 
 fn detect_strategy(backend: &dyn GraphBackend) -> Vec<PatternMatch> {
     // Kuzu/lbug may not support WITH + aggregation well, so fetch all
-    // INHERITS edges and aggregate in Rust.
+    // inheritance and implementation edges and aggregate in Rust.
     let query = "\
-        MATCH (impl:Symbol)-[:INHERITS]->(iface:Symbol) \
+        MATCH (impl:Symbol)-[:INHERITS|IMPLEMENTS]->(iface:Symbol) \
         WHERE iface.kind IN ['Class', 'Interface', 'Trait'] \
-        RETURN iface.name, iface.file, impl.name, impl.file";
+        RETURN DISTINCT iface.name, iface.file, impl.name, impl.file";
 
     let rows = match backend.raw_query(query) {
         Ok(r) => r,
@@ -454,7 +454,7 @@ fn detect_strategy(backend: &dyn GraphBackend) -> Vec<PatternMatch> {
 
 fn detect_decorator(backend: &dyn GraphBackend) -> Vec<PatternMatch> {
     let query = "\
-        MATCH (decorator:Symbol)-[:INHERITS]->(base:Symbol) \
+        MATCH (decorator:Symbol)-[:INHERITS|IMPLEMENTS]->(base:Symbol) \
         WHERE decorator.kind = 'Class' \
         AND base.kind IN ['Class', 'Interface', 'Trait'] \
         AND EXISTS { \

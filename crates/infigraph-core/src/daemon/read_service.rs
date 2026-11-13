@@ -51,6 +51,26 @@ pub type StoreSource = Arc<dyn Fn() -> Option<Arc<crate::graph::GraphStore>> + S
 /// `read_guard::ensure_read_only` is public.
 pub type RowSource = Arc<dyn Fn(&str) -> Result<Vec<Vec<String>>> + Send + Sync>;
 
+pub type DocSearchSource = Arc<
+    dyn Fn(
+            &crate::search::service::DocSearchRequest,
+        ) -> Result<Vec<crate::search::service::DocSearchResult>>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone)]
+pub struct DocReadSources {
+    pub rows: RowSource,
+    pub search: Option<DocSearchSource>,
+}
+
+impl From<RowSource> for DocReadSources {
+    fn from(rows: RowSource) -> Self {
+        Self { rows, search: None }
+    }
+}
+
 /// Marker in the error frame sent when the daemon is up and listening but
 /// has not opened its graph yet.
 ///
@@ -162,7 +182,14 @@ impl ReadService {
         docs: Option<RowSource>,
         workers: usize,
     ) -> Result<Self> {
-        Self::start_serving(root, source, docs, workers, Arc::new(Liveness::new()), None)
+        Self::start_serving(
+            root,
+            source,
+            docs.map(Into::into),
+            workers,
+            Arc::new(Liveness::new()),
+            None,
+        )
     }
 
     /// As [`start_with_sources`], counting leases and activity into
@@ -174,7 +201,7 @@ impl ReadService {
     pub fn start_serving(
         root: &Path,
         source: StoreSource,
-        docs: Option<RowSource>,
+        docs: Option<DocReadSources>,
         workers: usize,
         liveness: Arc<Liveness>,
         control: Option<Arc<CoordinatorPort>>,
@@ -190,6 +217,7 @@ impl ReadService {
 
         let pool = Pool::new(workers);
         let accept_stop = stop.clone();
+        let root = root.to_path_buf();
         let accept = std::thread::spawn(move || {
             while !accept_stop.load(Ordering::Relaxed) {
                 let Ok(Some(stream)) = listener.accept_timeout(ACCEPT_POLL) else {
@@ -199,9 +227,16 @@ impl ReadService {
                 let docs = docs.clone();
                 let leases = accept_leases.clone();
                 let control = control.clone();
+                let root = root.clone();
                 pool.execute(move || {
-                    let served =
-                        serve_one(&source, docs.as_ref(), &leases, control.as_ref(), stream);
+                    let served = serve_one(
+                        &root,
+                        &source,
+                        docs.as_ref(),
+                        &leases,
+                        control.as_ref(),
+                        stream,
+                    );
                     if let Some(failure) = note_connection(served) {
                         eprintln!("[read] connection failed: {failure}");
                     }
@@ -286,8 +321,9 @@ fn note_connection(served: Result<()>) -> Option<String> {
 }
 
 fn serve_one(
+    root: &Path,
     source: &StoreSource,
-    docs: Option<&RowSource>,
+    docs: Option<&DocReadSources>,
     leases: &Arc<LeaseBook>,
     control: Option<&Arc<CoordinatorPort>>,
     mut stream: ReadStream,
@@ -298,7 +334,46 @@ fn serve_one(
     if frame.keeps_alive() == Some(true) {
         leases.liveness.touch();
     }
+    let _active_read = (frame.keeps_alive() == Some(true)).then(|| leases.liveness.begin_read());
     let req = match frame {
+        ClientFrame::Search(request) => {
+            let result = (|| {
+                let store = source().ok_or_else(|| anyhow::anyhow!(NOT_READY))?;
+                let key = crate::search::service::CacheKey::local(
+                    root,
+                    Arc::as_ptr(&store) as usize,
+                    store.current_ast_generation()?,
+                );
+                crate::search::service::execute(key, &request.search, || {
+                    let conn = store.connection()?;
+                    let rows = crate::graph::GraphQuery::new(&conn).get_symbols_for_search()?;
+                    let data = crate::search::service::data_from_rows(
+                        root,
+                        rows,
+                        store.current_ast_generation().ok(),
+                    )?;
+                    Ok((data, true))
+                })
+            })();
+            let reply = match result {
+                Ok(value) => OpReply::Ok(value),
+                Err(e) => OpReply::Err(format!("{e:#}")),
+            };
+            write_reply(&mut stream, &reply)?;
+            return Ok(());
+        }
+        ClientFrame::DocSearch(request) => {
+            let result = docs
+                .and_then(|d| d.search.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("this daemon has no document search service"))
+                .and_then(|search| search(&request.doc_search));
+            let reply = match result {
+                Ok(value) => OpReply::Ok(value),
+                Err(e) => OpReply::Err(format!("{e:#}")),
+            };
+            write_reply(&mut stream, &reply)?;
+            return Ok(());
+        }
         ClientFrame::Read(req) => req,
         ClientFrame::Attach(Attach { attach_pid }) => {
             park_lease(leases.clone(), attach_pid, stream);
@@ -346,7 +421,7 @@ fn serve_one(
             )?;
             return Ok(());
         };
-        match docs(&req.query) {
+        match (docs.rows)(&req.query) {
             Ok(rows) => {
                 for chunk in rows.chunks(req.chunk_size.max(1)) {
                     write_frame(&mut stream, &ReadFrame::Rows(chunk.to_vec()))?;

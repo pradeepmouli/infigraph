@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use kuzu::Connection;
@@ -36,16 +35,7 @@ use crate::settings_file::ConfigScope;
 /// site and leaving its neighbours is how the original bug survived in a
 /// file that already documented the hazard.
 pub fn staging_parquet(name: &str) -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "{name}.{}-{nanos}-{id}.parquet",
-        std::process::id()
-    ))
+    std::env::temp_dir().join(format!("{name}.{}.parquet", crate::scratch::run_id()))
 }
 
 /// How many bad-record-drop-and-retry cycles a bulk COPY gets before giving
@@ -977,13 +967,6 @@ pub(crate) fn write_absent_edges<S: AsRef<str>, D: AsRef<str>>(
     Ok(())
 }
 
-/// Symbol-to-symbol edge tables whose edges from *other* files are lost when a
-/// file's symbols are replaced: `DETACH DELETE` on the replaced symbols removes
-/// every edge into them, and the file holding the edge is not re-extracted, so
-/// nothing writes it back (base.ts edited, child.ts's INHERITS gone until
-/// child.ts is touched).
-const INCOMING_EDGE_TABLES: [&str; 3] = ["CALLS", "INHERITS", "TESTED_BY"];
-
 /// The edges into the symbols of `files` that come from other files, read
 /// before those symbols are deleted and written back by [`Self::restore`].
 ///
@@ -1006,7 +989,7 @@ impl IncomingEdges {
         let list: Vec<String> = files.iter().map(|f| format!("'{}'", escape(f))).collect();
         let list = list.join(", ");
         let mut saved = Vec::new();
-        for table in INCOMING_EDGE_TABLES {
+        for &table in super::schema::SYMBOL_EDGE_TABLES {
             let rows = conn
                 .query(&format!(
                     "MATCH (a:Symbol)-[:{table}]->(b:Symbol) \

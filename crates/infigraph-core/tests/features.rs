@@ -166,6 +166,122 @@ fn setup_graph() -> TestGraph {
 // ============================================================
 
 #[test]
+fn implementation_edges_reach_patterns_checks_and_exports() {
+    use infigraph_core::check::{run_checks, CheckConfig, CheckSelection, CheckStatus};
+    let dir = tempfile::tempdir().unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
+    let contract = "contract.ts::Strategy";
+    let mut method = sym(
+        "contract.ts::Strategy::run",
+        "run",
+        SymbolKind::Method,
+        "contract.ts",
+        2,
+        2,
+    );
+    method.parent = Some(contract.into());
+    let implementations: Vec<_> = ["Fast", "Safe", "Small"]
+        .into_iter()
+        .map(|name| {
+            sym(
+                &format!("impl.ts::{name}"),
+                name,
+                SymbolKind::Class,
+                "impl.ts",
+                1,
+                3,
+            )
+        })
+        .collect();
+    let relations = implementations
+        .iter()
+        .map(|implementation| rel(&implementation.id, contract, RelationKind::Implements))
+        .collect();
+    let extractions = [
+        FileExtraction {
+            file: "contract.ts".into(),
+            language: "typescript".into(),
+            content_hash: "1".into(),
+            symbols: vec![
+                sym(
+                    contract,
+                    "Strategy",
+                    SymbolKind::Interface,
+                    "contract.ts",
+                    1,
+                    3,
+                ),
+                method,
+            ],
+            relations: vec![],
+            statements: vec![],
+        },
+        FileExtraction {
+            file: "impl.ts".into(),
+            language: "typescript".into(),
+            content_hash: "2".into(),
+            symbols: implementations,
+            relations,
+            statements: vec![],
+        },
+        FileExtraction {
+            file: "unused.ts".into(),
+            language: "typescript".into(),
+            content_hash: "3".into(),
+            symbols: vec![sym(
+                "unused.ts::orphan",
+                "orphan",
+                SymbolKind::Function,
+                "unused.ts",
+                1,
+                2,
+            )],
+            relations: vec![],
+            statements: vec![],
+        },
+    ];
+    {
+        let lock = store.write_lock().unwrap();
+        let conn = store.connection().unwrap();
+        store.upsert_all_bulk(&conn, &extractions, &lock).unwrap();
+    }
+    let backend = KuzuBackend::from_store(store);
+    let patterns = infigraph_core::patterns::detect_all(&backend).unwrap();
+    let strategy = patterns
+        .patterns
+        .iter()
+        .find(|p| p.pattern == "Strategy")
+        .unwrap();
+    assert_eq!(strategy.participants.len(), 4);
+
+    let mut config = CheckConfig::default();
+    config.dead_code.max_dead = 0;
+    let checks = run_checks(
+        dir.path(),
+        &config,
+        &backend,
+        &CheckSelection::from_csv("dead-code"),
+    );
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0].status, CheckStatus::Fail);
+    assert_eq!(checks[0].details.len(), 1);
+    assert!(checks[0].details[0].contains("orphan"));
+
+    let mut output = Vec::new();
+    infigraph_core::export::export_json(&backend, &mut output).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        json["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|edge| edge["label"] == "IMPLEMENTS")
+            .count(),
+        3
+    );
+}
+
+#[test]
 fn test_export_cypher() {
     let tg = setup_graph();
     let mut buf = Vec::new();

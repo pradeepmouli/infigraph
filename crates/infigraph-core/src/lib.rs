@@ -24,6 +24,7 @@ pub mod extract;
 pub mod gc;
 pub mod git_blame;
 pub mod graph;
+pub mod idle_cache;
 pub mod ignore_rules;
 pub mod instances;
 pub mod lang;

@@ -92,25 +92,18 @@ pub(crate) fn api_graph_data(params: &Value) -> Value {
             let nodes = backend
                 .raw_query("MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file")
                 .unwrap_or_default();
-            let calls = backend
-                .raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")
-                .unwrap_or_default();
-            let inherits = backend
-                .raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")
-                .unwrap_or_default();
+            let relationships = match backend.symbol_relationships() {
+                Ok(edges) => edges,
+                Err(error) => return json!({"error": error.to_string()}),
+            };
 
             let node_items: Vec<Value> = nodes
                 .iter()
                 .map(|r| json!({"id": r[0], "name": r[1], "kind": r[2], "file": r[3]}))
                 .collect();
-            let edge_items: Vec<Value> = calls
+            let edge_items: Vec<Value> = relationships
                 .iter()
-                .map(|r| json!({"from": r[0], "to": r[1], "type": "CALLS"}))
-                .chain(
-                    inherits
-                        .iter()
-                        .map(|r| json!({"from": r[0], "to": r[1], "type": "INHERITS"})),
-                )
+                .map(|(kind, from, to)| json!({"from": from, "to": to, "type": kind}))
                 .collect();
 
             json!({"nodes": node_items, "edges": edge_items})

@@ -52,3 +52,25 @@ pub fn daemon_row_source(root: &Path) -> Result<infigraph_core::daemon::read_ser
         DocQuery::new(&conn).raw_query(cypher)
     }))
 }
+
+/// Document reads and ranking run in the same daemon; no document vectors
+/// or HNSW state are loaded by an MCP client on the routed path.
+pub fn daemon_read_sources(
+    root: &Path,
+) -> Result<infigraph_core::daemon::read_service::DocReadSources> {
+    let rows = daemon_row_source(root)?;
+    let root = root.to_path_buf();
+    Ok(infigraph_core::daemon::read_service::DocReadSources {
+        rows,
+        search: Some(Arc::new(move |request| {
+            let store = DocStore::open_for_read(&root)?;
+            crate::search::hybrid_doc_search_in_dir(
+                &request.query,
+                &*store,
+                &root.join(".infigraph"),
+                request.limit,
+                request.alpha,
+            )
+        })),
+    })
+}

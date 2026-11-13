@@ -214,6 +214,9 @@ pub fn tool_get_graph_schema(args: &Value) -> Result<String> {
         "  INHERITS  ({} edges)  Symbol -> Symbol\n",
         stats.inherits
     ));
+    out.push_str("  IMPLEMENTS            Symbol -> Symbol\n");
+    out.push_str("  READS                 Symbol -> Symbol\n");
+    out.push_str("  WRITES                Symbol -> Symbol\n");
     out.push_str(&format!(
         "  CONTAINS  ({} edges)  Module -> Symbol, Symbol -> Symbol\n",
         stats.contains

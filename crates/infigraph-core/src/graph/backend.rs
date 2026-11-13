@@ -105,6 +105,23 @@ pub trait GraphBackend: Send + Sync {
 
     // ── Read: graph traversal ────────────────────────────────────────
 
+    /// All ordinary symbol relationships. Exports and visualizations use the
+    /// same list so a new relationship cannot disappear in one format.
+    /// Each tuple is (relationship kind, source symbol ID, target symbol ID).
+    fn symbol_relationships(&self) -> Result<Vec<(String, String, String)>> {
+        let mut edges = Vec::new();
+        for &table in super::schema::SYMBOL_EDGE_TABLES {
+            for row in self.raw_query(&format!(
+                "MATCH (a:Symbol)-[:{table}]->(b:Symbol) RETURN a.id, b.id"
+            ))? {
+                if row.len() >= 2 {
+                    edges.push((table.to_owned(), row[0].clone(), row[1].clone()));
+                }
+            }
+        }
+        Ok(edges)
+    }
+
     fn callers_of(&self, symbol_id: &str) -> Result<Vec<String>>;
     fn callees_of(&self, symbol_id: &str) -> Result<Vec<String>>;
 

@@ -13,6 +13,7 @@ pub mod read_guard;
 pub mod read_protocol;
 pub mod read_service;
 pub mod reindex_gate;
+pub mod search;
 pub mod task;
 pub mod writes;
 
@@ -798,7 +799,7 @@ pub fn run_write_coordinator<MR, F>(
     // document read then gets an explicit refusal rather than silently
     // opening `docs.kuzu` in the client. Supplied by the caller because
     // `infigraph-docs` depends on this crate, not the reverse.
-    docs_reads: Option<read_service::RowSource>,
+    docs_reads: Option<read_service::DocReadSources>,
 ) -> Result<()>
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry> + Send + 'static,
@@ -1140,6 +1141,8 @@ where
     // exists at that path -- see `path_is_gone`.
     let root_identity = path_identity(root);
     let mut self_watch = crate::watchdog::SelfWatch::new("watch");
+    let cache_idle = crate::idle_cache::idle_timeout();
+    let mut last_cache_check = std::time::Instant::now();
     let mut reindex_gate = reindex_gate::ReindexGate::machine();
     let mut restart_for: Option<String> = None;
 
@@ -1311,13 +1314,24 @@ where
             && scip_import_in_flight.is_none();
         match self_watch.check(std::time::Instant::now()) {
             crate::watchdog::Action::DropCaches => {
-                crate::embed::invalidate_hnsw_cache();
+                crate::search::service::drop_cache();
+                crate::embed::invalidate_caches();
                 if idle {
                     poison_watch_db(&mut held_prism);
                 }
             }
             crate::watchdog::Action::Restart(why) => restart_for = Some(why),
             crate::watchdog::Action::None => {}
+        }
+        // In-process watchers share their host's caches, but have no client
+        // lease book. Only a daemon can apply the last-client rule; the MCP
+        // host maintains its own caches between tool calls.
+        if serve_requests && last_cache_check.elapsed() >= Duration::from_secs(1) {
+            last_cache_check = std::time::Instant::now();
+            let released = search::maintain_caches(&liveness, cache_idle);
+            if released > 0 {
+                eprintln!("[cache] released {released} idle search/vector caches");
+            }
         }
         if idle {
             if let Some(why) = &restart_for {
@@ -4242,15 +4256,18 @@ fn read_policy(root: &Path) -> [bool; 2] {
     ]
 }
 
-/// Returns true if the file has any resolved CALLS edges to/from symbols in other files.
+/// Returns true if the file has any resolved dependency edges to/from symbols in other files.
 fn has_cross_file_calls(prism: &CodeIndex, rel_path: &str) -> bool {
     let backend = match prism.backend() {
         Some(b) => b,
         None => return false,
     };
     let escaped = rel_path.replace('\'', "\\'");
+    let Ok(rel) = crate::graph::schema::dependency_rel_types(|q| backend.raw_query(q)) else {
+        return false;
+    };
     let q = format!(
-        "MATCH (a:Symbol)-[:CALLS]->(b:Symbol) WHERE a.file = '{escaped}' AND b.file <> '{escaped}' RETURN count(*) LIMIT 1"
+        "MATCH (a:Symbol)-[:{rel}]->(b:Symbol) WHERE a.file = '{escaped}' AND b.file <> '{escaped}' RETURN count(*) LIMIT 1"
     );
     if let Ok(result) = backend.raw_query(&q) {
         if let Some(row) = result.first() {
@@ -4262,7 +4279,7 @@ fn has_cross_file_calls(prism: &CodeIndex, rel_path: &str) -> bool {
         }
     }
     let q2 = format!(
-        "MATCH (a:Symbol)-[:CALLS]->(b:Symbol) WHERE b.file = '{escaped}' AND a.file <> '{escaped}' RETURN count(*) LIMIT 1"
+        "MATCH (a:Symbol)-[:{rel}]->(b:Symbol) WHERE b.file = '{escaped}' AND a.file <> '{escaped}' RETURN count(*) LIMIT 1"
     );
     if let Ok(result) = backend.raw_query(&q2) {
         if let Some(row) = result.first() {

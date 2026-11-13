@@ -226,7 +226,10 @@ fn pick_samples(store: &CozoStore) -> Result<Samples> {
     )?;
 
     // INHERITS participants
-    let inherits = store.raw_query(r#"?[child, parent] := *inherits{child, parent}"#)?;
+    let inherits = store.raw_query(
+        r#"?[child, parent] := *inherits{child, parent}
+        ?[child, parent] := *implements{child, parent}"#,
+    )?;
 
     let mut symbol_ids: Vec<String> = Vec::new();
     for row in &top_called {

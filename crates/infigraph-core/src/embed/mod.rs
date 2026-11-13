@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::{Context, Result};
 
 use crate::byte_reader::ByteReader;
+use crate::idle_cache::IdleCache;
 use crate::model::Symbol;
 
 /// Compute the sibling temp path for an atomic write: same directory as
@@ -156,13 +157,13 @@ struct CachedEmbeddings {
     data: Vec<(String, Vec<f32>)>,
 }
 
-static EMBEDDINGS_CACHE: OnceLock<Mutex<Option<CachedEmbeddings>>> = OnceLock::new();
+static EMBEDDINGS_CACHE: OnceLock<Mutex<IdleCache<CachedEmbeddings>>> = OnceLock::new();
 
-fn cache_lock() -> &'static Mutex<Option<CachedEmbeddings>> {
-    EMBEDDINGS_CACHE.get_or_init(|| Mutex::new(None))
+fn cache_lock() -> &'static Mutex<IdleCache<CachedEmbeddings>> {
+    EMBEDDINGS_CACHE.get_or_init(|| Mutex::new(IdleCache::default()))
 }
 
-/// Load embeddings with process-lifetime caching. Returns cached data if the
+/// Load embeddings with idle-expiring caching. Returns cached data if the
 /// file hasn't been modified since last load. Falls back to `load_embeddings`
 /// on any cache miss.
 pub fn load_embeddings_cached(path: &Path) -> Result<Vec<(String, Vec<f32>)>> {
@@ -170,17 +171,15 @@ pub fn load_embeddings_cached(path: &Path) -> Result<Vec<(String, Vec<f32>)>> {
     let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
     let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
-    let guard = cache_lock().lock().unwrap();
-    if let Some(cached) = guard.as_ref() {
-        if cached.path == canon && cached.modified == mtime {
-            return Ok(cached.data.clone());
-        }
+    let mut guard = cache_lock().lock().unwrap();
+    if let Some(cached) = guard.get_if(|cached| cached.path == canon && cached.modified == mtime) {
+        return Ok(cached.data.clone());
     }
     drop(guard);
 
     let data = load_embeddings(path)?;
     let mut guard = cache_lock().lock().unwrap();
-    *guard = Some(CachedEmbeddings {
+    guard.insert(CachedEmbeddings {
         path: canon,
         modified: mtime,
         data: data.clone(),
@@ -190,9 +189,8 @@ pub fn load_embeddings_cached(path: &Path) -> Result<Vec<(String, Vec<f32>)>> {
 
 /// Invalidate the embeddings cache (call after save_embeddings or update_embeddings).
 pub fn invalidate_embeddings_cache() {
-    if let Ok(mut guard) = cache_lock().lock() {
-        *guard = None;
-    }
+    let removed = cache_lock().lock().ok().and_then(|mut guard| guard.take());
+    drop(removed);
 }
 
 /// Embedding engine trait. Implementations can use ONNX, API calls, etc.
@@ -1215,7 +1213,7 @@ const HNSW_EXPANSION_ADD: usize = 200;
 const HNSW_EXPANSION_SEARCH: usize = 256;
 const HNSW_OVERSAMPLE: usize = 20;
 
-static HNSW_CACHE: OnceLock<Mutex<Option<CachedHnsw>>> = OnceLock::new();
+static HNSW_CACHE: OnceLock<Mutex<IdleCache<CachedHnsw>>> = OnceLock::new();
 
 struct CachedHnsw {
     path: PathBuf,
@@ -1224,8 +1222,8 @@ struct CachedHnsw {
     id_map: Vec<String>,
 }
 
-fn hnsw_cache_lock() -> &'static Mutex<Option<CachedHnsw>> {
-    HNSW_CACHE.get_or_init(|| Mutex::new(None))
+fn hnsw_cache_lock() -> &'static Mutex<IdleCache<CachedHnsw>> {
+    HNSW_CACHE.get_or_init(|| Mutex::new(IdleCache::default()))
 }
 
 fn hnsw_opts(dim: usize) -> IndexOptions {
@@ -1510,9 +1508,29 @@ fn patch_hnsw_index(
 
 /// Invalidate the HNSW cache.
 pub fn invalidate_hnsw_cache() {
-    if let Ok(mut guard) = hnsw_cache_lock().lock() {
-        *guard = None;
-    }
+    let removed = hnsw_cache_lock()
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take());
+    drop(removed);
+}
+
+/// Release both lower-level caches, including the separate vector copy.
+pub fn invalidate_caches() {
+    invalidate_embeddings_cache();
+    invalidate_hnsw_cache();
+}
+
+/// Called by long-lived workers/daemons even while client transports stay open.
+pub fn evict_idle_caches(timeout: std::time::Duration) -> usize {
+    usize::from(crate::idle_cache::evict_idle(cache_lock(), timeout))
+        + usize::from(crate::idle_cache::evict_idle(hnsw_cache_lock(), timeout))
+}
+
+/// Release shared vector state after the daemon's last client and read left.
+pub fn clear_unused_caches() -> usize {
+    usize::from(crate::idle_cache::clear(cache_lock()))
+        + usize::from(crate::idle_cache::clear(hnsw_cache_lock()))
 }
 
 /// Which `embeddings.bin` an index reflects, finer than the whole seconds
@@ -1773,16 +1791,16 @@ pub fn search_hnsw(
         .unwrap_or(std::time::UNIX_EPOCH);
 
     // Try cache first
-    let guard = hnsw_cache_lock().lock().unwrap();
-    if let Some(cached) = guard.as_ref() {
-        if cached.path == canon && cached.modified == idx_mtime {
-            return Ok(Some(query_index(
-                &cached.index,
-                &cached.id_map,
-                query,
-                top_k,
-            )?));
-        }
+    let mut guard = hnsw_cache_lock().lock().unwrap();
+    if let Some(cached) =
+        guard.get_if(|cached| cached.path == canon && cached.modified == idx_mtime)
+    {
+        return Ok(Some(query_index(
+            &cached.index,
+            &cached.id_map,
+            query,
+            top_k,
+        )?));
     }
     drop(guard);
 
@@ -1805,7 +1823,7 @@ pub fn search_hnsw(
     let out = query_index(&index, &id_map, query, top_k)?;
 
     let mut guard = hnsw_cache_lock().lock().unwrap();
-    *guard = Some(CachedHnsw {
+    guard.insert(CachedHnsw {
         path: canon,
         modified: idx_mtime,
         index,

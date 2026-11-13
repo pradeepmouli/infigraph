@@ -195,6 +195,7 @@ pub fn build_combined_graph(registry: &Registry, group_name: &str) -> Result<Com
         let edge_names = [
             "CALLS",
             "INHERITS",
+            "IMPLEMENTS",
             "IMPORTS",
             "CONTAINS",
             "DEFINES",
@@ -468,9 +469,9 @@ fn resolve_cross_repo(store: &GraphStore, contracts: &[super::Contract]) -> Resu
     }
 
     let mut new_calls = 0;
-    let mut new_inherits = 0;
+    let mut new_heritage = 0;
 
-    // Cross-repo INHERITS: types with same qualified key in multiple repos
+    // Cross-repo heritage: preserve the relation kind across copies of a type.
     let mut name_to_ids: HashMap<String, Vec<(String, String)>> = HashMap::new();
     for (qkey, entries) in &symbol_map {
         let type_entries: Vec<_> = entries
@@ -502,77 +503,45 @@ fn resolve_cross_repo(store: &GraphStore, contracts: &[super::Contract]) -> Resu
         }
     }
 
-    // Batch: collect all inheritor→target pairs to create
-    let mut inh_pairs: Vec<(String, String)> = Vec::new();
-    for id_repos in name_to_ids.values() {
-        if id_repos.len() < 2 {
-            continue;
-        }
-        for (target_id, _) in id_repos {
-            let escaped = target_id.replace('\'', "\\'");
-            let inheritors = gq
-                .raw_query(&format!(
-                    "MATCH (s:Symbol)-[:INHERITS]->(t:Symbol {{id: '{}'}}) RETURN s.id",
-                    escaped
-                ))
-                .unwrap_or_default();
-
-            for row in &inheritors {
-                if row.is_empty() {
-                    continue;
-                }
-                let inh_repo = extract_repo(&row[0]);
-                for (other_id, other_repo) in id_repos {
-                    if other_repo == inh_repo || other_id == target_id {
+    let mut heritage_pairs = HashSet::new();
+    for table in ["INHERITS", "IMPLEMENTS"] {
+        let mut pairs = Vec::new();
+        for id_repos in name_to_ids.values() {
+            for (target_id, _) in id_repos {
+                let escaped = target_id.replace('\'', "\\'");
+                let subtypes = gq.raw_query(&format!(
+                    "MATCH (s:Symbol)-[:{table}]->(t:Symbol {{id: '{escaped}'}}) RETURN s.id"
+                ))?;
+                for row in &subtypes {
+                    let Some(source) = row.first() else {
                         continue;
+                    };
+                    let source_repo = extract_repo(source);
+                    for (other_id, other_repo) in id_repos {
+                        if other_repo != source_repo && other_id != target_id {
+                            pairs.push((source.clone(), other_id.clone()));
+                        }
                     }
-                    inh_pairs.push((row[0].clone(), other_id.clone()));
                 }
             }
         }
-    }
-    // Deduplicate and write
-    let inh_pairs: Vec<(String, String)> = {
-        let mut seen = HashSet::new();
-        inh_pairs
-            .into_iter()
-            .filter(|p| seen.insert((p.0.clone(), p.1.clone())))
-            .collect()
-    };
-    if !inh_pairs.is_empty() {
-        let refs: Vec<(&str, &str)> = inh_pairs
-            .iter()
-            .map(|(a, b)| (a.as_str(), b.as_str()))
-            .collect();
-        let pq = std::env::temp_dir().join("ig_combined_cross_inherits.parquet");
-        parquet_loader::write_edge_parquet(&pq, &refs)?;
-        if let Err(e) = conn.query(&format!(
-            "COPY INHERITS FROM '{}'",
-            pq.to_string_lossy().replace('\\', "/")
-        )) {
-            eprintln!("  warn: COPY cross-repo INHERITS failed ({e}), using UNWIND");
-            for chunk in refs.chunks(500) {
-                let items: Vec<String> = chunk
-                    .iter()
-                    .map(|(a, b)| {
-                        format!(
-                            "{{a:'{}',b:'{}'}}",
-                            a.replace('\'', "\\'"),
-                            b.replace('\'', "\\'")
-                        )
-                    })
-                    .collect();
-                let _ = conn.query(&format!(
-                    "UNWIND [{}] AS p MATCH (a:Symbol),(b:Symbol) WHERE a.id=p.a AND b.id=p.b CREATE (a)-[:INHERITS]->(b)",
-                    items.join(",")
-                ));
-            }
+        heritage_pairs.extend(pairs.iter().cloned());
+        let pairs =
+            crate::graph::store_util::absent_edges(&conn, table, "Symbol", "Symbol", pairs)?;
+        new_heritage += pairs.len();
+        if !pairs.is_empty() {
+            crate::graph::store_util::copy_edges_with_bad_record_retry(
+                store,
+                table,
+                pairs,
+                "Symbol",
+                "Symbol",
+                &crate::graph::store_util::staging_parquet("infigraph_combined_heritage"),
+            )?;
         }
-        let _ = std::fs::remove_file(&pq);
-        new_inherits = inh_pairs.len();
     }
 
-    // Cross-repo CALLS: type-directed. For each INHERITS pair (child→parent across repos),
+    // Cross-repo CALLS: type-directed. For each heritage pair (child→parent across repos),
     // find methods in child's file, match to same-named methods in parent's file,
     // then link callers of child methods to parent methods. Avoids cartesian products.
     let mut type_file_map: HashMap<String, String> = HashMap::new();
@@ -582,7 +551,7 @@ fn resolve_cross_repo(store: &GraphStore, contracts: &[super::Contract]) -> Resu
         }
     }
 
-    // Build file→methods index for INHERITS-chain type files
+    // Build file→methods index for heritage-chain type files
     // Use bare name (after "::") for method matching across files
     let mut file_methods: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
     for (qkey, entries) in &symbol_map {
@@ -609,7 +578,7 @@ fn resolve_cross_repo(store: &GraphStore, contracts: &[super::Contract]) -> Resu
     let mut call_pairs: Vec<(String, String)> = Vec::new();
     let mut processed_pairs: HashSet<(String, String)> = HashSet::new();
 
-    for (child_id, parent_id) in &inh_pairs {
+    for (child_id, parent_id) in &heritage_pairs {
         let child_file = match type_file_map.get(child_id) {
             Some(f) => f,
             None => continue,
@@ -666,8 +635,8 @@ fn resolve_cross_repo(store: &GraphStore, contracts: &[super::Contract]) -> Resu
     }
 
     eprintln!(
-        "  [combined] Type-directed: {} INHERITS pairs → {} raw CALLS candidates",
-        inh_pairs.len(),
+        "  [combined] Type-directed: {} heritage pairs → {} raw CALLS candidates",
+        heritage_pairs.len(),
         call_pairs.len()
     );
     let call_pairs: Vec<(String, String)> = {
@@ -971,11 +940,11 @@ fn resolve_cross_repo(store: &GraphStore, contracts: &[super::Contract]) -> Resu
     }
 
     eprintln!(
-        "  [combined] Cross-repo: {} CALLS, {} INHERITS, {} xsvc→real",
-        new_calls, new_inherits, xsvc_resolved
+        "  [combined] Cross-repo: {} CALLS, {} heritage, {} xsvc→real",
+        new_calls, new_heritage, xsvc_resolved
     );
 
-    Ok(new_calls + new_inherits + xsvc_resolved)
+    Ok(new_calls + new_heritage + xsvc_resolved)
 }
 
 /// Open the combined graph store for a group.

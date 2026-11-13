@@ -40,25 +40,25 @@ fi
 echo '+cargo fmt -- --check'
 cargo fmt -- --check
 
-echo '+cargo clippy --all-targets -- -D warnings'
-cargo clippy --all-targets -- -D warnings
+echo '+cargo clippy --all-targets --release -- -D warnings'
+cargo clippy --all-targets --release -- -D warnings
 
-echo '+cargo test -p infigraph-core --test write_lock_perf -- --ignored'
-cargo test -p infigraph-core --test write_lock_perf -- --ignored
+echo '+cargo test --release -p infigraph-core --test write_lock_perf -- --ignored'
+cargo test --release -p infigraph-core --test write_lock_perf -- --ignored
 
 # groups_watch_perf spawns the `infigraph` CLI binary next to the test
 # executable, and infigraph-mcp has no dependency on infigraph-cli, so
-# `cargo test -p infigraph-mcp` never rebuilds it. A binary left over from
+# `cargo test --release -p infigraph-mcp` never rebuilds it. A binary left over from
 # another branch (different lbug version) makes the test fail silently
 # ("No results across repos"). Building it here costs one link step.
-echo '+cargo build -p infigraph-cli'
-cargo build -p infigraph-cli
+echo '+cargo build --release -p infigraph-cli'
+cargo build --release -p infigraph-cli
 
-echo '+cargo test -p infigraph-mcp --test groups_watch_perf -- --ignored'
-cargo test -p infigraph-mcp --test groups_watch_perf -- --ignored
+echo '+cargo test --release -p infigraph-mcp --test groups_watch_perf -- --ignored'
+cargo test --release -p infigraph-mcp --test groups_watch_perf -- --ignored
 
-echo '+cargo test -p infigraph-core --test index_perf -- --ignored'
-cargo test -p infigraph-core --test index_perf -- --ignored
+echo '+cargo test --release -p infigraph-core --test index_perf -- --ignored'
+cargo test --release -p infigraph-core --test index_perf -- --ignored
 
 # #183: re-upserting byte-identical content still grows the graph, measured at
 # 5.98x over 40 rounds. Not because reclamation is partial -- the row count
@@ -74,5 +74,5 @@ cargo test -p infigraph-core --test index_perf -- --ignored
 #
 # `--lib`, not `--test`: it is a unit test, because the size it measures comes
 # from `store_util::graph_family_bytes`, which is `pub(crate)`.
-echo '+cargo test -p infigraph-core --lib -- --ignored unchanged_content_churn_stays_within_its_measured_bound'
-cargo test -p infigraph-core --lib -- --ignored unchanged_content_churn_stays_within_its_measured_bound
+echo '+cargo test --release -p infigraph-core --lib -- --ignored unchanged_content_churn_stays_within_its_measured_bound'
+cargo test --release -p infigraph-core --lib -- --ignored unchanged_content_churn_stays_within_its_measured_bound

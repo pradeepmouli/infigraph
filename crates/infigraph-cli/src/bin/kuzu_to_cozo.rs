@@ -220,6 +220,12 @@ fn main() -> Result<()> {
             "a.id, b.id",
         ),
         (
+            "IMPLEMENTS",
+            "implements",
+            "(a:Symbol)-[r:IMPLEMENTS]->(b:Symbol)",
+            "a.id, b.id",
+        ),
+        (
             "TESTED_BY",
             "tested_by",
             "(a:Symbol)-[r:TESTED_BY]->(b:Symbol)",
@@ -504,6 +510,7 @@ fn main() -> Result<()> {
             "IMPORTS",
             "CONTAINS",
             "INHERITS",
+            "IMPLEMENTS",
             "TESTED_BY",
             "READS",
             "WRITES",
@@ -600,6 +607,11 @@ fn main() -> Result<()> {
             "inherits",
             "MATCH ()-[r:INHERITS]->() RETURN count(r)",
             "inherits",
+        ),
+        (
+            "implements",
+            "MATCH ()-[r:IMPLEMENTS]->() RETURN count(r)",
+            "implements",
         ),
         (
             "tested_by",

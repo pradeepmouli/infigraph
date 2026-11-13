@@ -3,7 +3,6 @@
 //! `index_via_daemon` -- comes through `submit`.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
@@ -161,21 +160,13 @@ pub fn submit(root: &Path, request: &WriteRequest, opts: WriteOpts) -> anyhow::R
     )
 }
 
-/// Distinguishes sidecars one process creates within the same nanosecond.
-static SIDECAR_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 /// A fresh sidecar path for a bulk payload, `<pid>-<nanos>-<n>.<ext>`, with
 /// its directory created. The caller removes it on every error; the daemon
 /// removes it once read; the daemon's startup sweeps leftovers older than 6h.
 pub fn sidecar_path(root: &Path, ext: &str) -> PathBuf {
     let dir = root.join(".infigraph").join(SIDECAR_DIR);
     let _ = std::fs::create_dir_all(&dir);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let n = SIDECAR_COUNTER.fetch_add(1, Ordering::Relaxed);
-    dir.join(format!("{}-{nanos}-{n}.{ext}", std::process::id()))
+    dir.join(format!("{}.{ext}", crate::scratch::run_id()))
 }
 
 #[cfg(test)]

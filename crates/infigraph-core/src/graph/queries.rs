@@ -118,10 +118,13 @@ impl<E: crate::graph::query_exec::QueryExec> GraphQuery<E> {
     }
 
     /// Transitive impact: all symbols affected by a change to the given symbol.
-    /// Follows CALLS edges in reverse (who calls this, who calls those, etc.).
+    /// Follows the dependency edges in reverse (who calls, reads, names or
+    /// subclasses this, and who depends on those, etc.).
     pub fn transitive_impact(&self, symbol_id: &str, max_depth: u32) -> Result<Vec<ImpactRow>> {
+        let rel = crate::graph::schema::dependency_rel_types(|q| self.exec.query_rows(q))?;
         let query = format!(
-            "MATCH (changed:Symbol)<-[:CALLS* 1..{}]-(affected:Symbol) WHERE changed.id = '{}' RETURN DISTINCT affected.id, affected.name, affected.file, affected.kind",
+            "MATCH (changed:Symbol)<-[:{}* 1..{}]-(affected:Symbol) WHERE changed.id = '{}' RETURN DISTINCT affected.id, affected.name, affected.file, affected.kind",
+            rel,
             max_depth,
             symbol_id.replace('\'', "\\'")
         );
@@ -202,10 +205,12 @@ impl<E: crate::graph::query_exec::QueryExec> GraphQuery<E> {
     /// Find all reference locations for a symbol — file, line, column, and calling symbol.
     /// Returns every place the symbol is called/used, for rename/refactor workflows.
     pub fn find_all_references(&self, symbol_id: &str) -> Result<Vec<ReferenceRow>> {
+        let rel = crate::graph::schema::dependency_rel_types(|q| self.exec.query_rows(q))?;
         let q = format!(
-            "MATCH (caller:Symbol)-[:CALLS]->(target:Symbol) \
+            "MATCH (caller:Symbol)-[:{}]->(target:Symbol) \
              WHERE target.id = '{}' \
-             RETURN caller.id, caller.name, caller.file, caller.start_line, target.id",
+             RETURN DISTINCT caller.id, caller.name, caller.file, caller.start_line, target.id",
+            rel,
             symbol_id.replace('\'', "\\'")
         );
         let result = self
@@ -320,13 +325,16 @@ impl<E: crate::graph::query_exec::QueryExec> GraphQuery<E> {
     /// Get full type hierarchy for a class/interface: ancestors (up) and descendants (down).
     pub fn get_type_hierarchy(&self, symbol_id: &str, max_depth: u32) -> Result<TypeHierarchy> {
         let esc = symbol_id.replace('\'', "\\'");
+        let rel = crate::graph::schema::present_edge_tables(&["INHERITS", "IMPLEMENTS"], |q| {
+            self.exec.query_rows(q)
+        })?;
 
         // Ancestors: walk INHERITS edges upward
         let q_up = format!(
-            "MATCH (root:Symbol)-[:INHERITS* 1..{}]->(ancestor:Symbol) \
+            "MATCH (root:Symbol)-[:{}* 1..{}]->(ancestor:Symbol) \
              WHERE root.id = '{}' \
              RETURN ancestor.id, ancestor.name, ancestor.kind, ancestor.file",
-            max_depth, esc
+            rel, max_depth, esc
         );
         let r = self
             .exec
@@ -346,10 +354,10 @@ impl<E: crate::graph::query_exec::QueryExec> GraphQuery<E> {
 
         // Descendants: walk INHERITS edges downward
         let q_down = format!(
-            "MATCH (descendant:Symbol)-[:INHERITS* 1..{}]->(root:Symbol) \
+            "MATCH (descendant:Symbol)-[:{}* 1..{}]->(root:Symbol) \
              WHERE root.id = '{}' \
              RETURN descendant.id, descendant.name, descendant.kind, descendant.file",
-            max_depth, esc
+            rel, max_depth, esc
         );
         let r2 = self
             .exec

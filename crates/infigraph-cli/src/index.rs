@@ -511,7 +511,7 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
             let backend = prism.backend().context("graph not initialized")?;
             let pg = infigraph_core::meta::PostgresMetaStore::connect_from_env_cached()?;
             pg.init_schema()?;
-            let count = infigraph_core::embed::update_embeddings_remote(backend, &pg, &changed)?;
+            let count = infigraph_core::embed::update_embeddings_remote(backend, pg, &changed)?;
             println!("Saved {} embeddings to Postgres pgvector", count);
             done = true;
         }
@@ -1036,16 +1036,12 @@ pub(crate) fn cmd_scip_enrich(
 /// actually run. An empty result means there was nothing to import --
 /// callers should skip acquiring any lock at all in that case.
 /// Run-unique suffix for this process's SCIP scratch files (#139): pid plus
-/// a nanosecond timestamp. A user-run `infigraph scip-enrich`/`index --full`
+/// a timestamp and process counter. A user-run `infigraph scip-enrich`/`index --full`
 /// and the daemon's own staleness-triggered enrichment can now run the same
 /// indexer at the same time; with a fixed `<indexer>.scip` name one side
 /// imported the other's half-written file or found it already deleted.
 fn scip_run_id() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{}-{nanos}", std::process::id())
+    infigraph_core::scratch::run_id()
 }
 
 /// Age past which a `.scip` scratch file is assumed orphaned by a producer

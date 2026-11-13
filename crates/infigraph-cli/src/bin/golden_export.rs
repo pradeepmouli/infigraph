@@ -230,8 +230,9 @@ fn pick_samples<E: infigraph_core::graph::query_exec::QueryExec>(
     )?;
 
     // INHERITS participants
-    let inherits: Vec<Vec<String>> =
-        q.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
+    let inherits: Vec<Vec<String>> = q.raw_query(
+        "MATCH (a:Symbol)-[:INHERITS|IMPLEMENTS]->(b:Symbol) RETURN DISTINCT a.id, b.id",
+    )?;
 
     let mut symbol_ids: Vec<String> = Vec::new();
     for row in &top_called {

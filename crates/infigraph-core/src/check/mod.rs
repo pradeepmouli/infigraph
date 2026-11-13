@@ -337,7 +337,7 @@ fn run_complexity_check(backend: &dyn GraphBackend, cfg: &ComplexityConfig) -> C
 fn run_dead_code_check(backend: &dyn GraphBackend, cfg: &DeadCodeConfig) -> CheckResult {
     let query = "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] \
                  AND NOT EXISTS { MATCH ()-[:CALLS]->(s) } \
-                 AND NOT EXISTS { MATCH (p:Symbol)<-[:INHERITS]-() WHERE p.file = s.file AND p.kind IN ['Class', 'Interface', 'Trait'] } \
+                 AND NOT EXISTS { MATCH (p:Symbol)<-[:INHERITS|IMPLEMENTS]-() WHERE p.file = s.file AND p.kind IN ['Class', 'Interface', 'Trait'] } \
                  RETURN s.name, s.kind, s.file ORDER BY s.file, s.name";
 
     let rows = match backend.raw_query(query) {
