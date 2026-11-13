@@ -3826,7 +3826,7 @@ fn recover_or_quarantine_swapped_in_graph_with(
     graph_name: &str,
     live_path: &Path,
     retired_path: &Option<PathBuf>,
-    probe: impl Fn(&Path) -> bool,
+    probe: impl Fn(&Path) -> crate::probe::Probe,
 ) -> SwapReopen {
     match crate::lockfile::acquire(
         &crate::graph::db_lock_path(live_path),
@@ -3846,6 +3846,13 @@ fn recover_or_quarantine_swapped_in_graph_with(
             );
             if verdict.is_usable() {
                 return SwapReopen::GraphIsHealthy;
+            }
+            if verdict == crate::quarantine::WalRecovery::Indeterminate {
+                return SwapReopen::Undecided {
+                    note: "the probe that decides the swapped-in graph's fate could not finish; \
+                           nothing was quarantined"
+                        .to_string(),
+                };
             }
             debug_assert!(verdict.permits_quarantine());
             let _ = crate::quarantine::quarantine_graph(infigraph_dir, graph_name);
@@ -5917,7 +5924,7 @@ mod swapped_in_graph_reopen_tests {
             crate::graph::names::STEM,
             &live,
             &Some(retired.clone()),
-            |_| true,
+            |_| crate::probe::Probe::Opens,
         );
 
         assert!(
@@ -5948,7 +5955,7 @@ mod swapped_in_graph_reopen_tests {
             crate::graph::names::STEM,
             &live,
             &Some(retired.clone()),
-            |_| false,
+            |_| crate::probe::Probe::DoesNotOpen,
         );
 
         match outcome {
@@ -5996,7 +6003,7 @@ mod extensioned_swap_lock_tests {
             "live.kuzu",
             &live,
             &None,
-            |_| false,
+            |_| crate::probe::Probe::DoesNotOpen,
         );
         assert!(
             matches!(outcome, SwapReopen::Undecided { .. }),

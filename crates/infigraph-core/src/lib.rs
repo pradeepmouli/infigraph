@@ -622,6 +622,20 @@ impl CodeIndex {
                                             self.db_path.display()
                                         ));
                                     }
+                                    // Nothing was decided: the probe was killed from
+                                    // outside, could not start, or ran out of time.
+                                    // Quarantining now would discard a graph nobody
+                                    // has shown to be bad, so refuse the open
+                                    // transiently and leave the attempt uncounted.
+                                    WalRecovery::Indeterminate => {
+                                        return Err(last_err).context(format!(
+                                            "the graph at {} could not be checked just now (its \
+                                             probe process was killed, could not start, or ran \
+                                             past its time budget), so it was NOT quarantined. \
+                                             Retry shortly.",
+                                            self.db_path.display()
+                                        ));
+                                    }
                                     WalRecovery::NotRecoverable => {}
                                 }
                             }

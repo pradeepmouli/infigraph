@@ -373,6 +373,12 @@ pub fn settle_open_deaths(
             )
         }
         WalRecovery::AlreadyHealthy => Ok(()),
+        // Undecided: refuse this open for now. The death record is kept (it
+        // is not folded or cleared), so the next open asks again.
+        WalRecovery::Indeterminate => anyhow::bail!(
+            "opening {graph_name} is refused for now: the probe that checks it after an earlier \
+             death could not finish, so nothing was decided and the record is kept"
+        ),
     }
 }
 

@@ -968,7 +968,7 @@ impl GraphStore {
     /// the "probe says no" branch and the interesting one would be unreachable.
     pub(crate) fn open_read_only_or_degrade_with(
         path: &Path,
-        probe: impl Fn(&Path) -> bool,
+        probe: impl Fn(&Path) -> crate::probe::Probe,
     ) -> Result<(Self, Option<DegradeReason>)> {
         let infigraph_dir = path.parent().ok_or_else(|| {
             anyhow::anyhow!("graph path {} has no parent directory", path.display())
@@ -1037,6 +1037,16 @@ impl GraphStore {
                     let store = Self::open_read_only(path)?;
                     drop(graph_lock);
                     return Ok((store, None));
+                }
+                if verdict == crate::quarantine::WalRecovery::Indeterminate {
+                    // Nothing was decided and the WAL is back in place: refuse
+                    // this read, leave the graph alone, and let the caller retry.
+                    drop(graph_lock);
+                    anyhow::bail!(
+                        "graph {} could not be checked just now (its probe process was killed, \
+                         could not start, or ran past its time budget); it was NOT quarantined",
+                        path.display()
+                    );
                 }
                 debug_assert!(verdict.permits_quarantine());
                 crate::quarantine::quarantine_graph(infigraph_dir, &graph_name)?;
@@ -2729,8 +2739,12 @@ mod tests {
     /// a test binary is libtest -- it would re-run this whole suite per call.
     /// Same open path the real probe child takes, so the dead-holder guard
     /// behaves identically.
-    fn in_process_probe(graph: &Path) -> bool {
-        GraphStore::open_read_only(graph).is_ok()
+    fn in_process_probe(graph: &Path) -> crate::probe::Probe {
+        if GraphStore::open_read_only(graph).is_ok() {
+            crate::probe::Probe::Opens
+        } else {
+            crate::probe::Probe::DoesNotOpen
+        }
     }
 
     /// A graph the probe opens AS IT STANDS must never be quarantined, even
