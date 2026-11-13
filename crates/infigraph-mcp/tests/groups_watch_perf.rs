@@ -46,6 +46,12 @@ fn group_fixture() -> &'static GroupFixture {
         // Local MCP watchers are explicit and do not use this CLI opt-out.
         let orig_no_watch = std::env::var_os("INFIGRAPH_NO_WATCH");
         std::env::set_var("INFIGRAPH_NO_WATCH", "1");
+        // NO_WATCH does not stop SCIP enrichment: `infigraph index` still
+        // detaches a `scip-enrich` child for these Python projects, and that
+        // child holds the graph's writer lock while its indexer runs. Under
+        // load the next fixture call then fails with "locked by another
+        // infigraph process". None of this test's assertions reads SCIP output.
+        support::disable_scip_enrichment();
 
         // One thread for every indexer this fixture starts (the spawned
         // `infigraph index`, the in-process watcher). The test compares the
