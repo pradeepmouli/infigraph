@@ -805,6 +805,11 @@ mod tests {
         for dir in ["src", "target", ".infigraph/scip-tmp"] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
+        // The creation events of those directories are queued by fseventsd and
+        // can be delivered late under load. Let them drain before the stream
+        // exists, so the only events it can deliver are the ones this test
+        // writes: a directory's own creation event is not a write inside it.
+        std::thread::sleep(Duration::from_secs(2));
 
         let Subscription {
             watcher: _watcher,
@@ -844,10 +849,14 @@ mod tests {
             wanted(&delivered),
             "the sibling's and the canary's events must still arrive: {delivered:?}"
         );
+        // Strictly below each excluded directory: a write inside it must never
+        // arrive. The directory's own event is not such a write.
+        let strictly_below =
+            |dir: PathBuf| delivered.iter().any(|p| p.starts_with(&dir) && *p != dir);
         assert!(
-            !delivered.iter().any(|p| p.starts_with(root.join("target"))
-                || p.starts_with(root.join(".infigraph/scip-tmp"))),
-            "an excluded directory's write reached the receiver: {delivered:?}"
+            !strictly_below(root.join("target"))
+                && !strictly_below(root.join(".infigraph/scip-tmp")),
+            "a write inside an excluded directory reached the receiver: {delivered:?}"
         );
 
         let controlled = event_paths_until(&mut control_rx, Duration::from_secs(15), |paths| {
