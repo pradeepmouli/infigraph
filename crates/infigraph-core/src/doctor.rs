@@ -1312,7 +1312,9 @@ pub fn check_keyless_edges(ctx: &DoctorContext) -> Vec<CheckResult> {
 /// "not checked", never a pass.
 fn check_one_project_keyless_edges(project_path: &Path) -> Vec<CheckResult> {
     use crate::degraded::DegradedMode;
-    use crate::graph::edge_census::{census, table_count_query, TableCount, CENSUS_BUDGET};
+    use crate::graph::edge_census::{
+        census, present_keyless_tables, table_count_query, TableCount, CENSUS_BUDGET,
+    };
     use crate::graph::observe::ObservedGraph;
 
     let graph_path = project_path
@@ -1326,19 +1328,29 @@ fn check_one_project_keyless_edges(project_path: &Path) -> Vec<CheckResult> {
     };
     let name = project_path.display().to_string();
 
-    let counted = census(CENSUS_BUDGET, |table: &str, src: &str, dst: &str| {
-        let rows = observed.with_query(|q| q.raw_query(&table_count_query(table, src, dst)))??;
-        match rows.first() {
-            Some(cells) => TableCount::from_cells(cells)
-                .ok_or_else(|| anyhow::anyhow!("unreadable count row for {table}")),
-            // An empty match returns no row: the table holds no edges.
-            None => Ok(TableCount {
-                table: table.to_string(),
-                rows: 0,
-                pairs: 0,
-            }),
-        }
-    });
+    // Only the tables this graph holds: an older graph has no REFERENCES or
+    // IMPLEMENTS, and counting a missing table would fail the whole census.
+    let counted =
+        present_keyless_tables(|q| observed.with_query(|g| g.raw_query(q))?).and_then(|present| {
+            census(
+                CENSUS_BUDGET,
+                &present,
+                |table: &str, src: &str, dst: &str| {
+                    let rows = observed
+                        .with_query(|q| q.raw_query(&table_count_query(table, src, dst)))??;
+                    match rows.first() {
+                        Some(cells) => TableCount::from_cells(cells)
+                            .ok_or_else(|| anyhow::anyhow!("unreadable count row for {table}")),
+                        // An empty match returns no row: the table holds no edges.
+                        None => Ok(TableCount {
+                            table: table.to_string(),
+                            rows: 0,
+                            pairs: 0,
+                        }),
+                    }
+                },
+            )
+        });
     let census = match counted {
         Ok(census) => census,
         Err(e) => {

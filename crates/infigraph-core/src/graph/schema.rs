@@ -31,13 +31,13 @@ pub const DEPENDENCY_EDGE_TABLES: &[&str] = &[
 /// exact. The schema DDL runs only on a writer's open, so a read-only open never
 /// creates it; the graph's own catalog answers instead, one read per call.
 /// Errors when none of `wanted` is present.
-pub fn present_edge_tables(
-    wanted: &[&str],
+pub fn present_tables<'a>(
+    wanted: &[&'a str],
     run: impl FnOnce(&str) -> anyhow::Result<Vec<Vec<String>>>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Vec<&'a str>> {
     // `show_tables` rows are (id, name, type, database name, comment).
     let catalog = run("CALL show_tables() RETURN *")?;
-    let present: Vec<&str> = wanted
+    Ok(wanted
         .iter()
         .copied()
         .filter(|table| {
@@ -45,7 +45,14 @@ pub fn present_edge_tables(
                 .iter()
                 .any(|row| row.get(1).map(String::as_str) == Some(*table))
         })
-        .collect();
+        .collect())
+}
+
+pub fn present_edge_tables(
+    wanted: &[&str],
+    run: impl FnOnce(&str) -> anyhow::Result<Vec<Vec<String>>>,
+) -> anyhow::Result<String> {
+    let present = present_tables(wanted, run)?;
     anyhow::ensure!(
         !present.is_empty(),
         "none of the edge tables {wanted:?} exists in this graph"
