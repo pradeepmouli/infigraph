@@ -905,11 +905,14 @@ impl GraphBackend for Neo4jBackend {
     }
 
     fn transitive_impact(&self, id: &str, max_depth: u32) -> Result<Vec<ImpactRow>> {
+        // Neo4j has no catalog to read, and a relationship type with no edges
+        // matches no rows rather than failing, so the static list is exact here.
         let rows = self.run_query(
             query(&format!(
-                "MATCH (s:Symbol {{id: $id}})<-[:CALLS*1..{}]-(caller:Symbol) \
+                "MATCH (s:Symbol {{id: $id}})<-[:{}*1..{}]-(caller:Symbol) \
                  RETURN DISTINCT caller.id AS id, caller.name AS name, \
                         caller.file AS file, caller.kind AS kind",
+                crate::graph::schema::DEPENDENCY_EDGE_TABLES.join("|"),
                 max_depth
             ))
             .param("id", id.to_string()),
@@ -929,11 +932,13 @@ impl GraphBackend for Neo4jBackend {
 
     fn find_all_references(&self, id: &str) -> Result<Vec<ReferenceRow>> {
         let rows = self.run_query(
-            query(
-                "MATCH (ref:Symbol)-[r:CALLS|READS|WRITES|IMPORTS|INHERITS|IMPLEMENTS]->(target:Symbol {id: $id}) \
+            query(&format!(
+                // Static list, as in `transitive_impact`: no catalog here (see there).
+                "MATCH (ref:Symbol)-[r:{}]->(target:Symbol {{id: $id}}) \
                  RETURN ref.id AS caller_id, ref.name AS caller_name, \
                         ref.file AS file, ref.start_line AS line, target.id AS target_id",
-            )
+                crate::graph::schema::DEPENDENCY_EDGE_TABLES.join("|")
+            ))
             .param("id", id.to_string()),
         )?;
         Ok(rows

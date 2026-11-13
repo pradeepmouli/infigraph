@@ -156,3 +156,32 @@ fn changing_a_constant_affects_the_function_that_uses_it() {
         "changing LIMIT affects make: {affected:?}"
     );
 }
+
+/// A tree-sitter constructor call is a CALLS edge the SCIP import never wrote.
+/// A replay under a newer importer revision adds the reference edges and must
+/// leave that edge in place: the import only adds, it never removes CALLS pairs.
+#[test]
+fn a_tree_sitter_call_edge_survives_a_replay() {
+    let (dir, graph) = import_fixture();
+    let store = GraphStore::open(&graph).unwrap();
+    store
+        .connection()
+        .unwrap()
+        .query(&format!(
+            "MATCH (a:Symbol {{id: '{MAKE}'}}), (b:Symbol {{id: '{POINT}'}}) CREATE (a)-[:CALLS]->(b)"
+        ))
+        .unwrap();
+    import_scip_index(&dir.path().join("index.scip"), &store, Some(dir.path())).unwrap();
+    drop(store);
+
+    let backend = KuzuBackend::open(&graph).unwrap();
+    for table in ["CALLS", "REFERENCES"] {
+        let rows = backend
+            .raw_query(&format!(
+                "MATCH (a:Symbol {{id: '{MAKE}'}})-[r:{table}]->(b:Symbol {{id: '{POINT}'}}) RETURN count(r)"
+            ))
+            .unwrap();
+        let count: usize = rows[0][0].to_string().parse().unwrap();
+        assert_eq!(count, 1, "{table} from make to Point after the replay");
+    }
+}

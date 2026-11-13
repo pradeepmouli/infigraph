@@ -4256,15 +4256,18 @@ fn read_policy(root: &Path) -> [bool; 2] {
     ]
 }
 
-/// Returns true if the file has any resolved CALLS edges to/from symbols in other files.
+/// Returns true if the file has any resolved dependency edges to/from symbols in other files.
 fn has_cross_file_calls(prism: &CodeIndex, rel_path: &str) -> bool {
     let backend = match prism.backend() {
         Some(b) => b,
         None => return false,
     };
     let escaped = rel_path.replace('\'', "\\'");
+    let Ok(rel) = crate::graph::schema::dependency_rel_types(|q| backend.raw_query(q)) else {
+        return false;
+    };
     let q = format!(
-        "MATCH (a:Symbol)-[:CALLS]->(b:Symbol) WHERE a.file = '{escaped}' AND b.file <> '{escaped}' RETURN count(*) LIMIT 1"
+        "MATCH (a:Symbol)-[:{rel}]->(b:Symbol) WHERE a.file = '{escaped}' AND b.file <> '{escaped}' RETURN count(*) LIMIT 1"
     );
     if let Ok(result) = backend.raw_query(&q) {
         if let Some(row) = result.first() {
@@ -4276,7 +4279,7 @@ fn has_cross_file_calls(prism: &CodeIndex, rel_path: &str) -> bool {
         }
     }
     let q2 = format!(
-        "MATCH (a:Symbol)-[:CALLS]->(b:Symbol) WHERE b.file = '{escaped}' AND a.file <> '{escaped}' RETURN count(*) LIMIT 1"
+        "MATCH (a:Symbol)-[:{rel}]->(b:Symbol) WHERE b.file = '{escaped}' AND a.file <> '{escaped}' RETURN count(*) LIMIT 1"
     );
     if let Ok(result) = backend.raw_query(&q2) {
         if let Some(row) = result.first() {

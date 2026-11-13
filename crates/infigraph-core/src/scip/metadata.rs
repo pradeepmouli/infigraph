@@ -110,6 +110,9 @@ pub(super) fn reference_tables(kind: Option<Kind>, roles: i32) -> &'static [&'st
     }
     let write = roles & SymbolRole::WriteAccess as i32 != 0;
     let read = roles & SymbolRole::ReadAccess as i32 != 0;
+    // rust-analyzer sends no access flags on its references. A variable,
+    // constant, property, field or parameter reference is therefore a READS
+    // edge by its symbol's kind, not by the flag, so a constant read is kept.
     if write
         || read
         || matches!(
@@ -123,26 +126,22 @@ pub(super) fn reference_tables(kind: Option<Kind>, roles: i32) -> &'static [&'st
             _ => &["READS"],
         };
     }
-    // Types are reference targets, not calls. The legacy producer supplies no
-    // kind; its old CALLS behavior is retained for backwards compatibility.
-    if matches!(
-        kind,
+    // A type is named, not called: a function that returns or constructs one
+    // depends on it, so the reference is its own table, not a CALLS edge.
+    // Files, namespaces, modules and type parameters are not reference targets.
+    // The legacy producer supplies no kind; its old CALLS behavior is retained.
+    match kind {
         Some(
             Kind::Class
-                | Kind::Interface
-                | Kind::Trait
-                | Kind::Struct
-                | Kind::Enum
-                | Kind::TypeAlias
-                | Kind::File
-                | Kind::Namespace
-                | Kind::Module
-                | Kind::TypeParameter
-        )
-    ) {
-        return &[];
+            | Kind::Interface
+            | Kind::Trait
+            | Kind::Struct
+            | Kind::Enum
+            | Kind::TypeAlias,
+        ) => &["REFERENCES"],
+        Some(Kind::File | Kind::Namespace | Kind::Module | Kind::TypeParameter) => &[],
+        _ => &["CALLS"],
     }
-    &["CALLS"]
 }
 
 pub(super) fn implementation_table(source: Option<Kind>, target: Option<Kind>) -> &'static str {

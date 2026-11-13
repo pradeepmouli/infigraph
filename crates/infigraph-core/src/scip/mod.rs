@@ -154,7 +154,10 @@ fn scip_ledger_path(infigraph_dir: &Path) -> std::path::PathBuf {
 
 // Increment when the same SCIP input must be replayed under new import
 // semantics. The ledger predates revisions; a missing revision is stale.
-const SCIP_IMPORT_REVISION: u64 = 1;
+// 2: a type reference becomes a REFERENCES edge (it was dropped). The replay
+// only adds those; the CALLS edges an earlier import wrote are not removed,
+// because tree-sitter also writes CALLS to a class for a constructor call.
+const SCIP_IMPORT_REVISION: u64 = 2;
 
 /// The language tags each SCIP indexer serves, by indexer binary: the one
 /// table both the CLI's download catalog (`scip_download::CATALOG`) and the

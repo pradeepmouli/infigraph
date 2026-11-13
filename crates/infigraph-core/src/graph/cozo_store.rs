@@ -254,11 +254,11 @@ impl CozoStore {
         let mut params = empty_params();
         params.insert("target".into(), DataValue::Str(symbol_id.into()));
         // Unroll recursion: bind callee from previous layer first for index use
-        let mut rules = String::new();
-        rules.push_str("layer_1[caller] := *calls{caller, callee: $target}\n");
+        let mut rules = String::from(dependency_rules());
+        rules.push_str("layer_1[caller] := dependency[caller, $target]\n");
         for d in 2..=max_depth {
             rules.push_str(&format!(
-                "layer_{d}[caller] := layer_{}[mid], *calls{{caller, callee: mid}}\n",
+                "layer_{d}[caller] := layer_{}[mid], dependency[caller, mid]\n",
                 d - 1
             ));
         }
@@ -301,10 +301,13 @@ impl CozoStore {
         let mut params = empty_params();
         params.insert("target".into(), DataValue::Str(symbol_id.into()));
         let r = self.run_params(
-            r#"?[caller_id, caller_name, file, start_line, target_id] :=
-                *calls{caller: caller_id, callee: $target},
-                *symbol{id: caller_id, name: caller_name, file, start_line},
-                target_id = $target"#,
+            &format!(
+                "{}?[caller_id, caller_name, file, start_line, target_id] :=
+                dependency[caller_id, $target],
+                *symbol{{id: caller_id, name: caller_name, file, start_line}},
+                target_id = $target",
+                dependency_rules()
+            ),
             params,
             false,
         )?;
@@ -1030,6 +1033,7 @@ impl CozoStore {
         for (rel, col_a, col_b) in &[
             ("inherits", "child", "parent"),
             ("implements", "child", "parent"),
+            ("references", "referrer", "target"),
             ("tested_by", "symbol_id", "test_id"),
             ("reads_rel", "reader", "target"),
             ("writes_rel", "writer", "target"),
@@ -1674,6 +1678,7 @@ impl CozoStore {
             ("contains", "module_id"),
             ("inherits", "child"),
             ("implements", "child"),
+            ("references", "referrer"),
             ("tested_by", "symbol_id"),
             ("reads_rel", "reader"),
             ("writes_rel", "writer"),
@@ -1728,6 +1733,7 @@ const COZO_SCHEMA: &[&str] = &[
     ":create contains {module_id: String, symbol_id: String}",
     ":create inherits {child: String, parent: String}",
     ":create implements {child: String, parent: String}",
+    ":create references {referrer: String, target: String}",
     ":create tested_by {symbol_id: String, test_id: String}",
     ":create reads_rel {reader: String, target: String}",
     ":create writes_rel {writer: String, target: String}",
@@ -1792,10 +1798,19 @@ const COZO_INDICES: &[&str] = &[
     "::index create symbol:symbol_by_visibility {visibility}",
 ];
 
+/// The Cozo rules for the dependency edges: a call, or a type or constant
+/// reference, from `caller` to `callee`. Readers that walk "what depends on
+/// this" build on `dependency[caller, callee]`.
+fn dependency_rules() -> &'static str {
+    "dependency[caller, callee] := *calls{caller, callee}\n\
+     dependency[caller, callee] := *references{referrer: caller, target: callee}\n"
+}
+
 fn edge_columns(relation: &str) -> (&'static str, &'static str) {
     match relation {
         "calls" => ("caller", "callee"),
         "inherits" | "implements" => ("child", "parent"),
+        "references" => ("referrer", "target"),
         "tested_by" => ("symbol_id", "test_id"),
         "contains" => ("module_id", "symbol_id"),
         "defines" => ("file_id", "symbol_id"),
