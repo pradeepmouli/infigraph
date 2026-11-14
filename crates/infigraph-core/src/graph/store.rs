@@ -67,6 +67,40 @@ impl std::fmt::Display for GraphCorruption {
 
 impl std::error::Error for GraphCorruption {}
 
+/// The open was refused because the probe that decides a graph (after an
+/// earlier opener died inside the open) could not decide: its child was
+/// killed, could not start, or ran out of time. Nothing is known to be wrong
+/// with the graph, and nothing was quarantined.
+///
+/// Not a fault, and not retried in place: the caller refuses this open and
+/// leaves the death record for the next open to ask again. Built in one
+/// place, and found anywhere in an error's chain by [`is_undecided_open`],
+/// so context wrapped around it cannot hide it.
+#[derive(Debug)]
+pub struct UndecidedOpen {
+    pub graph: String,
+}
+
+impl std::fmt::Display for UndecidedOpen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the graph {} could not be checked just now: the probe that decides it could not \
+             finish (killed, could not start, or ran past its time budget), so nothing was \
+             decided and it was NOT quarantined",
+            self.graph
+        )
+    }
+}
+
+impl std::error::Error for UndecidedOpen {}
+
+/// Whether `err` is, or wraps, an [`UndecidedOpen`].
+pub fn is_undecided_open(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|e| e.downcast_ref::<UndecidedOpen>().is_some())
+}
+
 /// Reason a read was served from something other than the live graph.
 #[derive(Debug, Clone)]
 pub enum DegradeReason {
@@ -576,7 +610,16 @@ pub fn is_storage_version_mismatch_error(err: &anyhow::Error) -> bool {
 /// `open_combined_graph`); `CodeIndex::init` distinguishes the classes
 /// itself because it retries the transient one.
 pub fn open_failure_is_not_corruption(err: &anyhow::Error) -> bool {
-    is_transient_open_error(err) || is_storage_version_mismatch_error(err)
+    open_failure_is_not_a_fault(err) || is_storage_version_mismatch_error(err)
+}
+
+/// An open failure that is not a fault. Two lists, and they point at each
+/// other: [`is_transient_open_error`] is retried in place, and
+/// [`is_undecided_open`] is not retried at all (its probe is the expensive
+/// part, and asking again in the same call decides nothing). Every "is this a
+/// fault?" and "is this corruption?" decision goes through this one function.
+pub fn open_failure_is_not_a_fault(err: &anyhow::Error) -> bool {
+    is_transient_open_error(err) || is_undecided_open(err)
 }
 
 /// lbug refuses a read-only open while a writer's checkpoint is running
@@ -589,24 +632,15 @@ pub fn is_checkpoint_in_progress_error(err: &anyhow::Error) -> bool {
     err.to_string().contains("checkpoint is in progress")
 }
 
-/// The open refused while the probe that decides a graph after an earlier
-/// death is undecided (`recovery::settle_open_deaths`). Nothing is known to
-/// be wrong with the graph, and the death record is kept for the next open to
-/// ask again, so it is retried like the others and never latched as a fault.
-pub fn is_undecided_open_error(err: &anyhow::Error) -> bool {
-    err.to_string()
-        .contains(crate::recovery::UNDECIDED_OPEN_PHRASE)
-}
-
-/// The one list of open failures worth retrying: another process holds the
-/// file lock, a live writer is mid-checkpoint, the WAL is being rotated
-/// under a concurrent open, or a probe is undecided. Every retry loop and
-/// every "is this corruption?" decision consults this, never its parts.
+/// The one list of open failures worth retrying in place: another process
+/// holds the file lock, a live writer is mid-checkpoint, or the WAL is being
+/// rotated under a concurrent open. Every retry loop consults this, never its
+/// parts. The other list is [`is_undecided_open`], which is deliberately not
+/// retried in place; [`open_failure_is_not_a_fault`] is both together.
 pub fn is_transient_open_error(err: &anyhow::Error) -> bool {
     is_lock_contention_error(err)
         || is_checkpoint_in_progress_error(err)
         || is_transient_wal_open_race_error(err)
-        || is_undecided_open_error(err)
 }
 
 /// Context line for a lock-contention open failure, naming the holder
@@ -1054,11 +1088,9 @@ impl GraphStore {
                     // this read, leave the graph alone, and let the caller retry.
                     crate::degraded::report_open_undecided(infigraph_dir);
                     drop(graph_lock);
-                    anyhow::bail!(
-                        "graph {} could not be checked just now (its probe process was killed, \
-                         could not start, or ran past its time budget); it was NOT quarantined",
-                        path.display()
-                    );
+                    return Err(anyhow::Error::new(UndecidedOpen {
+                        graph: path.display().to_string(),
+                    }));
                 }
                 debug_assert!(verdict.permits_quarantine());
                 crate::degraded::clear_open_undecided(infigraph_dir);
@@ -2810,6 +2842,7 @@ mod tests {
             .err()
             .expect("an undecided probe must refuse the read");
 
+        assert!(is_undecided_open(&err), "the typed error: {err:#}");
         assert!(format!("{err:#}").contains("NOT quarantined"), "{err:#}");
         assert_eq!(
             dir_snapshot(&infigraph_dir, &lock_path),
@@ -2822,6 +2855,22 @@ mod tests {
             "the refusal must say so through degraded mode: {modes:?}"
         );
         crate::degraded::clear_open_undecided(&infigraph_dir);
+    }
+
+    /// The classes an undecided open falls in. `verify` shows an open that is
+    /// not a fault as a WARN, and its arm asks [`open_failure_is_not_a_fault`],
+    /// so the decision is pinned here: not a fault, not retried in place, not
+    /// corruption. `verify`'s own open never probes, so this is the only place
+    /// that refusal's classification is checked end to end.
+    #[test]
+    fn an_undecided_open_is_not_a_fault_and_not_retried_in_place() {
+        let err = anyhow::Error::new(UndecidedOpen {
+            graph: "code.kuzu".to_string(),
+        });
+        assert!(open_failure_is_not_a_fault(&err));
+        assert!(!is_transient_open_error(&err));
+        assert!(is_undecided_open(&err));
+        assert!(open_failure_is_not_corruption(&err));
     }
 
     /// A process that cannot probe at all (`Unavailable`) decides exactly as it

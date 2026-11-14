@@ -90,6 +90,10 @@ pub fn run_if_probe_child() -> bool {
 /// A process that cannot run a probe at all gets [`Probe::Unavailable`], not
 /// `Indeterminate`: no retry can ever decide, so "retry shortly" would be false.
 pub fn graph_opens(graph_path: &Path) -> Probe {
+    #[cfg(test)]
+    if let Some(forced) = test_seam::answer() {
+        return forced;
+    }
     // Never re-invoke an executable that does not handle PROBE_ENV; a test
     // binary would re-run its whole suite. See PROBE_CAPABLE. Not being able
     // to ask is not an answer about the graph.
@@ -142,6 +146,60 @@ pub enum Probe {
 /// scans every symbol, so under swap it can take far longer than an ordinary
 /// open; the budget is generous, and running out of it is never "does not open".
 pub const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// The one test-only override of what a probe answers. Every probe reaches
+/// [`graph_opens`] (the writer open and the read path through
+/// `try_recover_by_setting_wal_aside`, the daemon through the same), so the
+/// override sits there and nowhere else. Thread-local: a test's `CodeIndex`
+/// work runs on its own thread, so parallel tests cannot see each other's.
+#[cfg(test)]
+pub(crate) mod test_seam {
+    use super::Probe;
+    use std::cell::Cell;
+
+    thread_local! {
+        static FORCED: Cell<Option<Probe>> = const { Cell::new(None) };
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Makes every probe on this thread answer `answer` until the guard drops.
+    /// Restores whatever was set before, including nothing.
+    pub struct Guard {
+        previous: Option<Probe>,
+        previous_calls: usize,
+    }
+
+    pub fn force(answer: Probe) -> Guard {
+        Guard {
+            previous: FORCED.with(|f| f.replace(Some(answer))),
+            previous_calls: CALLS.with(|c| c.replace(0)),
+        }
+    }
+
+    impl Guard {
+        /// Probes asked on this thread since the guard was taken.
+        pub fn calls(&self) -> usize {
+            CALLS.with(|c| c.get())
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FORCED.with(|f| f.set(self.previous));
+            CALLS.with(|c| c.set(self.previous_calls));
+        }
+    }
+
+    /// Called by [`super::graph_opens`]: counts the probe and returns the
+    /// forced answer, if one is set.
+    pub(super) fn answer() -> Option<Probe> {
+        let forced = FORCED.with(|f| f.get());
+        if forced.is_some() {
+            CALLS.with(|c| c.set(c.get() + 1));
+        }
+        forced
+    }
+}
 
 /// Runs a prepared probe command, waits at most `timeout`, and classifies how
 /// it ended. A timed-out child is killed and reaped before this returns.

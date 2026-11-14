@@ -507,6 +507,18 @@ impl CodeIndex {
                     // corruption, so no retry, no quarantine, no wipe (#140).
                     Err(first_err).with_context(|| storage_version_mismatch_context(&self.db_path))
                 }
+                Err(first_err) if graph::is_undecided_open(&first_err) => {
+                    // The probe could not decide after an earlier opener died.
+                    // Nothing is known about the graph: refuse now, with no
+                    // retry in place and no recovery attempt, so the probe runs
+                    // once per init. Its death record stays for the next open.
+                    Err(first_err).with_context(|| {
+                        format!(
+                            "the graph at {} was left as it was (not quarantined)",
+                            self.db_path.display()
+                        )
+                    })
+                }
                 Err(first_err) => {
                     // Some Kuzu IO errors (e.g. a short read while a concurrent
                     // writer is mid-checkpoint) look identical to genuine
@@ -631,12 +643,11 @@ impl CodeIndex {
                                     // transiently and leave the attempt uncounted.
                                     WalRecovery::Indeterminate => {
                                         crate::degraded::report_open_undecided(parent);
-                                        return Err(last_err).context(format!(
-                                            "the graph at {} could not be checked just now (its \
-                                             probe process was killed, could not start, or ran \
-                                             past its time budget), so it was NOT quarantined. \
-                                             Retry shortly.",
-                                            self.db_path.display()
+                                        return Err(anyhow::Error::new(graph::UndecidedOpen {
+                                            graph: self.db_path.display().to_string(),
+                                        }))
+                                        .context(format!(
+                                            "the open failed first with: {last_err:#}"
                                         ));
                                     }
                                     WalRecovery::NotRecoverable => {
@@ -1475,6 +1486,66 @@ mod tests {
         assert!(is_transient_open_error(&err));
         assert!(graph::open_failure_is_not_corruption(&err));
         assert!(!is_lock_contention_error(&err));
+    }
+
+    /// Every file under `dir`, by name, with its bytes: what must not change.
+    fn dir_bytes(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                let bytes = std::fs::read(e.path()).unwrap_or_default();
+                (e.file_name().to_string_lossy().into_owned(), bytes)
+            })
+            .collect()
+    }
+
+    /// An opener died inside the open, and the probe that decides the graph
+    /// cannot finish. `CodeIndex::init` must refuse with the typed error,
+    /// ask the probe exactly once, and leave every file as it was: no
+    /// retry in place, no recovery attempt, no quarantine.
+    #[test]
+    fn an_undecided_probe_after_an_open_death_is_asked_once_and_quarantines_nothing() {
+        use crate::probe::{test_seam, Probe};
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path();
+        let infigraph_dir = root.join(".infigraph");
+        std::fs::create_dir_all(&infigraph_dir).unwrap();
+        drop(graph::GraphStore::open(&infigraph_dir.join(graph::names::STEM)).unwrap());
+        std::fs::write(
+            infigraph_dir.join(format!(
+                "{}2147483600.1",
+                graph::names::OPEN_SENTINEL_PREFIX
+            )),
+            r#"{"pid":2147483600,"started_at":1}"#,
+        )
+        .unwrap();
+        let before = dir_bytes(&infigraph_dir);
+
+        let guard = test_seam::force(Probe::Indeterminate);
+        let mut ig = CodeIndex::open(root, LanguageRegistry::new()).unwrap();
+        let err = ig.init().expect_err("an undecided probe refuses the open");
+
+        assert!(
+            graph::is_undecided_open(&err),
+            "the refusal is the typed undecided error: {err:#}"
+        );
+        assert_eq!(guard.calls(), 1, "the probe is asked once per init");
+        // The orphaned sentinel is swept into `open-deaths.log` before the
+        // probe is asked, as every opener does; that is the only new file.
+        let after = dir_bytes(&infigraph_dir);
+        assert_eq!(
+            after.get("code.kuzu"),
+            before.get("code.kuzu"),
+            "the graph is byte-identical"
+        );
+        assert!(
+            after
+                .keys()
+                .all(|k| before.contains_key(k) || k == "open-deaths.log"),
+            "nothing is quarantined or written beside the graph: {:?}",
+            after.keys()
+        );
     }
 
     #[test]

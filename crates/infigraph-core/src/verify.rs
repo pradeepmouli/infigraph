@@ -57,11 +57,12 @@ pub fn run_verify(root: &Path) -> Vec<CheckResult> {
             ));
             o
         }
-        Err(e) if crate::graph::is_transient_open_error(&e) => {
-            // A live writer mid-transaction, a checkpoint in progress, or
-            // lock contention -- the graph is not answerable right now, but
-            // it is not damaged either. Telling the user to rebuild here
-            // would destroy a healthy graph over a passing race.
+        Err(e) if crate::graph::open_failure_is_not_a_fault(&e) => {
+            // A live writer mid-transaction, a checkpoint in progress, lock
+            // contention, or a probe that could not decide -- the graph is not
+            // answerable right now, but it is not damaged either. Telling the
+            // user to rebuild here would destroy a healthy graph over a
+            // passing race, or over a probe that merely could not finish.
             results.push(CheckResult::warn(
                 CATEGORY,
                 "graph: open",
