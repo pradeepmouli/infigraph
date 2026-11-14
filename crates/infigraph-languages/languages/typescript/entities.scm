@@ -26,10 +26,18 @@
 ; (and whether there is one) comes from extract::ts_member_owner; a property
 ; with none -- a parameter's inline type -- is no symbol.
 (property_signature
-  name: (property_identifier) @field.name) @field.def
+  name: [(property_identifier) (string)] @field.name) @field.def
 
 (public_field_definition
-  name: (property_identifier) @field.name) @field.def
+  name: [(property_identifier) (string)] @field.name) @field.def
+
+; Namespaces: `namespace N {}`, `module N {}` and `declare namespace N {}` are
+; all `internal_module`. The name is `N`, or `A.B` for a dotted name; the
+; namespace's own id comes from extract::entities, which also decides whether
+; one of them is a symbol at all (a declaration merged with a same-named one is
+; not).
+(internal_module
+  name: [(identifier) (nested_identifier)] @namespace.name) @namespace.def
 
 ; Interface declarations
 (interface_declaration
