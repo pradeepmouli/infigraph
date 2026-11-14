@@ -651,6 +651,16 @@ impl GraphBackend for Neo4jBackend {
         self.repo_filter.as_deref()
     }
 
+    // This backend keeps no generation counters. An error, not a 0: a 0 reads
+    // as "never", which is a different answer from "not tracked here".
+    fn current_ast_generation(&self) -> Result<i64> {
+        anyhow::bail!("the Neo4j backend keeps no AST generation counter")
+    }
+
+    fn current_scip_generation(&self) -> Result<i64> {
+        anyhow::bail!("the Neo4j backend keeps no SCIP generation counter")
+    }
+
     fn stats(&self) -> Result<GraphStats> {
         if let Some(repo) = self.repo_filter() {
             let r = escape(repo);

@@ -38,20 +38,8 @@ fn live_writer_holder_process() {
     wait_for(&root.join(HOLDER_RELEASE), Duration::from_secs(120));
 }
 
-fn cli_binary() -> PathBuf {
-    infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(
-        &std::env::current_exe().unwrap(),
-    )
-    .expect("infigraph CLI binary must already be built (shared target dir)")
-}
-
-/// The CLI with implicit SCIP enrichment off, so no enrichment child joins
-/// the holder and the daemon's own writes are the only ones in play.
-fn cli_command() -> Command {
-    let mut command = Command::new(cli_binary());
-    command.env(infigraph_core::scip_switch::enabled_env_name(), "0");
-    command
-}
+mod common;
+use common::cli::cli_command;
 
 /// Waits for `path` to appear, failing once `budget` is spent. A handshake
 /// with a child process, not a guess at how long it takes.

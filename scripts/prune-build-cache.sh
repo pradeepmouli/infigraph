@@ -21,8 +21,12 @@
 #                     incremental builds only costs those workspace crates a full
 #                     recompile; it is a cache, not state.
 #
-# It refuses to run while any cargo or rustc process exists (rust-analyzer's
-# background `cargo check` counts): deleting under a running build races it.
+# It refuses to run while a cargo or rustc builds into the target directory being
+# pruned: a rustc whose arguments name that directory, a cargo whose working
+# directory is inside the checkout that owns it (rust-analyzer's background
+# `cargo check` counts), or any such process whose working directory cannot be
+# read. A build in another checkout, with its own target, does not block it:
+# deleting under a running build races it, but only under the same directory.
 #
 # Why incremental/ comes back although CARGO_INCREMENTAL = "0" is configured:
 # the `[env]` table of ~/.cargo/config.toml only sets variables for the
@@ -81,17 +85,66 @@ if [ ! -d "$target_dir" ]; then
   exit 1
 fi
 
-# `ps -o comm=` is the executable name on both macOS and Linux. The list is
-# overridable (PRUNE_BUILD_CACHE_PROCESSES, one name per line) so a test can say
-# what is "running": under `cargo test` a real cargo always is.
+target_dir="$(cd "$target_dir" && pwd -P)"
+# The checkout that owns the target directory: `.shared-target` and `target`
+# both sit directly under it.
+owner="$(dirname "$target_dir")"
+
+# Every running cargo or rustc, one line each: "name<TAB>cwd<TAB>args", with cwd
+# "?" when it cannot be read. Prints nothing when none runs.
+live_builds() {
+  local pid comm cwd args
+  ps -axo pid=,comm= | while read -r pid comm; do
+    case "${comm##*/}" in
+      cargo | rustc) ;;
+      *) continue ;;
+    esac
+    cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | awk '/^n/ {print substr($0, 2); exit}')"
+    args="$(ps -ww -o args= -p "$pid" 2>/dev/null || true)"
+    printf '%s\t%s\t%s\n' "${comm##*/}" "${cwd:-?}" "$args"
+  done
+}
+
+# The list is overridable (PRUNE_BUILD_CACHE_PROCESSES, in the same format) so a
+# test can say what is running. A bare name with no cwd is read as unreadable,
+# so an old-style list still refuses.
 if [ -n "${PRUNE_BUILD_CACHE_PROCESSES+set}" ]; then
   listing="$PRUNE_BUILD_CACHE_PROCESSES"
 else
-  listing="$(ps -axo comm=)"
+  listing="$(live_builds)"
 fi
-running="$(printf '%s\n' "$listing" | awk -F/ '{print $NF}' | awk '$0 == "cargo" || $0 == "rustc"' | sort -u | tr '\n' ' ')"
-if [ -n "${running// /}" ]; then
-  echo "refusing to prune: ${running}running. Stop it (or wait) and run again." >&2
+
+# Refuse only what builds into this target directory: a cargo or rustc whose
+# arguments name it, a cargo whose working directory is inside the owning
+# checkout, or any of them whose working directory cannot be read (fail closed).
+busy=""
+while IFS=$'\t' read -r name cwd args; do
+  name="${name##*/}"
+  case "$name" in
+    cargo | rustc) ;;
+    *) continue ;;
+  esac
+  if [ -z "${cwd:-}" ] || [ "$cwd" = "?" ]; then
+    busy="$busy $name(cwd unreadable)"
+    continue
+  fi
+  case "${args:-}" in
+    *"$target_dir"*)
+      busy="$busy $name(builds into the target)"
+      continue
+      ;;
+  esac
+  if [ "$name" = cargo ]; then
+    case "$cwd/" in
+      "$owner"/*)
+        busy="$busy $name(in $owner)"
+        continue
+        ;;
+    esac
+  fi
+done <<<"$listing"
+if [ -n "$busy" ]; then
+  echo "refusing to prune $target_dir: a running build uses it:${busy}. Stop it (or wait) and run again." >&2
   exit 1
 fi
 

@@ -181,6 +181,13 @@ impl GraphBackend for DaemonKuzuBackend {
     fn current_ast_generation(&self) -> Result<i64> {
         self.with_reader(|q| Ok(q.generation("ast_generation")))
     }
+    // The trait default answers 0, which is "never enriched": a routed client
+    // that did not override it recorded every import it made with that 0 (the
+    // ledger entry for a `scip-enrich` run under the daemon backend). The
+    // stamp this reads is the one the routed import just wrote.
+    fn current_scip_generation(&self) -> Result<i64> {
+        self.with_reader(|q| Ok(q.generation("scip_generation")))
+    }
     fn get_file_hashes(&self) -> Result<HashMap<String, String>> {
         self.with_reader(|q| q.get_file_hashes())
     }
