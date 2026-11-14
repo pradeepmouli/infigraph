@@ -113,6 +113,62 @@ impl SessionData {
     }
 }
 
+/// Who wrote a record, as far as its id says. Consolidation merges records of
+/// one owner only: two records of different sessions are different lines of
+/// work, however alike their text embeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Owner<'a> {
+    /// `session_<yyyy-mm-dd>_<key>`: one client session, named by its key.
+    Session(&'a str),
+    /// `named_<name>`: a label the caller chose, shared by design.
+    Named,
+    /// `session_<yyyy-mm-dd>`, and any id of another shape: written by
+    /// whichever sessions saved that day, so it may hold several lines of work.
+    Legacy,
+}
+
+/// The owner a record's id names (see [`Owner`]).
+pub fn owner_of(id: &str) -> Owner<'_> {
+    if id.starts_with("named_") {
+        return Owner::Named;
+    }
+    let Some(rest) = id.strip_prefix("session_") else {
+        return Owner::Legacy;
+    };
+    match (rest.get(..10), rest.get(10..)) {
+        (Some(date), Some(tail)) if looks_like_date(date) => match tail.strip_prefix('_') {
+            Some(key) if !key.is_empty() => Owner::Session(key),
+            _ => Owner::Legacy,
+        },
+        _ => Owner::Legacy,
+    }
+}
+
+fn looks_like_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b.iter().enumerate().all(|(i, c)| {
+            if i == 4 || i == 7 {
+                *c == b'-'
+            } else {
+                c.is_ascii_digit()
+            }
+        })
+}
+
+impl Owner<'_> {
+    /// Whether records of these two owners may be merged: the same session, or
+    /// two named records. A legacy record never merges, since it may already
+    /// hold several sessions.
+    pub fn may_merge_with(&self, other: &Owner<'_>) -> bool {
+        match (self, other) {
+            (Owner::Session(a), Owner::Session(b)) => a == b,
+            (Owner::Named, Owner::Named) => true,
+            _ => false,
+        }
+    }
+}
+
 /// A session file that did not read, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skipped {
@@ -438,6 +494,35 @@ mod tests {
             confidence: 0.0,
             last_accessed: 0,
         }
+    }
+
+    #[test]
+    fn an_id_names_its_owner() {
+        assert_eq!(
+            owner_of("session_2026-11-14_2407ef7a"),
+            Owner::Session("2407ef7a")
+        );
+        assert_eq!(owner_of("named_jwt-refresh"), Owner::Named);
+        // The date-keyed record several sessions wrote to, and ids of any other shape.
+        assert_eq!(owner_of("session_2026-11-14"), Owner::Legacy);
+        assert_eq!(owner_of("session_2026-11-14_"), Owner::Legacy);
+        assert_eq!(owner_of("session_not-a-date_abc"), Owner::Legacy);
+        assert_eq!(owner_of("consolidated_1792117312"), Owner::Legacy);
+        assert_eq!(owner_of("session_"), Owner::Legacy);
+    }
+
+    #[test]
+    fn records_merge_only_within_one_owner() {
+        let a = Owner::Session("aaaaaaaa");
+        let b = Owner::Session("bbbbbbbb");
+        assert!(a.may_merge_with(&a));
+        assert!(!a.may_merge_with(&b));
+        assert!(Owner::Named.may_merge_with(&Owner::Named));
+        assert!(!a.may_merge_with(&Owner::Named));
+        // A legacy record may hold several sessions: it merges with nothing,
+        // not even another legacy record.
+        assert!(!Owner::Legacy.may_merge_with(&Owner::Legacy));
+        assert!(!Owner::Legacy.may_merge_with(&a));
     }
 
     #[test]

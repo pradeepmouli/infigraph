@@ -1010,12 +1010,13 @@ LM2 output gate: Adaptive context assembly in one call. Searches code symbols (B
 
 ### `consolidate_memory`
 
-LM2 memory update: Merges similar sessions into consolidated summaries. Groups by embedding similarity, creates merged session with combined decisions/constraints/assumptions. Source sessions preserved with reduced confidence. Run when session count grows large.
+LM2 memory update: merges similar session records into consolidated summaries (sources kept at reduced confidence). Never merges records of different sessions unless cross_owner=true. A save does not run it; run it when save_session says many records are active.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `path` | string |  |  | see Common parameters |
 | `threshold` | number |  | `0.7` | Similarity threshold for grouping sessions (0.0-1.0, default 0.7) |
+| `cross_owner` | boolean |  | `false` | Also merge records written by different sessions (default false) |
 
 
 ## Context compression

@@ -979,6 +979,9 @@ enum Commands {
         /// Cosine similarity threshold for merging (0.0-1.0)
         #[arg(short, long, default_value = "0.7")]
         threshold: f64,
+        /// Also merge records written by different sessions
+        #[arg(long)]
+        cross_owner: bool,
     },
 
     /// Delete sessions older than N days
@@ -1622,7 +1625,10 @@ fn run(command: Commands, root: &Path, root_given: bool) -> Result<()> {
             sources,
             limit,
         } => cmd_memory_context(root, &query, file.as_deref(), &depth, &sources, limit),
-        Commands::ConsolidateMemory { threshold } => cmd_consolidate_memory(root, threshold),
+        Commands::ConsolidateMemory {
+            threshold,
+            cross_owner,
+        } => cmd_consolidate_memory(root, threshold, cross_owner),
         Commands::PurgeSessions { days } => cmd_purge_sessions(root, days),
         Commands::Pipeline { action } => match action {
             PipelineAction::Plugins => cmd_pipeline_plugins(root),

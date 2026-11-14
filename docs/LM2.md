@@ -107,7 +107,7 @@ Merges related sessions to reduce redundancy and boost signal.
 **Algorithm:**
 1. Load all session embeddings from `.infigraph/sessions/embeddings.bin`
 2. Compute pairwise cosine similarity
-3. Union-find clustering: merge sessions with similarity ≥ threshold (default: 0.7)
+3. Union-find clustering: merge sessions with similarity ≥ threshold (default: 0.7), only within one owner (`graph::owner_of`: the same session, or two named records; a date-keyed record never merges) unless `cross_owner=true`
 4. For each cluster ≥ 2 sessions:
    - Merge summaries, decisions, constraints, assumptions, blockers, files touched
    - New consolidated session ID: `consolidated_{earliest_created_timestamp}`
@@ -115,7 +115,7 @@ Merges related sessions to reduce redundancy and boost signal.
    - Source sessions preserved with halved confidence
    - Re-embed consolidated session
 
-**Auto-trigger:** When session count exceeds 50, consolidation runs automatically after `save_session`.
+**No auto-trigger:** a save never consolidates. When more than 50 records are active, `save_session` says so and `consolidate_memory` is the explicit call. (It used to run after every save once `embeddings.bin` held more than 50 entries, a count of file entries rather than sessions, and merged records of different sessions.)
 
 **Source:** `tool_consolidate_memory` in `crates/infigraph-mcp/src/tools/session.rs`
 
