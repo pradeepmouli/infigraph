@@ -16,12 +16,11 @@ use infigraph_core::scip::{definition_ids, import_scip_index, use_language_regis
 const FIXTURE: &str = "tests/fixtures/scip_ts_namespaces";
 
 /// What the SCIP import gives a symbol that tree-sitter does not, and the reason:
-/// the file-level definition, the implicit `Dotted` of `namespace Dotted.Inner`
-/// (no declaration of its own in the source), and `declare module 'external-lib'`
-/// (out of scope, see the ruling in the branch's design).
+/// the file-level definition, and `declare module 'external-lib'` (out of scope,
+/// see the ruling in the branch's design). The implicit `Dotted` of
+/// `namespace Dotted.Inner` is tree-sitter's now.
 const SCIP_ONLY: &[&str] = &[
     "a.ts::a.ts",
-    "a.ts::Dotted",
     "a.ts::external-lib",
     "a.ts::external-lib::shape",
 ];
@@ -80,6 +79,7 @@ const NAMESPACE_KINDS: &[(&str, &str)] = &[
     ("a.ts::Declaration::Interface", "Module"),
     ("a.ts::Element", "Module"),
     ("a.ts::Ambient", "Module"),
+    ("a.ts::Dotted", "Module"),
     ("a.ts::Dotted::Inner", "Module"),
     ("a.ts::Repeated", "Module"),
     ("a.ts::Box", "Class"),
@@ -168,7 +168,7 @@ fn an_import_enriches_each_namespace_symbol_and_adds_no_second() {
 /// What the import adds to the graph of this file. `external-lib::shape` is not
 /// among them: the import adds no symbol for a member of an ambient module (the
 /// same out-of-scope declare module case, observed, not designed).
-const GRAPH_ADDED: &[&str] = &["a.ts::a.ts", "a.ts::Dotted", "a.ts::external-lib"];
+const GRAPH_ADDED: &[&str] = &["a.ts::a.ts", "a.ts::external-lib"];
 
 #[test]
 fn an_import_adds_only_the_known_gaps_to_the_graph() {

@@ -259,12 +259,14 @@ pub fn extract_entities(
         }
 
         if let (Some(full_name), Some(node), Some(sym_kind)) = (name_text, def_node, kind) {
-            // `A.B` in `namespace A.B {}` is the symbol `B`, under the path `A`.
-            let (name, dotted_path) = if is_namespace {
+            // `A.B` in `namespace A.B {}` is the symbol `B`, under the path `A`;
+            // `A` is a namespace of its own too (pushed with `B`, below).
+            let (name, dotted_segments) = if is_namespace {
                 split_namespace_name(&full_name)
             } else {
-                (full_name, None)
+                (full_name, Vec::new())
             };
+            let dotted_path = (!dotted_segments.is_empty()).then(|| dotted_segments.join("::"));
             let span = Span {
                 file: file.to_string(),
                 start_line: node.start_position().row as u32 + 1,
@@ -283,8 +285,8 @@ pub fn extract_entities(
             // Prefer an explicit @method.parent/@func.parent capture (needed when a
             // grammar's enclosing node has no generic "name" field to walk up to,
             // e.g. Rust's impl_item) over the generic ancestor walk.
-            // A namespace's dotted path is the namespaces it sits in, not an owner:
-            // no symbol of an implicit `A` exists, so it can be no parent.
+            // A namespace's dotted path is the namespaces it sits in, not a parent: a
+            // namespace has none, and so does a member whose only owner is a namespace.
             let parent_class = if is_namespace {
                 dotted_path
             } else {
@@ -307,9 +309,9 @@ pub fn extract_entities(
             if owned_only && parent_class.is_none() {
                 continue;
             }
-            // The namespaces go in front of the id's owner. A parent must be a
-            // symbol, and a namespace is none (tree-sitter makes no symbol of
-            // it): a member whose only owner is a namespace has no parent.
+            // The namespaces go in front of the id's owner. A namespace is not a
+            // parent: a member whose only owner is a namespace has none. SCIP's
+            // enclosing symbol is empty for these too, so nothing is recorded.
             let has_owner = !is_namespace && parent_class.is_some();
             let parent_class = if in_typescript {
                 ts_with_namespaces(node, source, parent_class)
@@ -345,7 +347,39 @@ pub fn extract_entities(
             if let (SymbolKind::Method, Some(at)) = (&sym_kind, method_name_at) {
                 method_names.push((symbols.len(), at));
             }
+            // `namespace A.B {}` declares `A` as well, under the path its own prefix
+            // gives (`file::A`); each segment is a namespace of its own, merged like
+            // any other by `drop_merged_namespaces`. `B` follows, last.
             if is_namespace {
+                for depth in 0..dotted_segments.len() {
+                    let before = (depth > 0).then(|| dotted_segments[..depth].join("::"));
+                    let path = if in_typescript {
+                        ts_with_namespaces(node, source, before)
+                    } else {
+                        before
+                    };
+                    let segment = dotted_segments[depth].clone();
+                    let segment_id = match path {
+                        Some(path) => format!("{file}::{path}::{segment}"),
+                        None => format!("{file}::{segment}"),
+                    };
+                    namespaces.push(symbols.len());
+                    symbols.push(Symbol {
+                        id: segment_id,
+                        name: segment,
+                        kind: SymbolKind::Module,
+                        span: span.clone(),
+                        signature_hash: signature_hash.clone(),
+                        parent: None,
+                        language: language.to_string(),
+                        visibility: visibility.clone(),
+                        docstring: docstring.clone(),
+                        complexity: 1,
+                        parameters: parameters.clone(),
+                        return_type: return_type.clone(),
+                        scip_id: None,
+                    });
+                }
                 namespaces.push(symbols.len());
             }
             symbols.push(Symbol {
@@ -487,13 +521,12 @@ pub fn extract_entities(
     result
 }
 
-/// The symbol of a TypeScript namespace name and the path it is declared under:
-/// `A.B` is `B` under `A`.
-fn split_namespace_name(full: &str) -> (String, Option<String>) {
-    match full.rsplit_once('.') {
-        Some((path, last)) => (last.to_string(), Some(path.replace('.', "::"))),
-        None => (full.to_string(), None),
-    }
+/// The symbol of a TypeScript namespace name and the segments it is declared
+/// under: `A.B` is `B` under `[A]`, and `A` alone is `A` under none.
+fn split_namespace_name(full: &str) -> (String, Vec<String>) {
+    let mut segments: Vec<String> = full.split('.').map(str::to_string).collect();
+    let last = segments.pop().unwrap_or_default();
+    (last, segments)
 }
 
 /// Drops each TypeScript namespace whose id another symbol already has: a

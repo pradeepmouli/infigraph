@@ -104,6 +104,39 @@ fn several_blocks_of_one_namespace_are_one_symbol_at_the_first_block() {
 }
 
 #[test]
+fn a_dotted_namespace_declares_each_segment_as_a_namespace() {
+    // `namespace Dotted.Inner` declares `Dotted` too; both are Module symbols.
+    let symbols = extracted();
+    assert_eq!(
+        kinds_of(&symbols, "a.ts::Dotted"),
+        ["Module"],
+        "{symbols:?}"
+    );
+    assert_eq!(
+        kinds_of(&symbols, "a.ts::Dotted::Inner"),
+        ["Module"],
+        "{symbols:?}"
+    );
+}
+
+#[test]
+fn dotted_segments_merge_across_blocks_like_any_namespace() {
+    // Two blocks that share the prefix `A`: one `A`, one `B`, one `C`.
+    let source = b"namespace A.B { export const x = 1; }\nnamespace A.C { export const y = 2; }\n";
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let pack = registry.for_extension(".ts").unwrap();
+    let symbols: Vec<(String, String)> = extract_file("a.ts", source, pack)
+        .unwrap()
+        .symbols
+        .into_iter()
+        .map(|s| (s.id, format!("{:?}", s.kind)))
+        .collect();
+    for id in ["a.ts::A", "a.ts::A::B", "a.ts::A::C"] {
+        assert_eq!(kinds_of(&symbols, id), ["Module"], "{id}: {symbols:?}");
+    }
+}
+
+#[test]
 fn a_declare_module_named_by_a_string_is_no_namespace() {
     // `declare module 'external-lib'` names a package, not a namespace of this
     // file: out of scope, so it gets no symbol of its own.
