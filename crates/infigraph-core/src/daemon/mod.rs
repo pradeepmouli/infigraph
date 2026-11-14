@@ -2462,7 +2462,7 @@ fn note_open(root: &Path, opened: Result<CodeIndex>) -> Result<CodeIndex> {
             crate::degraded::live::clear(root, crate::degraded::GRAPH_HELD_BY_WRITER);
         }
         Err(e) => {
-            let lock_failure = format!("{e:#}").contains(LOCK_CONTENTION_TEXT);
+            let lock_failure = crate::graph::store::lock_contention_in_chain(e);
             if !(lock_failure && wait_for_graph_writer(root)) {
                 fault::record_if_fault(&infigraph_dir, e, fault::FaultClass::of_open_failure);
             }
@@ -2470,11 +2470,6 @@ fn note_open(root: &Path, opened: Result<CodeIndex>) -> Result<CodeIndex> {
     }
     opened
 }
-
-/// The kuzu message for "another process holds this database's lock". Read
-/// from the whole error chain, because `CodeIndex::init` wraps it in
-/// context, which `to_string()` (the classifiers' view) does not show.
-const LOCK_CONTENTION_TEXT: &str = "Could not set lock on file";
 
 /// Drops the watch session's shared DB connection so the next `watch_db`
 /// call reopens fresh. See `watch_db`'s doc comment for when to call this.
@@ -2644,7 +2639,7 @@ fn serve_request_locked(
                     Ok(())
                 }
                 Err(e)
-                    if format!("{e:#}").contains(LOCK_CONTENTION_TEXT)
+                    if crate::graph::store::lock_contention_in_chain(&e)
                         && wait_for_graph_writer(root) =>
                 {
                     Err(reply)

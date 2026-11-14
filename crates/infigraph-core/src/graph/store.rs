@@ -520,7 +520,17 @@ fn refuse_newer_schema(db: &Database, db_path: &Path) -> Result<()> {
 /// second `infigraph` process opening a graph while a watcher already had
 /// it open would trigger `wipe_graph`, destroying the watcher's live data.
 pub fn is_lock_contention_error(err: &anyhow::Error) -> bool {
-    err.to_string().contains("Could not set lock on file")
+    err.to_string().contains(LOCK_CONTENTION_MESSAGE)
+}
+
+/// The kuzu text of a lock-contention failure, the one copy of it.
+pub const LOCK_CONTENTION_MESSAGE: &str = "Could not set lock on file";
+
+/// `is_lock_contention_error` over the whole chain. `CodeIndex::init` wraps
+/// the lock error in context, which `to_string()` does not show, so the
+/// daemon's open path asks this one.
+pub fn lock_contention_in_chain(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains(LOCK_CONTENTION_MESSAGE)
 }
 
 /// A `Database::new` open failure (`"failed to open kuzu db"` /
