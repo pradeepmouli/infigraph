@@ -159,6 +159,47 @@ fn an_unreadable_ledger_is_none_so_nothing_replays() {
     assert!(scip::ledger_entries(ledger_dir("[]").path()).is_none());
 }
 
+/// An index with no documents, settled rather than imported: the same record
+/// a normal import writes, at the current revision. The language stops being
+/// behind, so it is not replayed for every generation.
+#[test]
+fn an_empty_index_settles_its_language_at_the_current_revision() {
+    let dir = ledger_dir(LIVE_SHAPE);
+    let empty_hash = 0xdead_beef_u64;
+    scip::record_scip_import(dir.path(), "scip-python", empty_hash, 7);
+    let entries = scip::ledger_entries(dir.path()).unwrap();
+    let python = entries
+        .iter()
+        .find(|e| e.label == "scip-python")
+        .expect("the empty index is recorded");
+    assert_eq!(python.revision, Some(SCIP_IMPORT_REVISION));
+    assert!(
+        !languages_behind(&entries).iter().any(|l| *l == "python"),
+        "python is settled for this revision"
+    );
+    // A project that has python replays nothing for it, so the doctor remedy
+    // clears its warning rather than leaving it standing.
+    let project = tempfile::tempdir().unwrap();
+    let replayed = replay_languages(project.path(), 5, &entries, &detected(&["python"]));
+    assert!(!replayed.iter().any(|l| *l == "python"), "{replayed:?}");
+}
+
+/// A later real output has different bytes, so its hash never matches an
+/// empty record and it is imported, not skipped.
+#[test]
+fn a_later_real_output_is_not_redundant_against_an_empty_record() {
+    let dir = ledger_dir(LIVE_SHAPE);
+    let empty_hash = 0xdead_beef_u64;
+    let real_hash = 0x1234_5678_u64;
+    scip::record_scip_import(dir.path(), "scip-python", empty_hash, 7);
+    assert!(!scip::scip_import_is_redundant(
+        dir.path(),
+        "scip-python",
+        real_hash,
+        7
+    ));
+}
+
 #[test]
 fn a_replayed_ledger_is_not_behind_and_keeps_its_superseded_entries() {
     let dir = ledger_dir(LIVE_SHAPE);

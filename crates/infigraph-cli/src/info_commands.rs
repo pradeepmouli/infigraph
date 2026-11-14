@@ -660,9 +660,23 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
                     verdict,
                 } in results
                 {
-                    if verdict.is_err() || !scip_path.exists() {
-                        let _ = std::fs::remove_file(&scip_path);
-                        continue;
+                    match verdict {
+                        crate::index::IndexerVerdict::Ok if scip_path.exists() => {}
+                        // Nothing to import: the indexer ran clean and found no
+                        // documents. Settled in the ledger, not imported.
+                        crate::index::IndexerVerdict::EmptyIndex { hash, .. } => {
+                            crate::index::settle_indexer_output(
+                                &infigraph_dir,
+                                label,
+                                hash,
+                                job.ast_generation,
+                            );
+                            continue;
+                        }
+                        _ => {
+                            let _ = std::fs::remove_file(&scip_path);
+                            continue;
+                        }
                     }
                     // #138: once the coordinator loop is exiting nothing will
                     // ever serve this import, and the loop's exit joins this
@@ -722,7 +736,7 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
                             // what a later run will read back as the
                             // graph's current `scip_generation`.
                             if let Some(hash) = scip_hash {
-                                infigraph_core::scip::record_scip_import(
+                                crate::index::settle_indexer_output(
                                     &infigraph_dir,
                                     label,
                                     hash,
