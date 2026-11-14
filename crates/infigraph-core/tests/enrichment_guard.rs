@@ -16,7 +16,8 @@
 //! The rule, per file:
 //!
 //! * In the CLI and core, a file that builds its own command for the binary
-//!   (`CARGO_BIN_EXE_infigraph`, or core's `cli_binary()` /
+//!   (`CARGO_BIN_EXE_infigraph`, a binary run by path as `Command::new(bin)` or
+//!   `Command::new(old_bin)`, or core's `cli_binary()` /
 //!   `resolve_cli_binary_sibling_of`) and names an index-like command is a mixed
 //!   file. It fails unless it is on `ALLOWED` with the reason. A file that goes
 //!   only through the helper needs no entry: the helper is the one place such a
@@ -62,6 +63,12 @@ const ALLOWED: &[(&str, &str)] = &[
          run()",
     ),
     (
+        "crates/infigraph-cli/tests/upgrade_smoke.rs",
+        "mixed: its previous-release commands (`old_command`) run an old binary, which is \
+         what the test is about, and set enrichment off by hand; its new-binary runs go \
+         through run()",
+    ),
+    (
         "crates/infigraph-core/tests/daemon_kuzu_e2e.rs",
         "mixed: its index runs go through cli_command(); cli_binary() starts the daemon the \
          test drives, which is not an index run",
@@ -95,7 +102,9 @@ enum Rule {
 const RULES: &[Rule] = &[
     Rule::PerCommand {
         crate_dir: "crates/infigraph-cli/tests",
-        direct: r#"CARGO_BIN_EXE_infigraph""#,
+        // The binary built by cargo, or an old release's binary run by path (the
+        // upgrade test's `Command::new(old_bin)` and its `Command::new(bin)` probe).
+        direct: r#"(?:CARGO_BIN_EXE_infigraph"|Command::new\((?:old_)?bin\))"#,
     },
     Rule::PerCommand {
         crate_dir: "crates/infigraph-core/tests",
