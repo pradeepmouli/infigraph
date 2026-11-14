@@ -2128,6 +2128,11 @@ pub(crate) fn import_and_settle(
     let hash = infigraph_core::scip::scip_output_hash(scip_path);
     let stats = backend.import_scip_index(scip_path, Some(root))?;
     match (hash, backend.current_scip_generation()) {
+        // A stamp is never 0 once an import has run (it is at least 1), so a 0
+        // here means the generation could not be read: record nothing.
+        (Some(_), Ok(0)) => eprintln!(
+            "Auto-SCIP: {label} import not recorded in the SCIP ledger: the graph reports no SCIP generation after the import"
+        ),
         (Some(hash), Ok(generation)) => {
             settle_indexer_output(&root.join(".infigraph"), label, hash, generation)
         }
