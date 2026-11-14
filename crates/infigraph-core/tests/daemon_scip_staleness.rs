@@ -68,10 +68,43 @@ fn start_coordinator(
     mpsc::Sender<()>,
     std::thread::JoinHandle<anyhow::Result<()>>,
 ) {
+    start_coordinator_bumping(root, calls, 0)
+}
+
+/// [`start_coordinator`], except that the first enrichment request submits
+/// `bumps` new files through the coordinator's own write path. Each new file
+/// is one AST generation, so the test can move the generation while the
+/// coordinator runs, with no second handle on the graph.
+fn start_coordinator_bumping(
+    root: &std::path::Path,
+    calls: &Calls,
+    bumps: usize,
+) -> (
+    mpsc::Sender<()>,
+    std::thread::JoinHandle<anyhow::Result<()>>,
+) {
     let calls_for_cb = Arc::clone(calls);
     let on_full_reindex: Arc<infigraph_core::daemon::FullReindexCallback> =
-        Arc::new(move |_root, job, _token, _submit| {
-            calls_for_cb.lock().unwrap().push(job);
+        Arc::new(move |root, job, token, submit| {
+            let call = {
+                let mut recorded = calls_for_cb.lock().unwrap();
+                recorded.push(job);
+                recorded.len()
+            };
+            if call == 1 {
+                for i in 0..bumps {
+                    let path = root.join(format!("src/bump_{i}.rs"));
+                    std::fs::write(&path, format!("pub fn bump_{i}() {{}}\n")).unwrap();
+                    submit
+                        .submit(
+                            infigraph_core::daemon_protocol::WriteRequest::Index {
+                                paths: Some(vec![path]),
+                            },
+                            &token,
+                        )
+                        .expect("the coordinator serves a bump write");
+                }
+            }
         });
 
     let (stop_tx, stop_rx) = mpsc::channel();
@@ -266,6 +299,127 @@ fn coordinator_replays_a_behind_ledger_once_without_any_drift() {
             "no drift: the generation it stamps"
         );
     }
+
+    stop_tx.send(()).unwrap();
+    handle
+        .join()
+        .unwrap()
+        .expect("coordinator loop returned an error instead of a clean shutdown");
+
+    std::env::remove_var("INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD");
+    std::env::remove_var("INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS");
+    std::env::remove_var("INFIGRAPH_SCIP_START_GRACE_SECS");
+}
+
+/// The replay waits out the threshold. The first attempt makes one write
+/// through the coordinator, which moves the AST generation by a few steps (a
+/// single file write is several generations here), so the threshold is set
+/// above that movement: the generation moves, but less than the threshold, and
+/// no second attempt may start. A threshold at or below the write's own movement
+/// would let the drift rule fire legitimately, which is not what this pins.
+#[test]
+fn a_replay_does_not_repeat_before_the_threshold_of_generations() {
+    let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let project_dir = replayable_project();
+    std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD", "10");
+    std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS", "1");
+    std::env::set_var("INFIGRAPH_SCIP_START_GRACE_SECS", "0");
+
+    let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+    let (stop_tx, handle) = start_coordinator_bumping(project_dir.path(), &calls, 1);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while calls.lock().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no replay request within 20s of starting the coordinator"
+        );
+        assert!(!handle.is_finished(), "coordinator exited early");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Several checks at a generation one below the threshold.
+    std::thread::sleep(Duration::from_millis(3500));
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "a replay may not repeat before the threshold's worth of generations"
+    );
+    let first_ast = calls.lock().unwrap()[0].ast_generation;
+
+    stop_tx.send(()).unwrap();
+    handle
+        .join()
+        .unwrap()
+        .expect("coordinator loop returned an error instead of a clean shutdown");
+
+    // The bump really happened: the generation is one past the attempt.
+    let graph_path = project_dir
+        .path()
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
+    let backend = KuzuBackend::open_read_only(&graph_path).unwrap();
+    let moved = backend.current_ast_generation().unwrap() - first_ast;
+    assert!(
+        moved > 0 && moved < 10,
+        "the write must move the generation, but by less than the threshold: moved {moved}"
+    );
+
+    std::env::remove_var("INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD");
+    std::env::remove_var("INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS");
+    std::env::remove_var("INFIGRAPH_SCIP_START_GRACE_SECS");
+}
+
+/// The threshold's worth of generations moves the replay due again. The first
+/// attempt bumps the generation by the full threshold. A second request then
+/// appears, and no third follows at that generation. This second request can
+/// also be the drift rule firing at the same gap, which is why the lower bound
+/// is pinned by the test above and by the pure-function test.
+#[test]
+fn a_replay_is_due_again_once_the_threshold_of_generations_has_passed() {
+    let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let project_dir = replayable_project();
+    std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD", "2");
+    std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS", "1");
+    std::env::set_var("INFIGRAPH_SCIP_START_GRACE_SECS", "0");
+
+    let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+    let (stop_tx, handle) = start_coordinator_bumping(project_dir.path(), &calls, 2);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while calls.lock().unwrap().len() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no second request within 30s of the threshold being reached"
+        );
+        assert!(!handle.is_finished(), "coordinator exited early");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The invariant, not an exact count: every attempt is stamped at the AST
+    // generation it started from, and consecutive attempts are at least the
+    // threshold apart. The drift rule shares that spacing, so it may add an
+    // attempt where the generation has moved the threshold on; it may not add
+    // one sooner, and nothing may start while the generation stands still.
+    std::thread::sleep(Duration::from_millis(2500));
+    let gens: Vec<_> = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|c| c.ast_generation)
+        .collect();
+    assert!(gens.len() >= 2, "{gens:?}");
+    for pair in gens.windows(2) {
+        assert!(
+            pair[1] - pair[0] >= 2,
+            "two attempts less than the threshold apart: {gens:?}"
+        );
+    }
+    let settled = calls.lock().unwrap().len();
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        settled,
+        "a request started with the generation standing still"
+    );
 
     stop_tx.send(()).unwrap();
     handle
