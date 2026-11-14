@@ -248,6 +248,78 @@ pub(crate) fn scip_enrichment_due(
     ast_generation.saturating_sub(scip_generation) >= threshold
 }
 
+/// Whether a revision replay may start at this AST generation. Once per
+/// generation, as a drift retry is (`scip_enrichment_due`): an indexer that
+/// keeps failing reruns only after the graph has changed, not on every check.
+fn revision_replay_due(ast_generation: i64, last_attempt: Option<i64>) -> bool {
+    last_attempt != Some(ast_generation)
+}
+
+/// The languages a revision replay re-runs now: the ledger's behind languages
+/// that are detected and enabled (`scip_switch::replay_languages`). An
+/// unreadable ledger replays nothing.
+fn revision_replay_languages(
+    root: &Path,
+    scip_generation: i64,
+    detected: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let Some(entries) = crate::scip::ledger_entries(&root.join(".infigraph")) else {
+        return Vec::new();
+    };
+    crate::scip_switch::replay_languages(root, scip_generation, &entries, detected)
+}
+
+/// Runs `on_started` once `take_lock` has the enrich lock: the one place an
+/// enrichment job becomes an attempt. A busy lock (`take_lock` gives `None`)
+/// returns without running it, so it is not an attempt.
+fn begin_enrichment_job<G>(
+    take_lock: impl FnOnce() -> Option<G>,
+    on_started: impl FnOnce(),
+) -> Option<G> {
+    let guard = take_lock()?;
+    on_started();
+    Some(guard)
+}
+
+#[cfg(test)]
+mod revision_replay_tests {
+    use super::*;
+
+    /// A replay is due once per AST generation. An indexer that keeps failing
+    /// reruns only when the graph changes, however many checks run.
+    #[test]
+    fn a_revision_replay_runs_once_per_ast_generation() {
+        assert!(revision_replay_due(5, None));
+        assert!(!revision_replay_due(5, Some(5)));
+        assert!(revision_replay_due(6, Some(5)));
+        let mut last = None;
+        let mut attempts = 0;
+        for _ in 0..50 {
+            if revision_replay_due(5, last) {
+                attempts += 1;
+                last = Some(5);
+            }
+        }
+        assert_eq!(attempts, 1, "50 checks at one generation, one attempt");
+    }
+
+    /// A busy enrich lock is not an attempt: the start hook never runs, so the
+    /// retry gate is not stamped and the replay is due again next check. The
+    /// lock is supplied, so "busy" is exact rather than a racing second open.
+    #[test]
+    fn a_busy_enrich_lock_is_not_an_attempt() {
+        let mut started = false;
+        let busy: Option<()> = begin_enrichment_job(|| None, || started = true);
+        assert!(busy.is_none());
+        assert!(!started, "a busy lock must not count as started");
+
+        let mut started_now = false;
+        let free = begin_enrichment_job(|| Some(()), || started_now = true);
+        assert!(free.is_some());
+        assert!(started_now, "a job that holds the lock has started");
+    }
+}
+
 /// What one SCIP-enrichment run is asked to cover: which languages'
 /// indexers to run, and the AST generation the graph was at when the run
 /// was decided -- the value the eventual import stamps as enriched (see
@@ -276,9 +348,14 @@ pub struct ScipEnrichJob {
 /// coordinator's (plain OS) thread -- `drain_rt.enter()` scopes that
 /// context to just this call, matching `try_start_full_reindex`'s
 /// identical need.
+///
+/// `on_started` runs once this job holds the enrich lock, just before the
+/// indexers run. It is the attempt's stamp: a skip for a busy lock never runs
+/// it, so a busy lock does not count as an attempt.
 fn spawn_scip_enrich(
     drain_rt: &tokio::runtime::Runtime,
     daemon_token: &CancellationToken,
+    on_started: impl FnOnce() + Send + 'static,
     cb: Arc<FullReindexCallback>,
     root: PathBuf,
     job: ScipEnrichJob,
@@ -309,7 +386,10 @@ fn spawn_scip_enrich(
         // One enrichment per project at a time, whoever started it: the
         // detached `scip-enrich` child and a foreground `index --no-embed`
         // hold the same lock. The loser has already logged why it skipped.
-        let Some(_enriching) = crate::scip::try_begin_enrichment(&root, "daemon") else {
+        let Some(_enriching) = begin_enrichment_job(
+            || crate::scip::try_begin_enrichment(&root, "daemon"),
+            on_started,
+        ) else {
             return;
         };
         cb(root, job, token, submitter);
@@ -1135,7 +1215,11 @@ where
     let mut last_scip_staleness_check = std::time::Instant::now();
     // The AST generation at which the last enrichment attempt (either
     // trigger) started -- see `scip_enrichment_due` for why it gates retries.
-    let mut last_scip_attempt_ast_generation: Option<i64> = None;
+    // Shared with the job the staleness trigger spawns, which records it once
+    // it has actually started (`spawn_scip_enrich`): a busy enrich lock is not
+    // an attempt.
+    let last_scip_attempt_ast_generation: Arc<std::sync::Mutex<Option<i64>>> =
+        Arc::new(std::sync::Mutex::new(None));
 
     // Which directory this daemon started on, not just whether *a* directory
     // exists at that path -- see `path_is_gone`.
@@ -1480,7 +1564,7 @@ where
                 // whether or not enrichment gets spawned below. Left in
                 // place it would suppress the trigger on the new graph
                 // until its counter climbed past the old one's.
-                last_scip_attempt_ast_generation = None;
+                *last_scip_attempt_ast_generation.lock().unwrap() = None;
                 if scip_in_flight.is_some() {
                     // A previous full reindex's SCIP task is still running --
                     // don't overwrite its tracked handle (we'd lose the ability to
@@ -1517,10 +1601,11 @@ where
                         .backend()
                         .and_then(|b| b.current_scip_generation().ok())
                         .unwrap_or(0);
-                    last_scip_attempt_ast_generation = Some(ast_generation);
+                    *last_scip_attempt_ast_generation.lock().unwrap() = Some(ast_generation);
                     scip_in_flight = Some(spawn_scip_enrich(
                         &drain_rt,
                         daemon_token,
+                        || {},
                         cb,
                         root.to_path_buf(),
                         ScipEnrichJob {
@@ -1584,13 +1669,40 @@ where
                                 let ast = backend.current_ast_generation();
                                 let scip = backend.current_scip_generation();
                                 match (ast, scip) {
-                                    (Ok(ast), Ok(scip)) => scip_enrichment_due(
-                                        ast,
-                                        scip,
-                                        last_scip_attempt_ast_generation,
-                                        scip_staleness_threshold,
-                                    )
-                                    .then(|| (ast, scip, backend.distinct_languages())),
+                                    (Ok(ast), Ok(scip)) => {
+                                        let last =
+                                            *last_scip_attempt_ast_generation.lock().unwrap();
+                                        if scip_enrichment_due(
+                                            ast,
+                                            scip,
+                                            last,
+                                            scip_staleness_threshold,
+                                        ) {
+                                            Some((ast, scip, false, backend.distinct_languages()))
+                                        } else if revision_replay_due(ast, last) {
+                                            match backend.distinct_languages() {
+                                                Ok(detected) => {
+                                                    let detected: std::collections::HashSet<
+                                                        String,
+                                                    > = detected.into_iter().collect();
+                                                    let languages = revision_replay_languages(
+                                                        root, scip, &detected,
+                                                    );
+                                                    (!languages.is_empty())
+                                                        .then(|| (ast, scip, true, Ok(languages)))
+                                                }
+                                                Err(e) => {
+                                                    eprintln!(
+                                                        "[daemon] SCIP revision replay couldn't \
+                                                         list the graph's languages: {e}"
+                                                    );
+                                                    None
+                                                }
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    }
                                     (Err(e), _) | (_, Err(e)) => {
                                         eprintln!(
                                             "[daemon] SCIP staleness check couldn't read the \
@@ -1601,19 +1713,31 @@ where
                                 }
                             });
                         match due {
-                            Some((ast, scip, Ok(languages))) if !languages.is_empty() => {
-                                eprintln!(
-                                    "[daemon] SCIP enrichment is {} AST generations behind \
-                                     (threshold {}) -- re-enriching {}",
-                                    ast - scip,
-                                    scip_staleness_threshold,
-                                    languages.join(", ")
-                                );
-                                last_scip_attempt_ast_generation = Some(ast);
+                            Some((ast, scip, replay, Ok(languages))) if !languages.is_empty() => {
+                                if replay {
+                                    eprintln!(
+                                        "[daemon] SCIP import ledger is behind revision {} for \
+                                         {} -- replaying the enrichment",
+                                        crate::scip::SCIP_IMPORT_REVISION,
+                                        languages.join(", ")
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "[daemon] SCIP enrichment is {} AST generations behind \
+                                         (threshold {}) -- re-enriching {}",
+                                        ast - scip,
+                                        scip_staleness_threshold,
+                                        languages.join(", ")
+                                    );
+                                }
+                                // Recorded once the job holds the enrich lock,
+                                // not here: a busy lock is not an attempt.
+                                let stamp = Arc::clone(&last_scip_attempt_ast_generation);
                                 let cb = on_full_reindex.clone().expect("checked is_some above");
                                 scip_in_flight = Some(spawn_scip_enrich(
                                     &drain_rt,
                                     daemon_token,
+                                    move || *stamp.lock().unwrap() = Some(ast),
                                     cb,
                                     root.to_path_buf(),
                                     ScipEnrichJob {
@@ -1627,8 +1751,8 @@ where
                             // An empty graph has nothing to enrich; leave the
                             // retry gate alone so a later populated graph gets
                             // its chance.
-                            Some((_, _, Ok(_))) => {}
-                            Some((_, _, Err(e))) => {
+                            Some((_, _, _, Ok(_))) => {}
+                            Some((_, _, _, Err(e))) => {
                                 eprintln!(
                                     "[daemon] SCIP staleness check couldn't list the graph's \
                                      languages: {e}"

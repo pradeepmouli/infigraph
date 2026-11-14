@@ -1543,12 +1543,119 @@ fn check_one_project_scip_staleness(project_path: &Path) -> Option<CheckResult> 
             ),
             "run `infigraph rebuild` (or re-trigger SCIP enrichment) to refresh it",
         ))
+    } else if let Some(warning) = revision_replay_warning(project_path, &label, scip_gen, &detected)
+    {
+        Some(warning)
     } else {
         Some(CheckResult::pass(
             SCIP_STALENESS_CATEGORY,
             label,
             "up to date with the live graph",
         ))
+    }
+}
+
+/// The SCIP import ledger is behind the current import revision for a language
+/// this project has (`scip_switch::replay_languages`, the same rule the
+/// daemon's replay uses): a WARN, with the remedy the project's trigger
+/// setting allows. `None` when nothing is behind, or the ledger is unreadable.
+fn revision_replay_warning(
+    project_path: &Path,
+    label: &str,
+    scip_gen: i64,
+    detected: &std::collections::HashSet<String>,
+) -> Option<CheckResult> {
+    let entries = crate::scip::ledger_entries(&project_path.join(".infigraph"))?;
+    let languages =
+        crate::scip_switch::replay_languages(project_path, scip_gen, &entries, detected);
+    if languages.is_empty() {
+        return None;
+    }
+    let remedy = if crate::daemon::scip_settings(project_path).index_staleness_threshold > 0 {
+        "the daemon replays it after its start grace; or run `infigraph index --full` now"
+    } else {
+        "run `infigraph index --full`: the daemon's own re-enrichment is off \
+         ([scip] index_staleness_threshold = 0)"
+    };
+    Some(CheckResult::warn(
+        SCIP_STALENESS_CATEGORY,
+        label.to_string(),
+        format!(
+            "the SCIP import ledger is behind revision {} for {} -- those languages were \
+             enriched before the current import semantics",
+            crate::scip::SCIP_IMPORT_REVISION,
+            languages.join(", ")
+        ),
+        remedy,
+    ))
+}
+
+#[cfg(test)]
+mod revision_replay_warning_tests {
+    use super::*;
+
+    /// A copy of a live ledger from before revisions: four entries, none with
+    /// `importer_revision`.
+    const LIVE_SHAPE: &str = r#"{
+      "rust-analyzer": {"hash": 5536960326523201910, "scip_generation": 2},
+      "scip-go": {"hash": 181646230573971328, "scip_generation": 1333},
+      "scip-python": {"hash": 16813754624391336735, "scip_generation": 1283},
+      "scip-typescript": {"hash": 4920164732017185868, "scip_generation": 2}
+    }"#;
+
+    fn project_with_ledger(ledger: &str) -> tempfile::TempDir {
+        let project = tempfile::tempdir().unwrap();
+        let infigraph = project.path().join(".infigraph");
+        std::fs::create_dir_all(&infigraph).unwrap();
+        std::fs::write(infigraph.join("scip-imports.json"), ledger).unwrap();
+        project
+    }
+
+    fn detected(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn a_behind_ledger_warns_and_names_the_daemon_remedy_by_default() {
+        let project = project_with_ledger(LIVE_SHAPE);
+        let warning = revision_replay_warning(project.path(), "p", 5, &detected(&["rust"]))
+            .expect("a behind language the project has warns");
+        assert_eq!(warning.status, CheckStatus::Warn);
+        assert!(warning.message.contains("rust"), "{}", warning.message);
+        let remedy = warning.remediation.unwrap_or_default();
+        assert!(remedy.contains("daemon replays"), "{remedy}");
+    }
+
+    #[test]
+    fn a_zero_staleness_threshold_names_only_the_full_index() {
+        let project = project_with_ledger(LIVE_SHAPE);
+        std::fs::write(
+            project.path().join(".infigraph/config.toml"),
+            "[scip]\nindex_staleness_threshold = 0\n",
+        )
+        .unwrap();
+        let warning = revision_replay_warning(project.path(), "p", 5, &detected(&["rust"]))
+            .expect("the warning stands with the trigger off");
+        let remedy = warning.remediation.unwrap_or_default();
+        assert!(remedy.contains("index --full"), "{remedy}");
+        assert!(!remedy.contains("daemon replays"), "{remedy}");
+    }
+
+    #[test]
+    fn a_replayed_ledger_and_a_never_enriched_graph_are_silent() {
+        let project = project_with_ledger(LIVE_SHAPE);
+        for label in ["rust-analyzer", "scip-go", "scip-python", "scip-tsrs"] {
+            crate::scip::record_scip_import(&project.path().join(".infigraph"), label, 42, 5);
+        }
+        assert!(
+            revision_replay_warning(project.path(), "p", 5, &detected(&["rust"])).is_none(),
+            "a replayed ledger is silent"
+        );
+        let fresh = project_with_ledger(LIVE_SHAPE);
+        assert!(
+            revision_replay_warning(fresh.path(), "p", 0, &detected(&["rust"])).is_none(),
+            "a graph never enriched is not the replay's business"
+        );
     }
 }
 

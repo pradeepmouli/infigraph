@@ -23,14 +23,14 @@ pub const DEPENDENCY_EDGE_TABLES: &[&str] = &[
     "REFERENCES",
 ];
 
-/// The tables among `wanted` that this graph holds, as a Cypher relationship-type
-/// list (`A|B`). `run` executes one read query and returns its rows.
+/// The names among `wanted` that this graph holds, node or edge tables alike, in
+/// `wanted`'s order. `run` executes one read query and returns its rows. It
+/// never errors for a missing name; it returns fewer names.
 ///
 /// A table no writer has created yet (`REFERENCES` or `IMPLEMENTS` on a graph
-/// built before they existed) has no edges, so leaving it out of the pattern is
-/// exact. The schema DDL runs only on a writer's open, so a read-only open never
-/// creates it; the graph's own catalog answers instead, one read per call.
-/// Errors when none of `wanted` is present.
+/// built before they existed) has no edges, so leaving it out is exact. The
+/// schema DDL runs only on a writer's open, so a read-only open never creates
+/// it; the graph's own catalog answers instead, one read per call.
 pub fn present_tables<'a>(
     wanted: &[&'a str],
     run: impl FnOnce(&str) -> anyhow::Result<Vec<Vec<String>>>,
@@ -48,6 +48,10 @@ pub fn present_tables<'a>(
         .collect())
 }
 
+/// The names among `wanted` that this graph holds ([`present_tables`]), joined
+/// as a Cypher relationship-type pattern (`A|B`) for `MATCH ()-[:A|B]-()`.
+/// Errors when none of them is present, since an empty pattern matches nothing
+/// useful and says nothing about why.
 pub fn present_edge_tables(
     wanted: &[&str],
     run: impl FnOnce(&str) -> anyhow::Result<Vec<Vec<String>>>,

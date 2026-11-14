@@ -176,6 +176,108 @@ fn coordinator_triggers_scip_enrichment_once_when_staleness_exceeds_threshold() 
     std::env::remove_var("INFIGRAPH_SCIP_START_GRACE_SECS");
 }
 
+/// A project with no drift at all (SCIP and AST generations equal) whose SCIP
+/// import ledger is behind the current revision: the one case only the revision
+/// replay can answer. The ledger is a copy of a live one from before revisions.
+fn replayable_project() -> tempfile::TempDir {
+    let project_dir = tempfile::tempdir().unwrap();
+    let infigraph_dir = project_dir.path().join(".infigraph");
+    std::fs::create_dir_all(&infigraph_dir).unwrap();
+    let graph_path = infigraph_dir.join(infigraph_core::graph::names::STEM);
+
+    let source = b"pub fn f() {}\n";
+    std::fs::create_dir_all(project_dir.path().join("src")).unwrap();
+    std::fs::write(project_dir.path().join("src/lib.rs"), source).unwrap();
+    let content_hash = format!("{:x}", sha2::Sha256::digest(source));
+
+    {
+        let backend = KuzuBackend::open(&graph_path).unwrap();
+        backend
+            .upsert_files_bulk(
+                &[FileExtraction {
+                    file: "src/lib.rs".to_string(),
+                    language: "rust".to_string(),
+                    content_hash: content_hash.clone(),
+                    symbols: vec![],
+                    relations: vec![],
+                    statements: vec![],
+                }],
+                true,
+            )
+            .unwrap();
+    }
+    {
+        // Stamped at the current AST generation, with no bump after: no drift.
+        let store = GraphStore::open(&graph_path).unwrap();
+        let lock = store.write_lock().unwrap();
+        let conn = store.connection().unwrap();
+        store
+            .stamp_scip_generation_conn(&conn, &lock, None)
+            .unwrap();
+    }
+    std::fs::write(
+        infigraph_dir.join("scip-imports.json"),
+        r#"{
+          "rust-analyzer": {"hash": 5536960326523201910, "scip_generation": 1},
+          "scip-go": {"hash": 181646230573971328, "scip_generation": 1},
+          "scip-python": {"hash": 16813754624391336735, "scip_generation": 1},
+          "scip-typescript": {"hash": 4920164732017185868, "scip_generation": 1}
+        }"#,
+    )
+    .unwrap();
+    project_dir
+}
+
+/// No drift, but the ledger is behind: the coordinator replays the behind
+/// language that the project has, exactly once. The fake callback never updates
+/// the ledger, so further checks must not rerun it at the same AST generation.
+#[test]
+fn coordinator_replays_a_behind_ledger_once_without_any_drift() {
+    let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let project_dir = replayable_project();
+
+    std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD", "2");
+    std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS", "1");
+    std::env::set_var("INFIGRAPH_SCIP_START_GRACE_SECS", "0");
+
+    let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+    let (stop_tx, handle) = start_coordinator(project_dir.path(), &calls);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while calls.lock().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no replay request within 20s of starting the coordinator"
+        );
+        assert!(!handle.is_finished(), "coordinator exited early");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_millis(2500));
+    {
+        let recorded = calls.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "a replay runs once per AST generation, got {recorded:?}"
+        );
+        assert_eq!(recorded[0].languages, vec!["rust".to_string()]);
+        assert_eq!(
+            recorded[0].ast_generation, 1,
+            "no drift: the generation it stamps"
+        );
+    }
+
+    stop_tx.send(()).unwrap();
+    handle
+        .join()
+        .unwrap()
+        .expect("coordinator loop returned an error instead of a clean shutdown");
+
+    std::env::remove_var("INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD");
+    std::env::remove_var("INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS");
+    std::env::remove_var("INFIGRAPH_SCIP_START_GRACE_SECS");
+}
+
 /// The same drifted graph, and the trigger would fire at once -- but the
 /// daemon has just started, and a restart, the true-up and an editing burst
 /// settle first. The positive test above sees its request within 20s with the
