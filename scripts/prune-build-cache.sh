@@ -97,7 +97,9 @@ owner="$(dirname "$target_dir")"
 # `.cargo-build-lock`, `.cargo-artifact-lock`) open for the whole build, so this
 # says a cargo is building into the target wherever it was started, and whatever
 # its environment says. The environment itself cannot be read here: macOS `ps`
-# shows none, and KERN_PROCARGS2 returns only argv.
+# shows none, and KERN_PROCARGS2 returns only argv. Linux's
+# /proc/<pid>/environ is not read either, so the open-file check is the one that
+# runs on both platforms (lsof is already required for the working directory).
 held_in_target() {
   lsof -a -p "$1" -Fn 2>/dev/null |
     awk -v prefix="$target_dir/" 'substr($0, 1, 1) == "n" && index(substr($0, 2), prefix) == 1 { print substr($0, 2); exit }'
