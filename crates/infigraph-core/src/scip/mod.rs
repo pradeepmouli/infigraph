@@ -918,13 +918,25 @@ fn import_scip_index_unrecorded(
                         .as_ref()
                         .is_some_and(|own| without_ordinal(id) == without_ordinal(own))
             };
+            // A file-level definition (see `is_file_level_definition`) is the
+            // file's own container, so it matches only a Module row. Left open, a
+            // name match took a function of the same name: rust-analyzer's crate
+            // root `lib/` enriched `fn lib` in src/lib.rs with its moniker, and
+            // the crate root had no row of its own.
+            let file_level = is_file_level_definition(scip_sym, occ);
+            let module_only = |id: &String| {
+                !file_level
+                    || existing
+                        .get(id)
+                        .is_some_and(|e| e.kind.eq_ignore_ascii_case("module"))
+            };
             // Best candidate first: the row an earlier import gave THIS moniker,
             // then one with no moniker yet, then (a merged declaration, whose
             // two monikers share a row) one carrying another's. A row this pass
             // already gave another moniker is never a candidate, so sibling
             // members never share one.
             let rank = |s: u32, e: u32, id: &String| -> Option<u8> {
-                if !same_owner(id) {
+                if !same_owner(id) || !module_only(id) {
                     return None;
                 }
                 if made_in_pass
@@ -977,7 +989,7 @@ fn import_scip_index_unrecorded(
             let matched = file_name_to_ids
                 .get(&key)
                 .into_iter()
-                .chain(if literal.is_some() {
+                .chain(if literal.is_some() || file_level {
                     None
                 } else {
                     made_name_to_ids.get(&key)
@@ -993,7 +1005,7 @@ fn import_scip_index_unrecorded(
                     file_name_to_ids.get(&key).and_then(|c| {
                         if c.len() == 1 {
                             c.first()
-                                .filter(|(_, _, id)| same_owner(id))
+                                .filter(|(_, _, id)| same_owner(id) && module_only(id))
                                 .map(|(s, _, id)| (*s, id.clone()))
                         } else {
                             None
@@ -1986,6 +1998,19 @@ enum DescriptorKind {
     Macro,
     TypeParam,
     Param,
+}
+
+/// Whether a definition is a whole file's own namespace: the last descriptor is
+/// a namespace and the definition starts at the file's first position. That is
+/// rust-analyzer's crate root (`lib/` at 0:0, `bin/<package>/` for a binary) and
+/// scip-typescript's `a.ts/`. A namespace declared in the file (`namespace Box`)
+/// starts later on its line, so it is not one.
+fn is_file_level_definition(scip_sym: &str, occ: &Occurrence) -> bool {
+    let (line, col, ..) = occurrence_range(occ);
+    line == 0
+        && col == 0
+        && scip_descriptors(scip_sym).and_then(|d| d.last().map(|d| d.kind))
+            == Some(DescriptorKind::Namespace)
 }
 
 /// The descriptors of `scip_sym`, in order, or `None` when it does not parse
@@ -3798,39 +3823,66 @@ mod tests {
         );
     }
 
-    /// A real `fn lib` in `src/lib.rs` has the id `src/lib.rs::lib`, and
-    /// rust-analyzer's crate root (`lib/`, at the file's start) has the same
-    /// name. The real function keeps its id and its kind. Open finding: the import
-    /// does not give the crate root a row of its own (no `#2`); it matches the
-    /// crate root's moniker to the real function and writes the crate root's
-    /// moniker into that function's `scip_id`. The test pins the id and kind,
-    /// which is what must not change, and the single row; the `scip_id` is not asserted.
-    #[test]
-    fn a_crate_root_that_shares_a_real_symbols_name_keeps_the_real_symbol_id() {
+    const LIB_ROOT: &str = "rust-analyzer cargo shape 0.1.0 lib/";
+    const LIB_FN: &str = "rust-analyzer cargo shape 0.1.0 lib/lib().";
+    const BIN_ROOT: &str = "rust-analyzer cargo probebin 0.1.0 bin/probebin/";
+    const BIN_MAIN: &str = "rust-analyzer cargo probebin 0.1.0 bin/probebin/main().";
+
+    /// What a rust-analyzer-shaped index does to a file that already has a
+    /// tree-sitter row for `name`: a file-level definition `root` at 0:0, and the
+    /// definition `function` at `fn_at` (0-based line and column), where the row
+    /// starts at 1-based line `fn_line`. Returns the file's rows as
+    /// `(id, kind, scip_id)`, ordered by id.
+    fn file_rows_after_import(
+        file: &str,
+        name: &str,
+        root: &str,
+        function: &str,
+        fn_at: (i32, i32),
+        fn_line: i64,
+    ) -> Vec<(String, String, String)> {
         let env = TestEnv::new();
-        env.add_file("src/lib.rs");
+        env.add_file(file);
         {
             let conn = env.store.connection().unwrap();
-            conn.query(
-                "CREATE (:Symbol {id: 'src/lib.rs::lib', name: 'lib', kind: 'Function', \
-                 file: 'src/lib.rs', start_line: 3, end_line: 3, signature_hash: 'h', \
+            conn.query(&format!(
+                "CREATE (:Symbol {{id: '{file}::{name}', name: '{name}', kind: 'Function', \
+                 file: '{file}', start_line: {fn_line}, end_line: {end}, signature_hash: 'h', \
                  language: 'rust', visibility: 'public', parent: '', docstring: '', \
-                 complexity: 1, parameters: '', return_type: ''})",
-            )
+                 complexity: 1, parameters: '', return_type: ''}})",
+                end = fn_line + 2
+            ))
             .unwrap();
         }
-        let root = "rust-analyzer cargo shape 0.1.0 lib/".to_string();
         let doc = Document {
-            relative_path: "src/lib.rs".to_string(),
-            occurrences: vec![Occurrence {
-                symbol: root.clone(),
-                symbol_roles: SymbolRole::Definition as i32,
-                ..ranged(RangeForm::Legacy, 0, 0, 0)
-            }],
-            symbols: vec![SymbolInformation {
-                symbol: root,
-                ..Default::default()
-            }],
+            relative_path: file.to_string(),
+            occurrences: vec![
+                Occurrence {
+                    symbol: root.to_string(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..ranged(RangeForm::Legacy, 0, 0, 0)
+                },
+                Occurrence {
+                    symbol: function.to_string(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..ranged(
+                        RangeForm::Legacy,
+                        fn_at.0,
+                        fn_at.1,
+                        fn_at.1 + name.len() as i32,
+                    )
+                },
+            ],
+            symbols: vec![
+                SymbolInformation {
+                    symbol: root.to_string(),
+                    ..Default::default()
+                },
+                SymbolInformation {
+                    symbol: function.to_string(),
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         };
         let index = Index {
@@ -3842,19 +3894,145 @@ mod tests {
 
         import_scip_index(&index_path, &env.store, None).unwrap();
         let conn = env.store.connection().unwrap();
-        let rows: Vec<(String, String)> = conn
-            .query("MATCH (s:Symbol) WHERE s.file = 'src/lib.rs' RETURN s.id, s.kind ORDER BY s.id")
+        conn.query(&format!(
+            "MATCH (s:Symbol) WHERE s.file = '{file}' RETURN s.id, s.kind, s.scip_id ORDER BY s.id"
+        ))
+        .unwrap()
+        .map(|row| (row[0].to_string(), row[1].to_string(), row[2].to_string()))
+        .collect()
+    }
+
+    /// The crate root has a row of its own, `#2` because the function already
+    /// holds the bare id, and the function keeps its id and kind and takes its
+    /// own moniker.
+    fn assert_crate_root_has_its_own_row(rows: &[(String, String, String)]) {
+        let expected = vec![
+            (
+                "src/lib.rs::lib".to_string(),
+                "Function".to_string(),
+                LIB_FN.to_string(),
+            ),
+            (
+                "src/lib.rs::lib#2".to_string(),
+                "Module".to_string(),
+                LIB_ROOT.to_string(),
+            ),
+        ];
+        assert_eq!(rows, expected);
+    }
+
+    /// The function is on the crate root's line, so the containment rank used to
+    /// match them.
+    #[test]
+    fn a_crate_root_does_not_take_a_function_of_its_name_on_its_own_line() {
+        let rows = file_rows_after_import("src/lib.rs", "lib", LIB_ROOT, LIB_FN, (0, 7), 1);
+        assert_crate_root_has_its_own_row(&rows);
+    }
+
+    /// The function starts further down the file, so only the lone-candidate
+    /// fallback used to reach it.
+    #[test]
+    fn a_crate_root_does_not_take_a_function_of_its_name_further_down() {
+        let rows = file_rows_after_import("src/lib.rs", "lib", LIB_ROOT, LIB_FN, (2, 7), 3);
+        assert_crate_root_has_its_own_row(&rows);
+    }
+
+    /// rust-analyzer names a binary's root for the package (`bin/probebin/`), not
+    /// for `main`, so `fn main` is never a candidate of the crate root's name.
+    /// This holds under either rule: the test documents it.
+    #[test]
+    fn a_binary_crate_root_is_named_for_its_package_and_main_keeps_its_row() {
+        let rows = file_rows_after_import("src/main.rs", "main", BIN_ROOT, BIN_MAIN, (0, 3), 1);
+        let expected = vec![
+            (
+                "src/main.rs::main".to_string(),
+                "Function".to_string(),
+                BIN_MAIN.to_string(),
+            ),
+            (
+                "src/main.rs::probebin".to_string(),
+                "Module".to_string(),
+                BIN_ROOT.to_string(),
+            ),
+        ];
+        assert_eq!(rows, expected);
+    }
+
+    /// scip-typescript's `a.ts/` is the file's container: a top-level reference
+    /// is an edge from it, and the row stays a Module.
+    #[test]
+    fn a_typescript_file_level_definition_contains_its_top_level_references() {
+        let env = TestEnv::new();
+        env.add_file("a.ts");
+        {
+            let conn = env.store.connection().unwrap();
+            conn.query(
+                "CREATE (:Symbol {id: 'a.ts::hello', name: 'hello', kind: 'Function', \
+                 file: 'a.ts', start_line: 3, end_line: 5, signature_hash: 'h', \
+                 language: 'typescript', visibility: 'public', parent: '', docstring: '', \
+                 complexity: 1, parameters: '', return_type: ''})",
+            )
+            .unwrap();
+        }
+        let file = "scip-test npm test 1.0.0 `a.ts`/".to_string();
+        let hello = "scip-test npm test 1.0.0 `a.ts`/hello().".to_string();
+        let doc = Document {
+            relative_path: "a.ts".to_string(),
+            occurrences: vec![
+                Occurrence {
+                    symbol: file.clone(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    // The file, as scip-typescript gives it: its enclosing range
+                    // is the whole file, and that is what holds the references.
+                    enclosing_range: vec![0, 0, 9, 0],
+                    ..ranged(RangeForm::Legacy, 0, 0, 0)
+                },
+                Occurrence {
+                    symbol: hello.clone(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..ranged(RangeForm::Legacy, 2, 9, 14)
+                },
+                // Line 6 (1-based 7) is outside `hello`: top level of the file.
+                Occurrence {
+                    symbol: hello.clone(),
+                    symbol_roles: 0,
+                    ..ranged(RangeForm::Legacy, 6, 0, 5)
+                },
+            ],
+            symbols: vec![
+                SymbolInformation {
+                    symbol: file,
+                    ..Default::default()
+                },
+                SymbolInformation {
+                    symbol: hello,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let index = Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let index_path = env._dir.path().join("index.scip");
+        std::fs::write(&index_path, index.write_to_bytes().unwrap()).unwrap();
+
+        import_scip_index(&index_path, &env.store, None).unwrap();
+        let conn = env.store.connection().unwrap();
+        let kinds: Vec<(String, String)> = conn
+            .query("MATCH (s:Symbol) WHERE s.file = 'a.ts' RETURN s.id, s.kind ORDER BY s.id")
             .unwrap()
             .map(|row| (row[0].to_string(), row[1].to_string()))
             .collect();
         assert!(
-            rows.contains(&("src/lib.rs::lib".to_string(), "Function".to_string())),
-            "the real function lost its id or its kind: {rows:?}"
+            kinds.contains(&("a.ts::a.ts".to_string(), "Module".to_string())),
+            "the file-level row is not a Module: {kinds:?}"
         );
-        assert_eq!(
-            rows.len(),
-            1,
-            "the crate root made a row of its own: {rows:?}"
+        assert!(
+            edge_pairs(&env, "CALLS", "id")
+                .contains(&("a.ts::a.ts".to_string(), "a.ts::hello".to_string())),
+            "the top-level reference lost its container"
         );
     }
 
