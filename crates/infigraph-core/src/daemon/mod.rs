@@ -248,11 +248,16 @@ pub(crate) fn scip_enrichment_due(
     ast_generation.saturating_sub(scip_generation) >= threshold
 }
 
-/// Whether a revision replay may start at this AST generation. Once per
-/// generation, as a drift retry is (`scip_enrichment_due`): an indexer that
-/// keeps failing reruns only after the graph has changed, not on every check.
-fn revision_replay_due(ast_generation: i64, last_attempt: Option<i64>) -> bool {
-    last_attempt != Some(ast_generation)
+/// Whether a revision replay may start at this AST generation. Due when this
+/// daemon has made no attempt yet, or when the AST generation has moved at
+/// least `threshold` (`[scip] index_staleness_threshold`, the knob the drift
+/// retry reads) since the last started attempt. A language that stays behind
+/// (no indexer, or an indexer that imports nothing) is therefore retried once
+/// per `threshold` generations, not after every edit batch. `scip_enrichment_due`
+/// is the drift rule and is unchanged.
+fn revision_replay_due(ast_generation: i64, last_attempt: Option<i64>, threshold: u64) -> bool {
+    let threshold = i64::try_from(threshold).unwrap_or(i64::MAX);
+    last_attempt.is_none_or(|last| ast_generation.saturating_sub(last) >= threshold)
 }
 
 /// The languages a revision replay re-runs now: the ledger's behind languages
@@ -285,17 +290,26 @@ fn begin_enrichment_job<G>(
 mod revision_replay_tests {
     use super::*;
 
-    /// A replay is due once per AST generation. An indexer that keeps failing
-    /// reruns only when the graph changes, however many checks run.
+    /// The spacing rule: the first attempt in a daemon's life is due, then a
+    /// replay waits until the AST generation has moved `threshold` past the
+    /// last started attempt. An indexer that keeps failing is retried once per
+    /// threshold's worth of edits, however many checks run.
     #[test]
-    fn a_revision_replay_runs_once_per_ast_generation() {
-        assert!(revision_replay_due(5, None));
-        assert!(!revision_replay_due(5, Some(5)));
-        assert!(revision_replay_due(6, Some(5)));
+    fn a_revision_replay_is_spaced_by_the_staleness_threshold() {
+        const T: u64 = 50;
+        assert!(revision_replay_due(5, None, T), "the first attempt is due");
+        assert!(
+            !revision_replay_due(54, Some(5), T),
+            "49 generations after the last attempt is not due"
+        );
+        assert!(
+            revision_replay_due(55, Some(5), T),
+            "50 generations after the last attempt is due"
+        );
         let mut last = None;
         let mut attempts = 0;
         for _ in 0..50 {
-            if revision_replay_due(5, last) {
+            if revision_replay_due(5, last, T) {
                 attempts += 1;
                 last = Some(5);
             }
@@ -1679,7 +1693,11 @@ where
                                             scip_staleness_threshold,
                                         ) {
                                             Some((ast, scip, false, backend.distinct_languages()))
-                                        } else if revision_replay_due(ast, last) {
+                                        } else if revision_replay_due(
+                                            ast,
+                                            last,
+                                            scip_staleness_threshold,
+                                        ) {
                                             match backend.distinct_languages() {
                                                 Ok(detected) => {
                                                     let detected: std::collections::HashSet<
