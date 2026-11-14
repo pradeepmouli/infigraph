@@ -124,6 +124,9 @@ fn median(mut samples: Vec<Duration>) -> Duration {
 
 #[test]
 fn a_fallback_inside_the_daemon_is_visible_in_doctor_get_stats_and_the_footer() {
+    // Enrichment off for this process, as every index run here needs; the
+    // `command` helper below sets it per command as well.
+    support::disable_scip_enrichment();
     let Some(cli) = cli() else {
         eprintln!("skipping: infigraph CLI binary not built in this target dir");
         return;
