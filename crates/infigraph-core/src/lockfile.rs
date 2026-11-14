@@ -107,18 +107,26 @@ pub struct Busy {
     pub waited: Duration,
 }
 
+/// "scip-enrich (PID 69608), held 156s" -- the one wording for a lock
+/// holder, shared by `Busy` and the daemon's graph-held-by-writer mode.
+pub fn holder_summary(h: &LockInfo) -> String {
+    format!(
+        "{} (PID {}), held {}s",
+        h.role,
+        h.pid,
+        now_epoch_secs().saturating_sub(h.acquired_at)
+    )
+}
+
 impl std::fmt::Display for Busy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.holder {
             Some(h) => {
-                let held_for = now_epoch_secs().saturating_sub(h.acquired_at);
                 write!(
                     f,
-                    "{} is locked by {} (PID {}), held {}s — waited {}s, giving up",
+                    "{} is locked by {} — waited {}s, giving up",
                     self.lock_path.display(),
-                    h.role,
-                    h.pid,
-                    held_for,
+                    holder_summary(h),
                     self.waited.as_secs()
                 )
             }

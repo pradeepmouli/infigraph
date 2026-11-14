@@ -116,10 +116,20 @@ pub fn start_daemon_watcher_for_startup_dir(startup_dir: Option<&Path>) {
     // true-up must not block starting the watcher below.
     match crate::tools::index::tool_index_project(&serde_json::json!({ "path": path_str })) {
         Ok(msg) => crate::mcp_log("INFO", &format!("Startup true-up index: {path_str}: {msg}")),
-        Err(e) => crate::mcp_log(
-            "WARN",
-            &format!("Startup true-up index failed for {path_str}: {e}"),
-        ),
+        Err(e) => {
+            // A wait for a live writer is not lost work: the watcher's queued
+            // whole-project pass indexes what this did not, once it finishes.
+            let cover = if format!("{e}").contains(infigraph_core::degraded::HELD_BY_WRITER_PHRASE)
+            {
+                "; the queued whole-project pass covers it once the writer finishes"
+            } else {
+                ""
+            };
+            crate::mcp_log(
+                "WARN",
+                &format!("Startup true-up index failed for {path_str}: {e}{cover}"),
+            )
+        }
     }
 
     if let Some(msg) = crate::tools::watch::auto_start_watch(&path_str) {

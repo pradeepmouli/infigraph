@@ -149,15 +149,33 @@ pub fn submit(root: &Path, request: &WriteRequest, opts: WriteOpts) -> anyhow::R
                     }
                 }
             }
-            (slot_wait.counted(started.elapsed()) >= opts.timeout).then(|| {
-                anyhow::anyhow!(
-                    "the daemon did not answer the {} write within {:?}",
-                    request.kind(),
-                    opts.timeout
-                )
-            })
+            (slot_wait.counted(started.elapsed()) >= opts.timeout)
+                .then(|| timed_out(root, request, opts.timeout))
         },
     )
+}
+
+/// The client's timeout error. When the daemon is waiting for a live writer
+/// of the graph, the error names that holder (the daemon's own wording, read
+/// from its status), so a write that waited out its timeout says why.
+fn timed_out(root: &Path, request: &WriteRequest, timeout: Duration) -> anyhow::Error {
+    let mut message = format!(
+        "the daemon did not answer the {} write within {:?}",
+        request.kind(),
+        timeout
+    );
+    let status =
+        crate::daemon::control::query_status_within(root, crate::daemon::control::STATUS_DEADLINE);
+    if let Ok(report) = status {
+        if let Some(notice) = report
+            .degraded
+            .iter()
+            .find(|n| n.key == crate::degraded::GRAPH_HELD_BY_WRITER)
+        {
+            message = format!("{message}: {}", notice.message);
+        }
+    }
+    anyhow::anyhow!(message)
 }
 
 /// A fresh sidecar path for a bulk payload, `<pid>-<nanos>-<n>.<ext>`, with

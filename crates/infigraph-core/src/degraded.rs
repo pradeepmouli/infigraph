@@ -23,6 +23,10 @@ pub const UNWATCHED_DIRECTORIES: &str = "unwatched-directories";
 pub const CODE_WATCHER_DEAF: &str = "code-watcher-deaf";
 pub const DOC_READS_UNAVAILABLE: &str = "doc-reads-unavailable";
 pub const GRAPH_REOPEN_BACKOFF: &str = "graph-reopen-backoff";
+pub const GRAPH_HELD_BY_WRITER: &str = "graph-held-by-writer";
+/// The start of every `GraphHeldByWriter` message. A client that times out
+/// on a write looks for it in the daemon's status to name the holder.
+pub const HELD_BY_WRITER_PHRASE: &str = "the graph is held by ";
 pub const REINDEX_WAITING_FOR_SLOT: &str = "reindex-waiting-for-slot";
 pub const CLONE_BODIES_UNAVAILABLE: &str = "clone-bodies-unavailable";
 pub const CLONE_BODIES_PARTIAL: &str = "clone-bodies-partial";
@@ -122,6 +126,11 @@ pub enum DegradedMode {
     /// tables and how many extra rows each holds. Only `doctor` counts the
     /// rows, so this is reported there and not in footers.
     KeylessDuplicateEdges { extra_rows: u64, tables: String },
+    /// The graph's writer lock is held by a live, identified infigraph
+    /// process: the open waits for it instead of latching a fault. `summary`
+    /// is the holder as `lockfile::holder_summary` words it (role, pid, how
+    /// long it has held the lock).
+    GraphHeldByWriter { pid: u32, summary: String },
 }
 
 impl DegradedMode {
@@ -155,6 +164,7 @@ impl DegradedMode {
             DegradedMode::SessionsUnreadable { .. } => SESSIONS_UNREADABLE,
             DegradedMode::ScipUnknownLanguage { .. } => SCIP_UNKNOWN_LANGUAGE,
             DegradedMode::KeylessDuplicateEdges { .. } => KEYLESS_DUPLICATE_EDGES,
+            DegradedMode::GraphHeldByWriter { .. } => GRAPH_HELD_BY_WRITER,
         }
     }
 
@@ -283,6 +293,10 @@ impl DegradedMode {
                  once, so edge counts are too high. Reported by `infigraph doctor` only, not in \
                  footers"
             ),
+            DegradedMode::GraphHeldByWriter { summary, .. } => format!(
+                "{HELD_BY_WRITER_PHRASE}{summary}: writes wait for it, and no fault is latched \
+                 while it runs"
+            ),
         }
     }
 
@@ -350,6 +364,10 @@ impl DegradedMode {
             DegradedMode::KeylessDuplicateEdges { .. } => {
                 "run `infigraph rebuild`: a full rebuild writes each edge once. An index does not \
                  repair edges between files it does not touch"
+            }
+            DegradedMode::GraphHeldByWriter { .. } => {
+                "it finishes on its own; `infigraph kill <pid>` if it is stuck (the pid is in \
+                 the message)"
             }
         }
     }
@@ -1000,6 +1018,10 @@ mod tests {
             },
             DegradedMode::ScipUnknownLanguage {
                 names: "`pyton`".to_string(),
+            },
+            DegradedMode::GraphHeldByWriter {
+                pid: 4242,
+                summary: "scip-enrich (PID 4242), held 3s".to_string(),
             },
         ];
         let keys: std::collections::HashSet<_> = modes.iter().map(|m| m.key()).collect();
