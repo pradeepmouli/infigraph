@@ -116,6 +116,12 @@ pub enum WalRecovery {
     /// moved has been put back, so a quarantine now preserves the complete
     /// picture for diagnosis.
     NotRecoverable,
+    /// Nothing was decided: the probe could not start, was killed from
+    /// outside, or ran out of time (see [`crate::probe::Probe`]). Every WAL
+    /// moved for the experiment is back where it was. The caller MUST NOT
+    /// quarantine and MUST NOT count this as a recovery attempt: it should
+    /// report the open as transiently refused and try again later.
+    Indeterminate,
 }
 
 impl WalRecovery {
@@ -140,8 +146,9 @@ impl WalRecovery {
 pub fn try_recover_by_setting_wal_aside_with(
     infigraph_dir: &Path,
     graph_name: &str,
-    probe: impl Fn(&Path) -> bool,
+    probe: impl Fn(&Path) -> crate::probe::Probe,
 ) -> WalRecovery {
+    use crate::probe::Probe;
     let source = infigraph_dir.join(graph_name);
     if !source.exists() {
         return WalRecovery::NotRecoverable;
@@ -156,8 +163,10 @@ pub fn try_recover_by_setting_wal_aside_with(
     // in the other order meant a healthy graph with no WAL fell out as "not
     // recoverable" without ever being examined, and each caller had to re-probe
     // for itself to avoid quarantining it -- which only one of them did.
-    if probe(&source) {
-        return WalRecovery::AlreadyHealthy;
+    match probe(&source) {
+        Probe::Opens => return WalRecovery::AlreadyHealthy,
+        Probe::Indeterminate => return WalRecovery::Indeterminate,
+        Probe::DoesNotOpen | Probe::Unavailable => {}
     }
 
     let wal_paths = crate::graph::wal_family_paths(&source);
@@ -186,7 +195,8 @@ pub fn try_recover_by_setting_wal_aside_with(
         moved.push((path.clone(), dest));
     }
 
-    if probe(&source) {
+    let verdict = probe(&source);
+    if verdict == Probe::Opens {
         eprintln!(
             "[graph] recovered: the base image opens once its WAL is set aside -- keeping the \
              graph and filing the torn WAL as {} (uncommitted changes since the last checkpoint \
@@ -199,12 +209,16 @@ pub fn try_recover_by_setting_wal_aside_with(
         return WalRecovery::Recovered;
     }
 
-    // Base image is bad too. Restore the WAL so the quarantine that follows
-    // preserves everything.
+    // Not recovered. Put the WAL back first, whatever the answer: a quarantine
+    // that follows keeps the complete picture, and an undecided answer must
+    // leave the graph exactly as it was found.
     for (from, to) in moved.iter().rev() {
         let _ = std::fs::rename(to, from);
     }
-    WalRecovery::NotRecoverable
+    match verdict {
+        Probe::Indeterminate => WalRecovery::Indeterminate,
+        Probe::DoesNotOpen | Probe::Unavailable | Probe::Opens => WalRecovery::NotRecoverable,
+    }
 }
 
 pub fn quarantine_graph(infigraph_dir: &Path, graph_name: &str) -> Result<PathBuf> {
@@ -514,8 +528,12 @@ mod tests {
     /// which in a test binary is libtest -- it would re-run this whole suite
     /// per call. That is exactly the fork bomb `PROBE_CAPABLE` now prevents;
     /// this keeps the tests honest about the file shuffling either way.
-    fn in_process_probe(graph: &Path) -> bool {
-        crate::graph::GraphStore::open_read_only(graph).is_ok()
+    fn in_process_probe(graph: &Path) -> crate::probe::Probe {
+        if crate::graph::GraphStore::open_read_only(graph).is_ok() {
+            crate::probe::Probe::Opens
+        } else {
+            crate::probe::Probe::DoesNotOpen
+        }
     }
 
     /// A real graph with a deliberately corrupted WAL must be RECOVERED, not
@@ -619,6 +637,61 @@ mod tests {
         );
         assert_eq!(verdict, WalRecovery::NotRecoverable);
         assert!(verdict.permits_quarantine());
+    }
+
+    /// A probe that could not decide must never lead to a quarantine: nothing
+    /// is moved, and the verdict says so.
+    #[test]
+    fn an_undecided_probe_moves_nothing_and_never_permits_quarantine() {
+        use crate::probe::Probe;
+        let dir = tempfile::tempdir().unwrap();
+        let stem = crate::graph::names::STEM;
+        let wal = dir.path().join(crate::graph::names::sibling(".wal"));
+        std::fs::write(dir.path().join(stem), b"not decided").unwrap();
+        std::fs::write(&wal, b"wal").unwrap();
+
+        let verdict =
+            try_recover_by_setting_wal_aside_with(dir.path(), stem, |_| Probe::Indeterminate);
+
+        assert_eq!(verdict, WalRecovery::Indeterminate);
+        assert!(
+            !verdict.permits_quarantine(),
+            "an undecided image is not corrupt"
+        );
+        assert!(!verdict.is_usable(), "nor is it proven usable");
+        assert!(wal.exists(), "nothing was moved aside");
+    }
+
+    /// The WAL is set aside for the experiment and the answer then comes back
+    /// undecided: the WAL must be put back where it was, with no evidence file
+    /// left behind to suggest a torn tail was found.
+    #[test]
+    fn an_undecided_answer_after_setting_the_wal_aside_puts_it_back() {
+        use crate::probe::Probe;
+        let dir = tempfile::tempdir().unwrap();
+        let stem = crate::graph::names::STEM;
+        let wal = dir.path().join(crate::graph::names::sibling(".wal"));
+        std::fs::write(dir.path().join(stem), b"base").unwrap();
+        std::fs::write(&wal, b"wal").unwrap();
+        let calls = std::cell::Cell::new(0usize);
+
+        let verdict = try_recover_by_setting_wal_aside_with(dir.path(), stem, |_| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Probe::DoesNotOpen
+            } else {
+                Probe::Indeterminate
+            }
+        });
+
+        assert_eq!(verdict, WalRecovery::Indeterminate);
+        assert_eq!(calls.get(), 2, "the base was asked without its WAL");
+        assert!(wal.exists(), "the WAL is back in place");
+        let evidence = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains("torn-wal"));
+        assert!(!evidence, "an undecided answer leaves no torn-WAL evidence");
     }
 
     #[test]
@@ -771,8 +844,9 @@ mod tests {
         // in whenever a writer checkpointed and left the file behind.
         let wal = dir.path().join(crate::graph::names::sibling(".wal"));
         std::fs::write(&wal, b"").unwrap();
-        assert!(
+        assert_eq!(
             in_process_probe(&graph),
+            crate::probe::Probe::Opens,
             "precondition: this graph opens with its WAL in place, or the test \
              proves nothing"
         );

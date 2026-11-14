@@ -50,9 +50,10 @@ pub use session_store::{Scan, SessionData, SessionStore, Skipped};
 pub use store::{
     db_lock_path, is_checkpoint_in_progress_error, is_lock_contention_error,
     is_storage_version_mismatch_error, is_transient_open_error, is_transient_wal_open_race_error,
-    lock_contention_context, non_corruption_open_context, open_failure_is_not_corruption,
-    remove_wal_family, storage_version_mismatch_context, unclean_shutdown_wal_holder,
-    validate_db_file, wal_family_paths, DegradeReason, GraphCorruption, GraphStats, GraphStore,
+    is_undecided_open, lock_contention_context, non_corruption_open_context,
+    open_failure_is_not_a_fault, open_failure_is_not_corruption, remove_wal_family,
+    storage_version_mismatch_context, unclean_shutdown_wal_holder, validate_db_file,
+    wal_family_paths, DegradeReason, GraphCorruption, GraphStats, GraphStore, UndecidedOpen,
     WriteLock,
 };
 pub use store_util::stamp_healthy_graph_size;

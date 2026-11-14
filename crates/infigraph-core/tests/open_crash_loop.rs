@@ -70,7 +70,11 @@ fn graph_with_a_frozen_wal() -> (tempfile::TempDir, PathBuf) {
 
 fn in_process_probe(dir: &Path, name: &str) -> WalRecovery {
     try_recover_by_setting_wal_aside_with(dir, name, |graph| {
-        GraphStore::open_read_only(graph).is_ok()
+        if GraphStore::open_read_only(graph).is_ok() {
+            infigraph_core::probe::Probe::Opens
+        } else {
+            infigraph_core::probe::Probe::DoesNotOpen
+        }
     })
 }
 

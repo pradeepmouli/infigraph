@@ -55,11 +55,11 @@ impl FaultClass {
         }
     }
 
-    /// [`FaultClass::of`] for a failed graph open: anything but a transient
-    /// open failure is a fault.
+    /// [`FaultClass::of`] for a failed graph open: anything but an open
+    /// failure that is not a fault (retried in place, or undecided) is one.
     pub fn of_open_failure(err: &anyhow::Error) -> Option<Self> {
         Self::of(err).or_else(|| {
-            (!crate::graph::store::is_transient_open_error(err)).then_some(Self::OpenFailed)
+            (!crate::graph::store::open_failure_is_not_a_fault(err)).then_some(Self::OpenFailed)
         })
     }
 
@@ -226,6 +226,118 @@ mod tests {
         assert!(class.admits(&WriteRequest::FullReindex));
         assert!(!class.cleared_by_restart());
         assert!(!FaultClass::DiskFull.admits(&WriteRequest::FullReindex));
+    }
+
+    /// A rebuild builds beside the old graph and never opens it, so an open
+    /// the probe could not decide must not stop one. Here an opener died
+    /// inside the open (its sentinel names a pid that is gone), and the probe
+    /// after it is undecided: the open is refused, and the refusal must not
+    /// block a `FullReindex` at the client.
+    #[test]
+    fn a_rebuild_is_admitted_after_an_undecided_open_death_probe() {
+        let project = tempfile::tempdir().unwrap();
+        let infigraph_dir = project.path().join(".infigraph");
+        std::fs::create_dir_all(&infigraph_dir).unwrap();
+        std::fs::write(
+            infigraph_dir.join(format!(
+                "{}2147483600.1",
+                crate::graph::names::OPEN_SENTINEL_PREFIX
+            )),
+            r#"{"pid":2147483600,"started_at":1}"#,
+        )
+        .unwrap();
+        let refusal = crate::recovery::settle_open_deaths(
+            &infigraph_dir,
+            crate::graph::names::STEM,
+            &|_, _| crate::quarantine::WalRecovery::Indeterminate,
+        )
+        .expect_err("an undecided probe refuses the open");
+        record_if_fault(&infigraph_dir, &refusal, FaultClass::of_open_failure);
+        assert!(
+            crate::daemon::writes::blocking_fault(&infigraph_dir, &WriteRequest::FullReindex)
+                .is_none(),
+            "a rebuild must be admitted past an undecided open: {refusal:#}"
+        );
+    }
+
+    /// The refusal as `CodeIndex::init` hands it to the daemon: the
+    /// Indeterminate arm in lib.rs wraps the open error in its own context.
+    /// The phrase is still in the chain, and the open must still not latch.
+    #[test]
+    fn an_undecided_refusal_wrapped_by_the_init_arm_latches_no_fault() {
+        use anyhow::Context as _;
+        let project = tempfile::tempdir().unwrap();
+        let infigraph_dir = project.path().join(".infigraph");
+        std::fs::create_dir_all(&infigraph_dir).unwrap();
+        std::fs::write(
+            infigraph_dir.join(format!(
+                "{}2147483600.1",
+                crate::graph::names::OPEN_SENTINEL_PREFIX
+            )),
+            r#"{"pid":2147483600,"started_at":1}"#,
+        )
+        .unwrap();
+        let refusal = crate::recovery::settle_open_deaths(
+            &infigraph_dir,
+            crate::graph::names::STEM,
+            &|_, _| crate::quarantine::WalRecovery::Indeterminate,
+        )
+        .expect_err("an undecided probe refuses the open");
+        let wrapped = Err::<(), _>(refusal)
+            .context("the graph could not be checked just now")
+            .unwrap_err();
+        record_if_fault(&infigraph_dir, &wrapped, FaultClass::of_open_failure);
+        assert!(
+            crate::daemon::writes::blocking_fault(&infigraph_dir, &WriteRequest::FullReindex)
+                .is_none(),
+            "a wrapped undecided refusal must not latch: {wrapped:#}"
+        );
+    }
+
+    /// The daemon's own open, end to end: the error `CodeIndex::init` really
+    /// returns for an undecided probe goes through `note_open`. Nothing may
+    /// latch, so a rebuild and an ordinary write are both admitted.
+    #[test]
+    fn an_undecided_init_refusal_latches_no_fault_at_the_daemon() {
+        use crate::probe::{test_seam, Probe};
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path();
+        let infigraph_dir = root.join(".infigraph");
+        std::fs::create_dir_all(&infigraph_dir).unwrap();
+        drop(
+            crate::graph::GraphStore::open(&infigraph_dir.join(crate::graph::names::STEM)).unwrap(),
+        );
+        std::fs::write(
+            infigraph_dir.join(format!(
+                "{}2147483600.1",
+                crate::graph::names::OPEN_SENTINEL_PREFIX
+            )),
+            r#"{"pid":2147483600,"started_at":1}"#,
+        )
+        .unwrap();
+        let _guard = test_seam::force(Probe::Indeterminate);
+        let mut ig = crate::CodeIndex::open(root, crate::LanguageRegistry::new()).unwrap();
+        let err = ig.init().expect_err("an undecided probe refuses the open");
+
+        let opened = super::super::note_open(root, Err(err));
+        assert!(opened.is_err());
+        assert!(
+            !fault_path(&infigraph_dir).exists(),
+            "an undecided open latches no fault"
+        );
+        assert!(
+            crate::daemon::writes::blocking_fault(&infigraph_dir, &WriteRequest::FullReindex)
+                .is_none(),
+            "a rebuild is admitted"
+        );
+        assert!(
+            crate::daemon::writes::blocking_fault(
+                &infigraph_dir,
+                &WriteRequest::RemoveFiles { files: Vec::new() }
+            )
+            .is_none(),
+            "an ordinary write is admitted"
+        );
     }
 
     #[test]

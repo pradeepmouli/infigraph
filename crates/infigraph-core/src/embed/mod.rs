@@ -74,6 +74,33 @@ pub fn write_generation_marker(sidecar_path: &Path, generation: i64) -> Result<(
     )
 }
 
+/// Moves the generation marker on a no-op update, where `embeddings.bin` keeps
+/// its bytes. The marker is part of [`EmbStamp`], so a sidecar that reflects
+/// the bytes must be re-stamped with the moved identity too: otherwise the
+/// next real edit captures a prior stamp the sidecar never recorded and the
+/// patch declines into a full rebuild (the 45-60s one-file updates in the
+/// daemon log). A sidecar that did not reflect the bytes is left alone.
+fn record_unchanged_generation(emb_path: &Path, index_path: &Path, generation: i64) {
+    let before = EmbStamp::of(emb_path);
+    let _ = write_generation_marker(emb_path, generation);
+    let after = EmbStamp::of(emb_path);
+    if after == before {
+        return;
+    }
+    let meta_path = index_path.with_extension("meta");
+    let Ok(bytes) = std::fs::read(&meta_path) else {
+        return;
+    };
+    let Ok(sidecar) = read_sidecar(&bytes) else {
+        return;
+    };
+    if sidecar.stamp != Some(before) {
+        return;
+    }
+    let ids: Vec<&str> = sidecar.ids.iter().map(String::as_str).collect();
+    let _ = write_sidecar_ids(&meta_path, sidecar.emb_mtime_secs, after, sidecar.dim, &ids);
+}
+
 /// Read the generation `sidecar_path` was last built from, if a marker
 /// exists and is well-formed. `None` means "no generation recorded" --
 /// callers should treat that as "can't judge staleness", never as "stale".
@@ -1047,7 +1074,8 @@ fn update_embeddings_inner(
         // embedding, it now reflects this generation: move the marker, or
         // every body-only edit leaves it reading as stale.
         if reflects_generation && emb_path.exists() {
-            let _ = write_generation_marker(&emb_path, generation);
+            let hnsw_path = root.join(".infigraph").join("hnsw_index.usearch");
+            record_unchanged_generation(&emb_path, &hnsw_path, generation);
         }
         return Ok(count);
     }
@@ -1394,13 +1422,20 @@ fn sync_hnsw(
         let _ = std::fs::remove_file(index_path);
         return HnswSync::Removed;
     }
-    if let Some((delta, prior)) = delta {
-        match patch_hnsw_index(embeddings.len(), delta, prior, index_path, embeddings_path) {
-            Ok(true) => return HnswSync::Updated,
-            Ok(false) => {}
-            Err(e) => eprintln!("warning: HNSW index patch failed ({e:#}), rebuilding it"),
+    let reason = match delta {
+        None => "a full sync: every vector is taken as changed".to_string(),
+        Some((delta, prior)) => {
+            match patch_hnsw_index(embeddings.len(), delta, prior, index_path, embeddings_path) {
+                Ok(Patch::Patched) => return HnswSync::Updated,
+                Ok(Patch::Declined(reason)) => reason,
+                Err(e) => {
+                    eprintln!("warning: HNSW index patch failed ({e:#}), rebuilding it");
+                    format!("the patch failed: {e:#}")
+                }
+            }
         }
-    }
+    };
+    note_hnsw_rebuild(&reason, embeddings.len());
     if let Err(e) = build_hnsw_index(embeddings, index_path, embeddings_path) {
         eprintln!("warning: HNSW index build failed ({e}), vector search will use brute-force");
         crate::last_run::note("HNSW index not built", 1, &format!("{e:#}"));
@@ -1408,11 +1443,28 @@ fn sync_hnsw(
     HnswSync::Rebuilt
 }
 
-/// Applies `delta` to the index on disk. `Ok(false)` means "not patchable,
-/// rebuild": no index, one that does not reflect the previous
-/// `embeddings.bin`, a different dimension, too many changes or holes, or
-/// live ids that do not add up to `live_after` (so the sidecar and the new
-/// embeddings disagree about what changed).
+/// Whether [`patch_hnsw_index`] applied the delta, or why it would not, so the
+/// rebuild that follows can say what forced it.
+enum Patch {
+    Patched,
+    Declined(String),
+}
+
+/// Every rebuild says why it happened, and counts them for the process, so a
+/// slow write in the daemon log names its cause instead of looking random.
+fn note_hnsw_rebuild(reason: &str, vectors: usize) {
+    static REBUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = REBUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    eprintln!(
+        "[hnsw] rebuilding the index over {vectors} vectors (rebuild #{n} this process): {reason}"
+    );
+}
+
+/// Applies `delta` to the index on disk. `Declined` means "not patchable,
+/// rebuild", with the reason: no index, one that does not reflect the
+/// previous `embeddings.bin`, a different dimension, too many changes or
+/// holes, or live ids that do not add up to `live_after` (so the sidecar and
+/// the new embeddings disagree about what changed).
 ///
 /// Keys are positions in the sidecar's id list. A removed or replaced id
 /// leaves an empty hole at its key and an added one takes the next key, so
@@ -1423,14 +1475,17 @@ fn patch_hnsw_index(
     prior: EmbStamp,
     index_path: &Path,
     embeddings_path: &Path,
-) -> Result<bool> {
+) -> Result<Patch> {
     let meta_path = index_path.with_extension("meta");
     if !index_path.exists() {
-        return Ok(false);
+        return Ok(Patch::Declined("no index file on disk".into()));
     }
     let sidecar = read_sidecar(&std::fs::read(&meta_path).context("read hnsw sidecar")?)?;
     if sidecar.stamp != Some(prior) {
-        return Ok(false);
+        return Ok(Patch::Declined(format!(
+            "the index reflects a different embeddings.bin (sidecar stamp {:?}, expected {:?})",
+            sidecar.stamp, prior
+        )));
     }
     let dim = sidecar.dim;
     let mut ids = sidecar.ids;
@@ -1441,10 +1496,16 @@ fn patch_hnsw_index(
         .map(|(key, id)| (id.clone(), key))
         .collect();
     let changes = delta.upserted.len() + delta.removed.len();
-    if delta.upserted.iter().any(|(_, v)| v.len() != dim)
-        || changes * HNSW_PATCH_LIMIT_DIVISOR > key_of.len()
-    {
-        return Ok(false);
+    if delta.upserted.iter().any(|(_, v)| v.len() != dim) {
+        return Ok(Patch::Declined(format!(
+            "a vector's dimension differs from the index's ({dim})"
+        )));
+    }
+    if changes * HNSW_PATCH_LIMIT_DIVISOR > key_of.len() {
+        return Ok(Patch::Declined(format!(
+            "{changes} changed vectors exceed 1/{HNSW_PATCH_LIMIT_DIVISOR} of the {} indexed",
+            key_of.len()
+        )));
     }
 
     let index = UsearchIndex::new(&hnsw_opts(dim)).map_err(|e| anyhow::anyhow!("usearch: {e}"))?;
@@ -1484,8 +1545,17 @@ fn patch_hnsw_index(
         key_of.insert(id.to_string(), key);
     }
     let holes = ids.len() - key_of.len();
-    if key_of.len() != live_after || holes * HNSW_PATCH_LIMIT_DIVISOR > key_of.len() {
-        return Ok(false);
+    if key_of.len() != live_after {
+        return Ok(Patch::Declined(format!(
+            "{} live ids after the patch, but the embeddings hold {live_after}",
+            key_of.len()
+        )));
+    }
+    if holes * HNSW_PATCH_LIMIT_DIVISOR > key_of.len() {
+        return Ok(Patch::Declined(format!(
+            "{holes} holes exceed 1/{HNSW_PATCH_LIMIT_DIVISOR} of the {} live vectors",
+            key_of.len()
+        )));
     }
 
     let tmp_index_path = atomic_tmp_path(index_path);
@@ -1503,7 +1573,7 @@ fn patch_hnsw_index(
         dim,
         &ids.iter().map(String::as_str).collect::<Vec<_>>(),
     )?;
-    Ok(true)
+    Ok(Patch::Patched)
 }
 
 /// Invalidate the HNSW cache.
@@ -2118,6 +2188,54 @@ mod hnsw_freshness_tests {
                 top(&index, &emb, &[0.0, 0.0, round as f32 + 2.0, 1.0]),
                 [id]
             );
+        }
+    }
+
+    /// Regression for the bimodal daemon log (1s patched, 45-60s rebuilt): a
+    /// no-op update moves the generation marker while `embeddings.bin` keeps
+    /// its bytes. The next real edit captures its prior stamp AFTER that
+    /// move, so the sidecar's stamp no longer matches and the patch declined,
+    /// forcing a full rebuild for a one-file change.
+    #[test]
+    fn a_marker_only_move_keeps_the_index_patchable() {
+        let (_d, index, emb, _prior) = indexed_sixty();
+        record_unchanged_generation(&emb, &index, 7);
+        assert!(
+            hnsw_index_current(&index, &emb),
+            "a no-op must not invalidate the index"
+        );
+        let prior = EmbStamp::of(&emb);
+        let (all, upserted, removed) = edited_sixty(&emb);
+        let delta = HnswDelta {
+            upserted: &upserted,
+            removed: &removed,
+        };
+        assert_eq!(
+            sync_hnsw_index_delta(&all, &delta, prior, &index, &emb, PATCH_THRESHOLD),
+            HnswSync::Updated,
+            "a one-file edit after a no-op must patch, not rebuild"
+        );
+    }
+
+    /// A rebuild is only diagnosable if the decline says what forced it.
+    #[test]
+    fn a_declined_patch_says_why() {
+        let (_d, index, emb, prior) = indexed_sixty();
+        let (all, upserted, removed) = edited_sixty(&emb);
+        let delta = HnswDelta {
+            upserted: &upserted,
+            removed: &removed,
+        };
+        let stale = EmbStamp {
+            nanos: prior.nanos + 1,
+            ..prior
+        };
+        match patch_hnsw_index(all.len(), &delta, stale, &index, &emb).unwrap() {
+            Patch::Declined(reason) => assert!(
+                reason.contains("different embeddings.bin"),
+                "named: {reason}"
+            ),
+            Patch::Patched => panic!("a stale stamp must decline"),
         }
     }
 

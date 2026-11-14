@@ -67,6 +67,40 @@ impl std::fmt::Display for GraphCorruption {
 
 impl std::error::Error for GraphCorruption {}
 
+/// The open was refused because the probe that decides a graph (after an
+/// earlier opener died inside the open) could not decide: its child was
+/// killed, could not start, or ran out of time. Nothing is known to be wrong
+/// with the graph, and nothing was quarantined.
+///
+/// Not a fault, and not retried in place: the caller refuses this open and
+/// leaves the death record for the next open to ask again. Built in one
+/// place, and found anywhere in an error's chain by [`is_undecided_open`],
+/// so context wrapped around it cannot hide it.
+#[derive(Debug)]
+pub struct UndecidedOpen {
+    pub graph: String,
+}
+
+impl std::fmt::Display for UndecidedOpen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the graph {} could not be checked just now: the probe that decides it could not \
+             finish (killed, could not start, or ran past its time budget), so nothing was \
+             decided and it was NOT quarantined",
+            self.graph
+        )
+    }
+}
+
+impl std::error::Error for UndecidedOpen {}
+
+/// Whether `err` is, or wraps, an [`UndecidedOpen`].
+pub fn is_undecided_open(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|e| e.downcast_ref::<UndecidedOpen>().is_some())
+}
+
 /// Reason a read was served from something other than the live graph.
 #[derive(Debug, Clone)]
 pub enum DegradeReason {
@@ -576,7 +610,16 @@ pub fn is_storage_version_mismatch_error(err: &anyhow::Error) -> bool {
 /// `open_combined_graph`); `CodeIndex::init` distinguishes the classes
 /// itself because it retries the transient one.
 pub fn open_failure_is_not_corruption(err: &anyhow::Error) -> bool {
-    is_transient_open_error(err) || is_storage_version_mismatch_error(err)
+    open_failure_is_not_a_fault(err) || is_storage_version_mismatch_error(err)
+}
+
+/// An open failure that is not a fault. Two lists, and they point at each
+/// other: [`is_transient_open_error`] is retried in place, and
+/// [`is_undecided_open`] is not retried at all (its probe is the expensive
+/// part, and asking again in the same call decides nothing). Every "is this a
+/// fault?" and "is this corruption?" decision goes through this one function.
+pub fn open_failure_is_not_a_fault(err: &anyhow::Error) -> bool {
+    is_transient_open_error(err) || is_undecided_open(err)
 }
 
 /// lbug refuses a read-only open while a writer's checkpoint is running
@@ -589,10 +632,11 @@ pub fn is_checkpoint_in_progress_error(err: &anyhow::Error) -> bool {
     err.to_string().contains("checkpoint is in progress")
 }
 
-/// The one list of open failures worth retrying: another process holds the
-/// file lock, a live writer is mid-checkpoint, or the WAL is being rotated
-/// under a concurrent open. Every retry loop and every "is this corruption?"
-/// decision consults this, never its parts.
+/// The one list of open failures worth retrying in place: another process
+/// holds the file lock, a live writer is mid-checkpoint, or the WAL is being
+/// rotated under a concurrent open. Every retry loop consults this, never its
+/// parts. The other list is [`is_undecided_open`], which is deliberately not
+/// retried in place; [`open_failure_is_not_a_fault`] is both together.
 pub fn is_transient_open_error(err: &anyhow::Error) -> bool {
     is_lock_contention_error(err)
         || is_checkpoint_in_progress_error(err)
@@ -968,7 +1012,7 @@ impl GraphStore {
     /// the "probe says no" branch and the interesting one would be unreachable.
     pub(crate) fn open_read_only_or_degrade_with(
         path: &Path,
-        probe: impl Fn(&Path) -> bool,
+        probe: impl Fn(&Path) -> crate::probe::Probe,
     ) -> Result<(Self, Option<DegradeReason>)> {
         let infigraph_dir = path.parent().ok_or_else(|| {
             anyhow::anyhow!("graph path {} has no parent directory", path.display())
@@ -1034,11 +1078,22 @@ impl GraphStore {
                     // `AlreadyHealthy`, where the WAL is legitimately still
                     // there. Dropping the lock first would put the graph back
                     // into the exact shape that sent us down this branch.
+                    crate::degraded::clear_open_undecided(infigraph_dir);
                     let store = Self::open_read_only(path)?;
                     drop(graph_lock);
                     return Ok((store, None));
                 }
+                if verdict == crate::quarantine::WalRecovery::Indeterminate {
+                    // Nothing was decided and the WAL is back in place: refuse
+                    // this read, leave the graph alone, and let the caller retry.
+                    crate::degraded::report_open_undecided(infigraph_dir);
+                    drop(graph_lock);
+                    return Err(anyhow::Error::new(UndecidedOpen {
+                        graph: path.display().to_string(),
+                    }));
+                }
                 debug_assert!(verdict.permits_quarantine());
+                crate::degraded::clear_open_undecided(infigraph_dir);
                 crate::quarantine::quarantine_graph(infigraph_dir, &graph_name)?;
                 crate::recovery::mark_recovery_needed(infigraph_dir, pid, path)?;
                 drop(graph_lock);
@@ -2729,8 +2784,119 @@ mod tests {
     /// a test binary is libtest -- it would re-run this whole suite per call.
     /// Same open path the real probe child takes, so the dead-holder guard
     /// behaves identically.
-    fn in_process_probe(graph: &Path) -> bool {
-        GraphStore::open_read_only(graph).is_ok()
+    fn in_process_probe(graph: &Path) -> crate::probe::Probe {
+        if GraphStore::open_read_only(graph).is_ok() {
+            crate::probe::Probe::Opens
+        } else {
+            crate::probe::Probe::DoesNotOpen
+        }
+    }
+
+    /// Every file in `dir` with its bytes, sorted, leaving out `skip` (the
+    /// graph's lock file: recovery rewrites its payload, and it holds no graph
+    /// data).
+    fn dir_snapshot(dir: &Path, skip: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut out: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p != skip)
+            .map(|p| {
+                let bytes = std::fs::read(&p).unwrap_or_default();
+                (p, bytes)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A dead-holder graph with a WAL, as an earlier crash leaves it: the state
+    /// that sends the read path to its probe. Returns the project root (the
+    /// parent of `.infigraph`), the graph path and the lock path.
+    fn dead_holder_graph() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let project = tempfile::tempdir().unwrap();
+        let infigraph_dir = project.path().join(".infigraph");
+        std::fs::create_dir_all(&infigraph_dir).unwrap();
+        let db_path = infigraph_dir.join(crate::graph::names::STEM);
+        std::fs::write(&db_path, vec![0u8; 37]).unwrap();
+        std::fs::write(
+            infigraph_dir.join(crate::graph::names::sibling(".wal")),
+            b"wal",
+        )
+        .unwrap();
+        let lock_path = db_lock_path(&db_path);
+        write_holder_lock(&lock_path, DEAD_PID);
+        (project, db_path, lock_path)
+    }
+
+    /// An undecided probe (killed, could not start, out of time) refuses the
+    /// read, moves nothing, and reports `open-undecided` for the project. The
+    /// graph's files are byte-identical afterwards.
+    #[test]
+    fn open_read_only_or_degrade_refuses_an_undecided_probe_and_leaves_the_graph_unchanged() {
+        use crate::probe::Probe;
+        let (project, db_path, lock_path) = dead_holder_graph();
+        let infigraph_dir = db_path.parent().unwrap().to_path_buf();
+        let before = dir_snapshot(&infigraph_dir, &lock_path);
+
+        let err = GraphStore::open_read_only_or_degrade_with(&db_path, |_| Probe::Indeterminate)
+            .err()
+            .expect("an undecided probe must refuse the read");
+
+        assert!(is_undecided_open(&err), "the typed error: {err:#}");
+        assert!(format!("{err:#}").contains("NOT quarantined"), "{err:#}");
+        assert_eq!(
+            dir_snapshot(&infigraph_dir, &lock_path),
+            before,
+            "an undecided probe must not move, write or create a graph file"
+        );
+        let modes = crate::degraded::live::for_root(project.path());
+        assert!(
+            modes.iter().any(|n| n.key == "open-undecided"),
+            "the refusal must say so through degraded mode: {modes:?}"
+        );
+        crate::degraded::clear_open_undecided(&infigraph_dir);
+    }
+
+    /// The classes an undecided open falls in. `verify` shows an open that is
+    /// not a fault as a WARN, and its arm asks [`open_failure_is_not_a_fault`],
+    /// so the decision is pinned here: not a fault, not retried in place, not
+    /// corruption. `verify`'s own open never probes, so this is the only place
+    /// that refusal's classification is checked end to end.
+    #[test]
+    fn an_undecided_open_is_not_a_fault_and_not_retried_in_place() {
+        let err = anyhow::Error::new(UndecidedOpen {
+            graph: "code.kuzu".to_string(),
+        });
+        assert!(open_failure_is_not_a_fault(&err));
+        assert!(!is_transient_open_error(&err));
+        assert!(is_undecided_open(&err));
+        assert!(open_failure_is_not_corruption(&err));
+    }
+
+    /// A process that cannot probe at all (`Unavailable`) decides exactly as it
+    /// did before probes could be undecided: the graph is quarantined, as with a
+    /// probe that says "does not open". No undecided mode is reported.
+    #[test]
+    fn open_read_only_or_degrade_treats_an_unavailable_probe_as_does_not_open() {
+        use crate::probe::Probe;
+        let (project, db_path, _lock_path) = dead_holder_graph();
+
+        let result = GraphStore::open_read_only_or_degrade_with(&db_path, |_| Probe::Unavailable);
+
+        assert!(
+            !db_path.exists(),
+            "an unavailable probe quarantines, as a does-not-open verdict does"
+        );
+        let shown = format!("{:?}", result.err());
+        assert!(
+            !shown.contains("could not be checked"),
+            "an unavailable probe is not an undecided one: {shown}"
+        );
+        let modes = crate::degraded::live::for_root(project.path());
+        assert!(
+            !modes.iter().any(|n| n.key == "open-undecided"),
+            "{modes:?}"
+        );
     }
 
     /// A graph the probe opens AS IT STANDS must never be quarantined, even

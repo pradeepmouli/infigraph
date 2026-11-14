@@ -351,7 +351,12 @@ pub fn settle_open_deaths(
          error); checking it before opening again",
         deaths.len()
     );
-    match recover(infigraph_dir, graph_name) {
+    let verdict = recover(infigraph_dir, graph_name);
+    match verdict {
+        WalRecovery::Indeterminate => crate::degraded::report_open_undecided(infigraph_dir),
+        _ => crate::degraded::clear_open_undecided(infigraph_dir),
+    }
+    match verdict {
         WalRecovery::Recovered => Ok(()),
         WalRecovery::NotRecoverable => {
             Err(anyhow::Error::new(crate::graph::GraphCorruption {
@@ -373,6 +378,11 @@ pub fn settle_open_deaths(
             )
         }
         WalRecovery::AlreadyHealthy => Ok(()),
+        // Undecided: refuse this open for now. The death record is kept (it
+        // is not folded or cleared), so the next open asks again.
+        WalRecovery::Indeterminate => Err(anyhow::Error::new(crate::graph::UndecidedOpen {
+            graph: graph_name.to_string(),
+        })),
     }
 }
 
