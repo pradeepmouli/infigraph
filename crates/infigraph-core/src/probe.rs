@@ -87,18 +87,17 @@ pub fn run_if_probe_child() -> bool {
 /// node data, decided in a child process so a damaged file cannot take this
 /// one down.
 ///
-/// A probe that cannot be spawned at all returns `false`: "unknown" must not
-/// masquerade as "healthy" on a path whose whole job is deciding whether to
-/// keep the caller's data.
+/// A process that cannot run a probe at all gets [`Probe::Unavailable`], not
+/// `Indeterminate`: no retry can ever decide, so "retry shortly" would be false.
 pub fn graph_opens(graph_path: &Path) -> Probe {
     // Never re-invoke an executable that does not handle PROBE_ENV; a test
     // binary would re-run its whole suite. See PROBE_CAPABLE. Not being able
     // to ask is not an answer about the graph.
     if !PROBE_CAPABLE.load(std::sync::atomic::Ordering::Relaxed) {
-        return Probe::Indeterminate;
+        return Probe::Unavailable;
     }
     let Ok(exe) = std::env::current_exe() else {
-        return Probe::Indeterminate;
+        return Probe::Unavailable;
     };
     let mut cmd = std::process::Command::new(exe);
     cmd.env(PROBE_ENV, graph_path)
@@ -131,6 +130,12 @@ pub enum Probe {
     /// Nothing was learned: the probe did not start, was killed from outside,
     /// or ran past [`PROBE_TIMEOUT`]. The caller must not quarantine.
     Indeterminate,
+    /// This process cannot run a probe at all: it never declared itself
+    /// probe-capable ([`run_if_probe_child`]), or it cannot name its own
+    /// executable. No retry can change that, so it is not "could not be
+    /// checked just now". Every caller decides exactly as it did before probes
+    /// could be undecided, which is as [`Probe::DoesNotOpen`].
+    Unavailable,
 }
 
 /// How long a probe may run before it is stopped. A probe opens the graph and

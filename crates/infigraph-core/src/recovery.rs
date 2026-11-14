@@ -351,7 +351,12 @@ pub fn settle_open_deaths(
          error); checking it before opening again",
         deaths.len()
     );
-    match recover(infigraph_dir, graph_name) {
+    let verdict = recover(infigraph_dir, graph_name);
+    match verdict {
+        WalRecovery::Indeterminate => crate::degraded::report_open_undecided(infigraph_dir),
+        _ => crate::degraded::clear_open_undecided(infigraph_dir),
+    }
+    match verdict {
         WalRecovery::Recovered => Ok(()),
         WalRecovery::NotRecoverable => {
             Err(anyhow::Error::new(crate::graph::GraphCorruption {
@@ -376,11 +381,16 @@ pub fn settle_open_deaths(
         // Undecided: refuse this open for now. The death record is kept (it
         // is not folded or cleared), so the next open asks again.
         WalRecovery::Indeterminate => anyhow::bail!(
-            "opening {graph_name} is refused for now: the probe that checks it after an earlier \
-             death could not finish, so nothing was decided and the record is kept"
+            "opening {graph_name} is refused for now: {UNDECIDED_OPEN_PHRASE}, so nothing was \
+             decided and the record is kept"
         ),
     }
 }
+
+/// The reason an open is refused while its probe is undecided. The refusal
+/// message and `graph::store::is_undecided_open_error` both read it here.
+pub const UNDECIDED_OPEN_PHRASE: &str =
+    "the probe that checks it after an earlier death could not finish";
 
 /// Most recent cleanly-retired healthy graph for `graph_name`, if any --
 /// the degrade fallback (R3.1.4b).

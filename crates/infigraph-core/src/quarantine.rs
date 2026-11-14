@@ -166,7 +166,7 @@ pub fn try_recover_by_setting_wal_aside_with(
     match probe(&source) {
         Probe::Opens => return WalRecovery::AlreadyHealthy,
         Probe::Indeterminate => return WalRecovery::Indeterminate,
-        Probe::DoesNotOpen => {}
+        Probe::DoesNotOpen | Probe::Unavailable => {}
     }
 
     let wal_paths = crate::graph::wal_family_paths(&source);
@@ -217,7 +217,7 @@ pub fn try_recover_by_setting_wal_aside_with(
     }
     match verdict {
         Probe::Indeterminate => WalRecovery::Indeterminate,
-        Probe::DoesNotOpen | Probe::Opens => WalRecovery::NotRecoverable,
+        Probe::DoesNotOpen | Probe::Unavailable | Probe::Opens => WalRecovery::NotRecoverable,
     }
 }
 

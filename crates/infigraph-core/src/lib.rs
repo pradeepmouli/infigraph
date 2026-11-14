@@ -596,6 +596,7 @@ impl CodeIndex {
                                     &name.to_string_lossy(),
                                 ) {
                                     WalRecovery::Recovered => {
+                                        crate::degraded::clear_open_undecided(parent);
                                         let kb = crate::graph::KuzuBackend::open(&self.db_path)?;
                                         self.backend_kind = BackendKind::Kuzu(kb);
                                         return Ok(());
@@ -612,6 +613,7 @@ impl CodeIndex {
                                     // against an image that demonstrably works.
                                     // Refuse rather than destroy it.
                                     WalRecovery::AlreadyHealthy => {
+                                        crate::degraded::clear_open_undecided(parent);
                                         return Err(last_err).context(format!(
                                             "the graph at {} did not open here, but a fresh \
                                              probe process opened AND scanned it successfully \
@@ -628,6 +630,7 @@ impl CodeIndex {
                                     // has shown to be bad, so refuse the open
                                     // transiently and leave the attempt uncounted.
                                     WalRecovery::Indeterminate => {
+                                        crate::degraded::report_open_undecided(parent);
                                         return Err(last_err).context(format!(
                                             "the graph at {} could not be checked just now (its \
                                              probe process was killed, could not start, or ran \
@@ -636,7 +639,9 @@ impl CodeIndex {
                                             self.db_path.display()
                                         ));
                                     }
-                                    WalRecovery::NotRecoverable => {}
+                                    WalRecovery::NotRecoverable => {
+                                        crate::degraded::clear_open_undecided(parent);
+                                    }
                                 }
                             }
                         }

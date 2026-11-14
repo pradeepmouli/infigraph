@@ -27,6 +27,8 @@ pub const GRAPH_HELD_BY_WRITER: &str = "graph-held-by-writer";
 /// The start of every `GraphHeldByWriter` message. A client that times out
 /// on a write looks for it in the daemon's status to name the holder.
 pub const HELD_BY_WRITER_PHRASE: &str = "the graph is held by ";
+/// The graph could not be decided on just now (see `DegradedMode::OpenUndecided`).
+pub const OPEN_UNDECIDED: &str = "open-undecided";
 pub const REINDEX_WAITING_FOR_SLOT: &str = "reindex-waiting-for-slot";
 pub const CLONE_BODIES_UNAVAILABLE: &str = "clone-bodies-unavailable";
 pub const CLONE_BODIES_PARTIAL: &str = "clone-bodies-partial";
@@ -112,6 +114,10 @@ pub enum DegradedMode {
     /// (`graph::id_scheme`). An incremental index cannot adopt it a file at a
     /// time, so the daemon rebuilds it whole.
     IdsOutdated,
+    /// A probe of the graph was killed, could not start, or ran past its time
+    /// budget, so nothing is known about the graph. The open was refused and
+    /// the graph was left exactly as it was; the next open asks again.
+    OpenUndecided,
     /// A SCIP import met object-literal members in a process that had no
     /// language registry to ask who owns them, so they got the indexer's
     /// counter-suffixed names (`semi0`) instead of `file::Const::semi`.
@@ -160,6 +166,7 @@ impl DegradedMode {
             DegradedMode::DocLinksUnscanned { .. } => DOC_LINKS_UNSCANNED,
             DegradedMode::DocSyncUnknown { .. } => DOC_SYNC_UNKNOWN,
             DegradedMode::IdsOutdated => IDS_OUTDATED,
+            DegradedMode::OpenUndecided => OPEN_UNDECIDED,
             DegradedMode::ScipLiteralOwnersUnavailable => SCIP_LITERAL_OWNERS_UNAVAILABLE,
             DegradedMode::SessionsUnreadable { .. } => SESSIONS_UNREADABLE,
             DegradedMode::ScipUnknownLanguage { .. } => SCIP_UNKNOWN_LANGUAGE,
@@ -276,6 +283,10 @@ impl DegradedMode {
                  infigraph: a full rebuild is queued, and until it ends a saved id or a \
                  glossary key may name nothing"
                 .to_string(),
+            DegradedMode::OpenUndecided => "the graph could not be checked just now (its probe \
+                 was killed, could not start, or ran out of time), so this open was refused and \
+                 nothing was changed"
+                .to_string(),
             DegradedMode::ScipLiteralOwnersUnavailable => "a SCIP import named object-literal \
                  members without knowing their owners (no language registry in this process): \
                  they carry the indexer's counter, e.g. `semi0`, until the next import"
@@ -349,6 +360,10 @@ impl DegradedMode {
             }
             DegradedMode::IdsOutdated => {
                 "the rebuild starts by itself; `infigraph index --full` starts it now"
+            }
+            DegradedMode::OpenUndecided => {
+                "retry the command; the graph is unchanged. If it keeps happening, check that \
+                 the machine is not short of memory, then `infigraph rebuild`"
             }
             DegradedMode::ScipLiteralOwnersUnavailable => {
                 "import through `infigraph scip-enrich` or the daemon, which load the language \
@@ -548,6 +563,24 @@ pub fn merge_with_daemon(local: Vec<Notice>, from_daemon: Option<FromDaemon>) ->
         .filter(|n| !from_daemon.judged.contains(&n.key))
         .collect();
     merge(local, from_daemon.notices)
+}
+
+/// Reports that the graph under `infigraph_dir` could not be decided on: a
+/// probe of it was killed, could not start, or ran out of time. The one helper
+/// every refusal on an undecided probe goes through, so the three sites name
+/// the same mode.
+pub fn report_open_undecided(infigraph_dir: &std::path::Path) {
+    if let Some(root) = infigraph_dir.parent() {
+        live::set(root, DegradedMode::OpenUndecided);
+    }
+}
+
+/// Clears [`report_open_undecided`]: the graph under `infigraph_dir` was
+/// decided on by the open that just ran.
+pub fn clear_open_undecided(infigraph_dir: &std::path::Path) {
+    if let Some(root) = infigraph_dir.parent() {
+        live::clear(root, OPEN_UNDECIDED);
+    }
 }
 
 /// `base` with `over` folded in by key: a notice in `over` replaces the one

@@ -228,6 +228,38 @@ mod tests {
         assert!(!FaultClass::DiskFull.admits(&WriteRequest::FullReindex));
     }
 
+    /// A rebuild builds beside the old graph and never opens it, so an open
+    /// the probe could not decide must not stop one. Here an opener died
+    /// inside the open (its sentinel names a pid that is gone), and the probe
+    /// after it is undecided: the open is refused, and the refusal must not
+    /// block a `FullReindex` at the client.
+    #[test]
+    fn a_rebuild_is_admitted_after_an_undecided_open_death_probe() {
+        let project = tempfile::tempdir().unwrap();
+        let infigraph_dir = project.path().join(".infigraph");
+        std::fs::create_dir_all(&infigraph_dir).unwrap();
+        std::fs::write(
+            infigraph_dir.join(format!(
+                "{}2147483600.1",
+                crate::graph::names::OPEN_SENTINEL_PREFIX
+            )),
+            r#"{"pid":2147483600,"started_at":1}"#,
+        )
+        .unwrap();
+        let refusal = crate::recovery::settle_open_deaths(
+            &infigraph_dir,
+            crate::graph::names::STEM,
+            &|_, _| crate::quarantine::WalRecovery::Indeterminate,
+        )
+        .expect_err("an undecided probe refuses the open");
+        record_if_fault(&infigraph_dir, &refusal, FaultClass::of_open_failure);
+        assert!(
+            crate::daemon::writes::blocking_fault(&infigraph_dir, &WriteRequest::FullReindex)
+                .is_none(),
+            "a rebuild must be admitted past an undecided open: {refusal:#}"
+        );
+    }
+
     #[test]
     fn ordinary_and_transient_failures_are_not_faults() {
         assert_eq!(

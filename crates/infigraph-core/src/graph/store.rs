@@ -589,14 +589,24 @@ pub fn is_checkpoint_in_progress_error(err: &anyhow::Error) -> bool {
     err.to_string().contains("checkpoint is in progress")
 }
 
+/// The open refused while the probe that decides a graph after an earlier
+/// death is undecided (`recovery::settle_open_deaths`). Nothing is known to
+/// be wrong with the graph, and the death record is kept for the next open to
+/// ask again, so it is retried like the others and never latched as a fault.
+pub fn is_undecided_open_error(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .contains(crate::recovery::UNDECIDED_OPEN_PHRASE)
+}
+
 /// The one list of open failures worth retrying: another process holds the
-/// file lock, a live writer is mid-checkpoint, or the WAL is being rotated
-/// under a concurrent open. Every retry loop and every "is this corruption?"
-/// decision consults this, never its parts.
+/// file lock, a live writer is mid-checkpoint, the WAL is being rotated
+/// under a concurrent open, or a probe is undecided. Every retry loop and
+/// every "is this corruption?" decision consults this, never its parts.
 pub fn is_transient_open_error(err: &anyhow::Error) -> bool {
     is_lock_contention_error(err)
         || is_checkpoint_in_progress_error(err)
         || is_transient_wal_open_race_error(err)
+        || is_undecided_open_error(err)
 }
 
 /// Context line for a lock-contention open failure, naming the holder
@@ -1034,6 +1044,7 @@ impl GraphStore {
                     // `AlreadyHealthy`, where the WAL is legitimately still
                     // there. Dropping the lock first would put the graph back
                     // into the exact shape that sent us down this branch.
+                    crate::degraded::clear_open_undecided(infigraph_dir);
                     let store = Self::open_read_only(path)?;
                     drop(graph_lock);
                     return Ok((store, None));
@@ -1041,6 +1052,7 @@ impl GraphStore {
                 if verdict == crate::quarantine::WalRecovery::Indeterminate {
                     // Nothing was decided and the WAL is back in place: refuse
                     // this read, leave the graph alone, and let the caller retry.
+                    crate::degraded::report_open_undecided(infigraph_dir);
                     drop(graph_lock);
                     anyhow::bail!(
                         "graph {} could not be checked just now (its probe process was killed, \
@@ -1049,6 +1061,7 @@ impl GraphStore {
                     );
                 }
                 debug_assert!(verdict.permits_quarantine());
+                crate::degraded::clear_open_undecided(infigraph_dir);
                 crate::quarantine::quarantine_graph(infigraph_dir, &graph_name)?;
                 crate::recovery::mark_recovery_needed(infigraph_dir, pid, path)?;
                 drop(graph_lock);
@@ -2745,6 +2758,96 @@ mod tests {
         } else {
             crate::probe::Probe::DoesNotOpen
         }
+    }
+
+    /// Every file in `dir` with its bytes, sorted, leaving out `skip` (the
+    /// graph's lock file: recovery rewrites its payload, and it holds no graph
+    /// data).
+    fn dir_snapshot(dir: &Path, skip: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut out: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p != skip)
+            .map(|p| {
+                let bytes = std::fs::read(&p).unwrap_or_default();
+                (p, bytes)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A dead-holder graph with a WAL, as an earlier crash leaves it: the state
+    /// that sends the read path to its probe. Returns the project root (the
+    /// parent of `.infigraph`), the graph path and the lock path.
+    fn dead_holder_graph() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let project = tempfile::tempdir().unwrap();
+        let infigraph_dir = project.path().join(".infigraph");
+        std::fs::create_dir_all(&infigraph_dir).unwrap();
+        let db_path = infigraph_dir.join(crate::graph::names::STEM);
+        std::fs::write(&db_path, vec![0u8; 37]).unwrap();
+        std::fs::write(
+            infigraph_dir.join(crate::graph::names::sibling(".wal")),
+            b"wal",
+        )
+        .unwrap();
+        let lock_path = db_lock_path(&db_path);
+        write_holder_lock(&lock_path, DEAD_PID);
+        (project, db_path, lock_path)
+    }
+
+    /// An undecided probe (killed, could not start, out of time) refuses the
+    /// read, moves nothing, and reports `open-undecided` for the project. The
+    /// graph's files are byte-identical afterwards.
+    #[test]
+    fn open_read_only_or_degrade_refuses_an_undecided_probe_and_leaves_the_graph_unchanged() {
+        use crate::probe::Probe;
+        let (project, db_path, lock_path) = dead_holder_graph();
+        let infigraph_dir = db_path.parent().unwrap().to_path_buf();
+        let before = dir_snapshot(&infigraph_dir, &lock_path);
+
+        let err = GraphStore::open_read_only_or_degrade_with(&db_path, |_| Probe::Indeterminate)
+            .err()
+            .expect("an undecided probe must refuse the read");
+
+        assert!(format!("{err:#}").contains("NOT quarantined"), "{err:#}");
+        assert_eq!(
+            dir_snapshot(&infigraph_dir, &lock_path),
+            before,
+            "an undecided probe must not move, write or create a graph file"
+        );
+        let modes = crate::degraded::live::for_root(project.path());
+        assert!(
+            modes.iter().any(|n| n.key == "open-undecided"),
+            "the refusal must say so through degraded mode: {modes:?}"
+        );
+        crate::degraded::clear_open_undecided(&infigraph_dir);
+    }
+
+    /// A process that cannot probe at all (`Unavailable`) decides exactly as it
+    /// did before probes could be undecided: the graph is quarantined, as with a
+    /// probe that says "does not open". No undecided mode is reported.
+    #[test]
+    fn open_read_only_or_degrade_treats_an_unavailable_probe_as_does_not_open() {
+        use crate::probe::Probe;
+        let (project, db_path, _lock_path) = dead_holder_graph();
+
+        let result = GraphStore::open_read_only_or_degrade_with(&db_path, |_| Probe::Unavailable);
+
+        assert!(
+            !db_path.exists(),
+            "an unavailable probe quarantines, as a does-not-open verdict does"
+        );
+        let shown = format!("{:?}", result.err());
+        assert!(
+            !shown.contains("could not be checked"),
+            "an unavailable probe is not an undecided one: {shown}"
+        );
+        let modes = crate::degraded::live::for_root(project.path());
+        assert!(
+            !modes.iter().any(|n| n.key == "open-undecided"),
+            "{modes:?}"
+        );
     }
 
     /// A graph the probe opens AS IT STANDS must never be quarantined, even
