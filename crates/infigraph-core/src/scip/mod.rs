@@ -843,6 +843,15 @@ fn import_scip_index_unrecorded(
             if is_member_of_known_symbol(scip_sym, &scip_sym_to_file_name) {
                 continue;
             }
+            // A file-level definition -- scip-typescript's `a.ts/` at the file's
+            // start, rust-analyzer's crate root `lib/` -- is a Module row like any
+            // other, and the row is kept on purpose: it is the container of the
+            // file's top-level references. Its out-edges are those references
+            // (`client.ts::client.ts` has seven in the main checkout's graph), and no
+            // IMPORTS edge carries them, so removing the row drops them. Checked on
+            // scip-typescript, scip-tsrs and rust-analyzer output; scip-python (it
+            // crashed here) and scip-go (not installed) were not.
+            //
             // A type parameter or a parameter's own type is not a symbol:
             // no row, so no id for a reference to it to become an edge to.
             if is_parameter_symbol(scip_sym) {
@@ -1440,11 +1449,17 @@ fn import_scip_index_unrecorded(
                     .find(|(start, end, _)| ref_line >= *start && ref_line <= *end)
                     .map(|(_, _, id)| id.clone())
             });
-            let Some(container_id) = container else {
-                continue;
-            };
             let key = metadata::symbol_key(file, &occ.symbol);
             let Some(target_id) = scip_sym_to_ts_id.get(&key).cloned() else {
+                continue;
+            };
+            // A reference that no symbol of the file contains starts no edge. A
+            // top-level one is contained by the file-level definition, which the
+            // definition pass turns into a Module row on purpose (see the note
+            // there); where an indexer gave none, the reference is counted and
+            // nothing is written.
+            let Some(container_id) = container else {
+                stats.references_without_container += 1;
                 continue;
             };
             if container_id == target_id {
@@ -2268,6 +2283,13 @@ pub struct ImportStats {
     pub symbols_skipped: usize,
     pub relations_added: usize,
     pub references_added: usize,
+    /// References whose target this import knows but whose position lies in no
+    /// symbol of the file (no container), so no edge can start there. Dropped
+    /// silently until this counter: a reference at the top level of a file is
+    /// dropped when the file has no file-level definition to contain it (see the
+    /// container lookup in the reference pass). Nothing is written for them.
+    #[serde(default)]
+    pub references_without_container: usize,
     pub corrections_learned: usize,
     /// Every document this SCIP index covered, relative to the project
     /// root. Not filtered down to "only files that actually changed" --
@@ -2330,7 +2352,7 @@ impl std::fmt::Display for ImportStats {
         write!(
             f,
             "enriched {} symbols, {} new symbols, {} references, {} type relationships, \
-             {} corrections learned ({} files processed, {} skipped: no File node{}{})",
+             {} corrections learned ({} files processed, {} skipped: no File node{}{}{})",
             self.symbols_enriched,
             self.symbols_added,
             self.references_added,
@@ -2348,6 +2370,14 @@ impl std::fmt::Display for ImportStats {
             },
             if self.symbols_skipped > 0 {
                 format!(", {} parameter descriptors left out", self.symbols_skipped)
+            } else {
+                String::new()
+            },
+            if self.references_without_container > 0 {
+                format!(
+                    ", {} references with no enclosing symbol left out",
+                    self.references_without_container
+                )
             } else {
                 String::new()
             },
@@ -3706,6 +3736,126 @@ mod tests {
         std::fs::write(&index_path, bytes).unwrap();
         drop(conn); // it borrows `env.store`, which moves out below
         (env, index_path)
+    }
+
+    /// A reference that no symbol of its file contains starts no edge, and is
+    /// counted: `hello()` is called on line 3, outside `hello` (line 1), and the
+    /// file has no file-level definition to contain it.
+    #[test]
+    fn a_reference_no_symbol_contains_is_counted_and_starts_no_edge() {
+        let env = TestEnv::new();
+        env.add_file("test.ts");
+        {
+            let conn = env.store.connection().unwrap();
+            conn.query(
+                "CREATE (:Symbol {id: 'test.ts::hello', name: 'hello', kind: 'function', \
+                 file: 'test.ts', start_line: 1, end_line: 1, signature_hash: '', \
+                 language: 'typescript', visibility: 'public', parent: '', docstring: '', \
+                 complexity: 0, parameters: '', return_type: ''})",
+            )
+            .unwrap();
+        }
+        let hello = "scip-test npm test 1.0.0 `test.ts`/hello().".to_string();
+        let doc = Document {
+            relative_path: "test.ts".to_string(),
+            occurrences: vec![
+                Occurrence {
+                    symbol: hello.clone(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..ranged(RangeForm::Legacy, 0, 9, 14)
+                },
+                // 0-based line 2: the top-level call, outside `hello`'s line 1.
+                Occurrence {
+                    symbol: hello.clone(),
+                    symbol_roles: 0,
+                    ..ranged(RangeForm::Legacy, 2, 0, 5)
+                },
+            ],
+            symbols: vec![SymbolInformation {
+                symbol: hello,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let index = Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let index_path = env._dir.path().join("index.scip");
+        std::fs::write(&index_path, index.write_to_bytes().unwrap()).unwrap();
+
+        let stats = import_scip_index(&index_path, &env.store, None).unwrap();
+        assert_eq!(stats.references_without_container, 1, "{stats:?}");
+        assert_eq!(stats.references_added, 0, "{stats:?}");
+        assert!(
+            edge_pairs(&env, "CALLS", "id").is_empty(),
+            "a reference with no container wrote an edge"
+        );
+        let line = stats.to_string();
+        assert!(
+            line.contains("1 references with no enclosing symbol left out"),
+            "the stats line does not show the count: {line}"
+        );
+    }
+
+    /// A real `fn lib` in `src/lib.rs` has the id `src/lib.rs::lib`, and
+    /// rust-analyzer's crate root (`lib/`, at the file's start) has the same
+    /// name. The real function keeps its id and its kind. Open finding: the import
+    /// does not give the crate root a row of its own (no `#2`); it matches the
+    /// crate root's moniker to the real function and writes the crate root's
+    /// moniker into that function's `scip_id`. The test pins the id and kind,
+    /// which is what must not change, and the single row; the `scip_id` is not asserted.
+    #[test]
+    fn a_crate_root_that_shares_a_real_symbols_name_keeps_the_real_symbol_id() {
+        let env = TestEnv::new();
+        env.add_file("src/lib.rs");
+        {
+            let conn = env.store.connection().unwrap();
+            conn.query(
+                "CREATE (:Symbol {id: 'src/lib.rs::lib', name: 'lib', kind: 'Function', \
+                 file: 'src/lib.rs', start_line: 3, end_line: 3, signature_hash: 'h', \
+                 language: 'rust', visibility: 'public', parent: '', docstring: '', \
+                 complexity: 1, parameters: '', return_type: ''})",
+            )
+            .unwrap();
+        }
+        let root = "rust-analyzer cargo shape 0.1.0 lib/".to_string();
+        let doc = Document {
+            relative_path: "src/lib.rs".to_string(),
+            occurrences: vec![Occurrence {
+                symbol: root.clone(),
+                symbol_roles: SymbolRole::Definition as i32,
+                ..ranged(RangeForm::Legacy, 0, 0, 0)
+            }],
+            symbols: vec![SymbolInformation {
+                symbol: root,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let index = Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let index_path = env._dir.path().join("index.scip");
+        std::fs::write(&index_path, index.write_to_bytes().unwrap()).unwrap();
+
+        import_scip_index(&index_path, &env.store, None).unwrap();
+        let conn = env.store.connection().unwrap();
+        let rows: Vec<(String, String)> = conn
+            .query("MATCH (s:Symbol) WHERE s.file = 'src/lib.rs' RETURN s.id, s.kind ORDER BY s.id")
+            .unwrap()
+            .map(|row| (row[0].to_string(), row[1].to_string()))
+            .collect();
+        assert!(
+            rows.contains(&("src/lib.rs::lib".to_string(), "Function".to_string())),
+            "the real function lost its id or its kind: {rows:?}"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "the crate root made a row of its own: {rows:?}"
+        );
     }
 
     /// `table` edges between symbols, as `(source, target)` values of `prop`.
