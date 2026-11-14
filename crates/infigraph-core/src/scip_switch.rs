@@ -215,6 +215,56 @@ pub fn never_enriched(scip_generation: i64) -> bool {
     scip_generation <= 0
 }
 
+/// The languages a SCIP import ledger leaves behind. A language is behind
+/// when some entry serves it (through `ledger_label_languages`, so a retired
+/// label serves its successor's languages) and no entry serving it records the
+/// current `SCIP_IMPORT_REVISION`. An entry for a superseded indexer therefore
+/// stops mattering as soon as another indexer for the language records the
+/// current revision. A language no entry serves is not behind: "never
+/// enriched for this language" is the business of `never_enriched`, not this.
+pub fn languages_behind(entries: &[crate::scip::LedgerEntry]) -> Vec<String> {
+    use std::collections::BTreeMap;
+    let mut served: BTreeMap<&str, Vec<&crate::scip::LedgerEntry>> = BTreeMap::new();
+    for entry in entries {
+        for language in crate::scip::ledger_label_languages(&entry.label) {
+            served.entry(language).or_default().push(entry);
+        }
+    }
+    served
+        .into_iter()
+        .filter(|(_, serving)| {
+            !serving
+                .iter()
+                .any(|e| e.revision == Some(crate::scip::SCIP_IMPORT_REVISION))
+        })
+        .map(|(language, _)| language.to_string())
+        .collect()
+}
+
+/// The languages the daemon's revision replay re-runs, and the languages
+/// doctor warns about: behind (`languages_behind`), detected in the project,
+/// and enabled (`[scip] disable`). Empty for a graph never enriched
+/// (`never_enriched`), because the replay only brings an enrichment up to
+/// date; it never starts one. One function, so the trigger and doctor cannot
+/// disagree about what is due.
+pub fn replay_languages(
+    root: &Path,
+    scip_generation: i64,
+    entries: &[crate::scip::LedgerEntry],
+    detected: &HashSet<String>,
+) -> Vec<String> {
+    if never_enriched(scip_generation) {
+        return Vec::new();
+    }
+    let behind: HashSet<String> = languages_behind(entries)
+        .into_iter()
+        .filter(|language| detected.contains(language))
+        .collect();
+    let mut languages: Vec<String> = enabled_languages(root, &behind).into_iter().collect();
+    languages.sort();
+    languages
+}
+
 /// Whether `infigraph index` starts SCIP enrichment for `root` when it
 /// finishes: on a full reindex, and on any index of a graph that was never
 /// enriched (`never_enriched`, given the graph's SCIP generation). An

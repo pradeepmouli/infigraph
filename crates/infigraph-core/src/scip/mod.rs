@@ -157,7 +157,7 @@ fn scip_ledger_path(infigraph_dir: &Path) -> std::path::PathBuf {
 // 2: a type reference becomes a REFERENCES edge (it was dropped). The replay
 // only adds those; the CALLS edges an earlier import wrote are not removed,
 // because tree-sitter also writes CALLS to a class for a constructor call.
-const SCIP_IMPORT_REVISION: u64 = 2;
+pub const SCIP_IMPORT_REVISION: u64 = 2;
 
 /// The language tags each SCIP indexer serves, by indexer binary: the one
 /// table both the CLI's download catalog (`scip_download::CATALOG`) and the
@@ -176,6 +176,13 @@ pub const INDEXER_LANGUAGES: &[(&str, &[&str])] = &[
     ("scip-php", &["php"]),
 ];
 
+/// Ledger labels of an indexer this build no longer ships, each mapped to the
+/// label that replaced it. Only the ledger rule reads it
+/// ([`ledger_label_languages`]); the catalog and `[scip] disable` do not.
+/// A future indexer swap adds a row here. Each successor must be in
+/// `INDEXER_LANGUAGES` (a test holds that), so its languages are listed once.
+pub const RETIRED_LABELS: &[(&str, &str)] = &[("scip-typescript", "scip-tsrs")];
+
 /// The language tags `binary_name` serves, or none for an indexer the table
 /// does not list.
 pub fn indexer_languages(binary_name: &str) -> &'static [&'static str] {
@@ -183,6 +190,20 @@ pub fn indexer_languages(binary_name: &str) -> &'static [&'static str] {
         .iter()
         .find(|(binary, _)| *binary == binary_name)
         .map_or(&[], |(_, tags)| *tags)
+}
+
+/// The languages a ledger entry's label stands for: its own row in
+/// `INDEXER_LANGUAGES`, or, for a retired label, its successor's. A label in
+/// neither table serves nothing.
+pub fn ledger_label_languages(label: &str) -> &'static [&'static str] {
+    let languages = indexer_languages(label);
+    if !languages.is_empty() {
+        return languages;
+    }
+    RETIRED_LABELS
+        .iter()
+        .find(|(retired, _)| *retired == label)
+        .map_or(&[], |(_, successor)| indexer_languages(successor))
 }
 
 /// A whole-file fingerprint of one indexer's `.scip` output, sitting a layer
@@ -256,6 +277,35 @@ pub fn scip_import_should_skip(
     hash.is_some_and(|hash| {
         scip_import_is_redundant(infigraph_dir, label, hash, current_scip_generation)
     })
+}
+
+/// One entry of the SCIP import ledger, as [`record_scip_import`] wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerEntry {
+    pub label: String,
+    /// The `SCIP_IMPORT_REVISION` the entry was written under; `None` for an
+    /// entry that predates revisions.
+    pub revision: Option<u64>,
+}
+
+/// The ledger's entries. `None` when the ledger is missing, unreadable or not
+/// a JSON object: an unreadable ledger says nothing about what the graph
+/// holds, so it never leads to a replay.
+pub fn ledger_entries(infigraph_dir: &Path) -> Option<Vec<LedgerEntry>> {
+    let text = std::fs::read_to_string(scip_ledger_path(infigraph_dir)).ok()?;
+    let ledger = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    Some(
+        ledger
+            .as_object()?
+            .iter()
+            .map(|(label, entry)| LedgerEntry {
+                label: label.clone(),
+                revision: entry
+                    .get("importer_revision")
+                    .and_then(serde_json::Value::as_u64),
+            })
+            .collect(),
+    )
 }
 
 /// Record that `label`'s output, hashing to `hash`, was imported and stamped
