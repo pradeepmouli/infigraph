@@ -19,6 +19,8 @@
 //! `main.rs`'s thin wrapper, which spawns a thread around it), so this test
 //! can observe its effect deterministically.
 
+mod support;
+
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -263,6 +265,10 @@ fn start_daemon_watcher_for_startup_dir_never_touches_other_projects() {
 fn start_daemon_watcher_for_startup_dir_catches_drift_from_before_it_was_running() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _ci = CiOptOutSuppressed::new();
+    // This test is about the true-up. A SCIP enrichment child left running by
+    // the bootstrap index holds the graph's writer and is a collision of its
+    // own (see the live-writer test in daemon/mod.rs); keep it out of this one.
+    support::disable_scip_enrichment();
 
     let Ok(_cli) = infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(
         &std::env::current_exe().unwrap(),

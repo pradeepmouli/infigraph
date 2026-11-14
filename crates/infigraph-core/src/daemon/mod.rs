@@ -2408,18 +2408,73 @@ fn graph_path(root: &Path) -> PathBuf {
     root.join(".infigraph").join(crate::graph::names::STEM)
 }
 
+/// The live, identified process holding the graph's writer lock, if there is
+/// one: the holder `graph::lock_probe` names (the fcntl owner of the graph
+/// file) matched to an identity payload that names that same pid and still
+/// passes `lockfile::holder_is_alive`. A holder no payload names, or one that
+/// no longer exists, is not a wait: `None`, and the open decides as before.
+fn graph_writer_wait(root: &Path) -> Option<crate::degraded::DegradedMode> {
+    use crate::graph::lock_probe::{probe_graph_lock, LockProbe, ProbeFor};
+    let pid = match probe_graph_lock(&graph_path(root), ProbeFor::Write) {
+        LockProbe::Locked(Some(pid)) => pid,
+        _ => return None,
+    };
+    let infigraph_dir = root.join(".infigraph");
+    let payloads = [
+        crate::ops::index_lock_path(root),
+        infigraph_dir.join(crate::graph::names::LOCK),
+        infigraph_dir.join(crate::scip::SCIP_ENRICH_LOCK),
+    ];
+    payloads.iter().find_map(|path| {
+        let info = crate::lockfile::read_holder(path)?;
+        (info.pid == pid && crate::lockfile::holder_is_alive(&info)).then(|| {
+            crate::degraded::DegradedMode::GraphHeldByWriter {
+                pid,
+                summary: crate::lockfile::holder_summary(&info),
+            }
+        })
+    })
+}
+
+/// Report the writer wait, if there is one, as the daemon's live degraded
+/// mode. True when the open should wait rather than fail or back off.
+fn wait_for_graph_writer(root: &Path) -> bool {
+    match graph_writer_wait(root) {
+        Some(mode) => {
+            crate::degraded::live::set(root, mode);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Publish how an open of the daemon's graph went (#165): a failure the
 /// backoff cannot outwait latches an `OpenFailed` fault -- including a
 /// released handle that never lets go, which is how a daemon ends up
-/// pinning a deleted graph -- and a success clears it.
+/// pinning a deleted graph -- and a success clears it. A lock failure whose
+/// holder is a live, identified process is a wait instead (see
+/// `graph_writer_wait`): nothing is latched, and the wait is reported.
 fn note_open(root: &Path, opened: Result<CodeIndex>) -> Result<CodeIndex> {
     let infigraph_dir = root.join(".infigraph");
     match &opened {
-        Ok(_) => fault::clear(&infigraph_dir, Some(fault::FaultClass::OpenFailed)),
-        Err(e) => fault::record_if_fault(&infigraph_dir, e, fault::FaultClass::of_open_failure),
+        Ok(_) => {
+            fault::clear(&infigraph_dir, Some(fault::FaultClass::OpenFailed));
+            crate::degraded::live::clear(root, crate::degraded::GRAPH_HELD_BY_WRITER);
+        }
+        Err(e) => {
+            let lock_failure = format!("{e:#}").contains(LOCK_CONTENTION_TEXT);
+            if !(lock_failure && wait_for_graph_writer(root)) {
+                fault::record_if_fault(&infigraph_dir, e, fault::FaultClass::of_open_failure);
+            }
+        }
     }
     opened
 }
+
+/// The kuzu message for "another process holds this database's lock". Read
+/// from the whole error chain, because `CodeIndex::init` wraps it in
+/// context, which `to_string()` (the classifiers' view) does not show.
+const LOCK_CONTENTION_TEXT: &str = "Could not set lock on file";
 
 /// Drops the watch session's shared DB connection so the next `watch_db`
 /// call reopens fresh. See `watch_db`'s doc comment for when to call this.
@@ -2569,20 +2624,37 @@ fn serve_request_locked(
         return Err(reply);
     }
     match begin_index_op(root, "infigraph daemon", Duration::from_secs(30)) {
-        Ok(IndexOpOutcome::Acquired(_guard)) => match watch_db(root, registry, held) {
-            Ok(prism) => {
-                reopen_backoff.succeeded(root);
-                let _slow = crate::phase_clock::SlowOp::start(|| {
-                    format!("write request {}", request.kind())
-                });
-                reply.send(crate::daemon_protocol::serve_write(&prism, request));
-                Ok(())
+        Ok(IndexOpOutcome::Acquired(_guard)) => {
+            // A live writer holds the graph: the write waits for it. No open
+            // attempt, no backoff step, no latch -- the same deferral as a
+            // backoff, so the client's own timeout is the only limit.
+            if held.is_none() {
+                if wait_for_graph_writer(root) {
+                    return Err(reply);
+                }
+                crate::degraded::live::clear(root, crate::degraded::GRAPH_HELD_BY_WRITER);
             }
-            Err(e) => {
-                log_reopen_failure(root, "daemon", reopen_backoff, &e);
-                Err(reply)
+            match watch_db(root, registry, held) {
+                Ok(prism) => {
+                    reopen_backoff.succeeded(root);
+                    let _slow = crate::phase_clock::SlowOp::start(|| {
+                        format!("write request {}", request.kind())
+                    });
+                    reply.send(crate::daemon_protocol::serve_write(&prism, request));
+                    Ok(())
+                }
+                Err(e)
+                    if format!("{e:#}").contains(LOCK_CONTENTION_TEXT)
+                        && wait_for_graph_writer(root) =>
+                {
+                    Err(reply)
+                }
+                Err(e) => {
+                    log_reopen_failure(root, "daemon", reopen_backoff, &e);
+                    Err(reply)
+                }
             }
-        },
+        }
         Ok(o @ IndexOpOutcome::AlreadyRunning(_)) => {
             eprintln!(
                 "[daemon] request-serving busy ({}), retrying next tick",
@@ -4504,6 +4576,159 @@ mod tests {
             .expect("the wait must end once the last holder drops the store");
         assert!(held.retired.is_none());
         holder.join().unwrap();
+    }
+
+    const WRITER_HELPER_ROOT: &str = "INFIGRAPH_TEST_WRITER_HELPER_ROOT";
+    const WRITER_HELPER_IDENTIFIED: &str = "INFIGRAPH_TEST_WRITER_HELPER_IDENTIFIED";
+    const WRITER_HELPER_READY: &str = "writer-helper.ready";
+    const WRITER_HELPER_RELEASE: &str = "writer-helper.release";
+
+    /// Waits for `path` to appear, failing once `budget` is spent. A handshake
+    /// with a child process, not a guess at how long it takes.
+    fn wait_for_file(path: &Path, budget: Duration) {
+        let deadline = std::time::Instant::now() + budget;
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} never appeared",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The child the writer-wait tests run. It is not a test of its own: it does
+    /// nothing unless `WRITER_HELPER_ROOT` is set. When it runs, it opens the
+    /// graph as its writer and, if `WRITER_HELPER_IDENTIFIED` is set, names
+    /// itself in `index.lock` as a `scip-enrich` does. It holds both until the
+    /// test writes `WRITER_HELPER_RELEASE`.
+    #[test]
+    fn writer_wait_helper_process() {
+        let Some(root) = std::env::var_os(WRITER_HELPER_ROOT) else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let registry = Arc::new(crate::lang::LanguageRegistry::new());
+        let mut held = HeldPrism::new();
+        let _writer =
+            reopen_watch_db(&root, &registry, &mut held).expect("the helper opens the graph");
+        let _identity = std::env::var_os(WRITER_HELPER_IDENTIFIED).map(|_| {
+            crate::lockfile::try_acquire(&crate::ops::index_lock_path(&root), "scip-enrich")
+                .expect("index.lock can be taken")
+                .expect("index.lock is free")
+        });
+        std::fs::write(root.join(WRITER_HELPER_READY), b"").unwrap();
+        wait_for_file(&root.join(WRITER_HELPER_RELEASE), Duration::from_secs(120));
+    }
+
+    fn spawn_writer_holder(root: &Path, identified: bool) -> std::process::Child {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "daemon::tests::writer_wait_helper_process",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(WRITER_HELPER_ROOT, root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+        if identified {
+            cmd.env(WRITER_HELPER_IDENTIFIED, "1");
+        }
+        let child = cmd.spawn().expect("spawn the writer helper");
+        wait_for_file(&root.join(WRITER_HELPER_READY), Duration::from_secs(120));
+        child
+    }
+
+    /// A live, identified writer: the daemon's open waits for it. Nothing is
+    /// latched while it holds the graph, the wait names it, and the wait
+    /// clears on the open that succeeds after it has gone.
+    #[test]
+    fn a_live_identified_writer_is_waited_for_not_latched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let registry = Arc::new(crate::lang::LanguageRegistry::new());
+        let infigraph_dir = root.join(".infigraph");
+        let mut writer = spawn_writer_holder(root, true);
+
+        let mut held = HeldPrism::new();
+        assert!(
+            reopen_watch_db(root, &registry, &mut held).is_err(),
+            "the graph is held, so the open must fail"
+        );
+        assert!(
+            fault::live_fault(&infigraph_dir).is_none(),
+            "a live writer must not latch OpenFailed"
+        );
+        let notices = crate::degraded::live::for_root(root);
+        let wait = notices
+            .iter()
+            .find(|n| n.key == crate::degraded::GRAPH_HELD_BY_WRITER)
+            .expect("the wait is reported as a live degraded mode");
+        assert!(
+            wait.message
+                .contains(&format!("scip-enrich (PID {}), held", writer.id())),
+            "the wait names the holder: {}",
+            wait.message
+        );
+
+        std::fs::write(root.join(WRITER_HELPER_RELEASE), b"").unwrap();
+        assert!(writer.wait().unwrap().success(), "the helper exits cleanly");
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while let Err(e) = reopen_watch_db(root, &registry, &mut held) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the open never succeeded after the holder exited: {e:#}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            crate::degraded::live::for_root(root)
+                .iter()
+                .all(|n| n.key != crate::degraded::GRAPH_HELD_BY_WRITER),
+            "the wait clears on the open that succeeds"
+        );
+        assert!(fault::live_fault(&infigraph_dir).is_none());
+    }
+
+    /// A writer no live identity names -- here, an `index.lock` payload for a
+    /// pid that is gone -- is not a wait: today's latch still happens.
+    #[test]
+    fn an_unidentified_writer_still_latches_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let registry = Arc::new(crate::lang::LanguageRegistry::new());
+        let infigraph_dir = root.join(".infigraph");
+        let mut writer = spawn_writer_holder(root, false);
+        let stale = crate::lockfile::LockInfo {
+            pid: 0x7fff_fff0,
+            role: "scip-enrich".to_string(),
+            build_hash: "stale".to_string(),
+            acquired_at: 1,
+            last_heartbeat: 1,
+            holder_started_at: 1,
+        };
+        std::fs::write(
+            crate::ops::index_lock_path(root),
+            serde_json::to_string(&stale).unwrap(),
+        )
+        .unwrap();
+
+        let mut held = HeldPrism::new();
+        assert!(reopen_watch_db(root, &registry, &mut held).is_err());
+        assert!(
+            fault::live_fault(&infigraph_dir).is_some(),
+            "a writer no live identity names latches OpenFailed, as before"
+        );
+        assert!(
+            crate::degraded::live::for_root(root)
+                .iter()
+                .all(|n| n.key != crate::degraded::GRAPH_HELD_BY_WRITER),
+            "an unidentified writer is not reported as a wait"
+        );
+
+        std::fs::write(root.join(WRITER_HELPER_RELEASE), b"").unwrap();
+        assert!(writer.wait().unwrap().success());
     }
 
     /// #174: Windows' per-call reopen releases the held store, and waits for

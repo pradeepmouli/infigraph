@@ -51,7 +51,7 @@ impl IndexOpOutcome {
     }
 }
 
-fn index_lock_path(root: &Path) -> std::path::PathBuf {
+pub(crate) fn index_lock_path(root: &Path) -> std::path::PathBuf {
     root.join(".infigraph").join("index.lock")
 }
 
