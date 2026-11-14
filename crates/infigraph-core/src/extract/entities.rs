@@ -50,6 +50,10 @@ pub fn extract_entities(
     let mut members = super::members::MemberScan::default();
     // (index in `symbols`, position of the method's name) for each method
     let mut method_names: Vec<(usize, (u32, u32))> = Vec::new();
+    // Index in `symbols` of each TypeScript namespace, which may yet be dropped
+    // as merged (see `drop_merged_namespaces`).
+    let mut namespaces: Vec<usize> = Vec::new();
+    let in_typescript = matches!(language, "typescript" | "tsx");
 
     while let Some(m) = matches.next() {
         let mut name_text = None;
@@ -67,6 +71,7 @@ pub fn extract_entities(
         // `@field.def`: a symbol only when something owns it.
         let mut owned_only = false;
         let mut method_name_at: Option<(u32, u32)> = None;
+        let mut is_namespace = false;
         members.add(m.captures, capture_names, source);
 
         for capture in m.captures {
@@ -151,6 +156,20 @@ pub fn extract_entities(
                         kind = Some(SymbolKind::Module);
                     }
                 }
+                "namespace.name" => {
+                    name_text = Some(node_text(node, source));
+                    is_namespace = true;
+                    if kind.is_none() {
+                        kind = Some(SymbolKind::Module);
+                    }
+                }
+                "namespace.def" => {
+                    def_node = Some(node);
+                    is_namespace = true;
+                    if kind.is_none() {
+                        kind = Some(SymbolKind::Module);
+                    }
+                }
                 "test.name" => {
                     name_text = Some(node_text(node, source));
                     kind = Some(SymbolKind::Test);
@@ -177,7 +196,14 @@ pub fn extract_entities(
                     }
                 }
                 "field.name" => {
-                    name_text = Some(node_text(node, source));
+                    let raw = node_text(node, source);
+                    // A quoted key (`'bound-clauses': true`) is named without its
+                    // quotes, as SCIP names it.
+                    name_text = Some(if in_typescript {
+                        strip_string_delimiters(&raw)
+                    } else {
+                        raw
+                    });
                     if kind.is_none() {
                         kind = Some(SymbolKind::Variable);
                     }
@@ -232,7 +258,13 @@ pub fn extract_entities(
             });
         }
 
-        if let (Some(name), Some(node), Some(sym_kind)) = (name_text, def_node, kind) {
+        if let (Some(full_name), Some(node), Some(sym_kind)) = (name_text, def_node, kind) {
+            // `A.B` in `namespace A.B {}` is the symbol `B`, under the path `A`.
+            let (name, dotted_path) = if is_namespace {
+                split_namespace_name(&full_name)
+            } else {
+                (full_name, None)
+            };
             let span = Span {
                 file: file.to_string(),
                 start_line: node.start_position().row as u32 + 1,
@@ -251,19 +283,24 @@ pub fn extract_entities(
             // Prefer an explicit @method.parent/@func.parent capture (needed when a
             // grammar's enclosing node has no generic "name" field to walk up to,
             // e.g. Rust's impl_item) over the generic ancestor walk.
-            let in_typescript = matches!(language, "typescript" | "tsx");
-            let parent_class = parent_capture
-                .map(|n| resolve_compound_node_text(n, source, decompose_query))
-                .or_else(|| {
-                    if in_typescript
-                        && matches!(sym_kind, SymbolKind::Variable)
-                        && !ts_binds_function(node, &name, source)
-                    {
-                        ts_member_owner(node, source)
-                    } else {
-                        find_parent_class(node, source, decompose_query)
-                    }
-                });
+            // A namespace's dotted path is the namespaces it sits in, not an owner:
+            // no symbol of an implicit `A` exists, so it can be no parent.
+            let parent_class = if is_namespace {
+                dotted_path
+            } else {
+                parent_capture
+                    .map(|n| resolve_compound_node_text(n, source, decompose_query))
+                    .or_else(|| {
+                        if in_typescript
+                            && matches!(sym_kind, SymbolKind::Variable)
+                            && !ts_binds_function(node, &name, source)
+                        {
+                            ts_member_owner(node, source)
+                        } else {
+                            find_parent_class(node, source, decompose_query)
+                        }
+                    })
+            };
             // Owned means the member has a class or TypeScript owner of its own:
             // a namespace alone does not own a literal's member, so the check
             // comes before the namespaces are put in front of the owner.
@@ -273,7 +310,7 @@ pub fn extract_entities(
             // The namespaces go in front of the id's owner. A parent must be a
             // symbol, and a namespace is none (tree-sitter makes no symbol of
             // it): a member whose only owner is a namespace has no parent.
-            let has_owner = parent_class.is_some();
+            let has_owner = !is_namespace && parent_class.is_some();
             let parent_class = if in_typescript {
                 ts_with_namespaces(node, source, parent_class)
             } else {
@@ -307,6 +344,9 @@ pub fn extract_entities(
 
             if let (SymbolKind::Method, Some(at)) = (&sym_kind, method_name_at) {
                 method_names.push((symbols.len(), at));
+            }
+            if is_namespace {
+                namespaces.push(symbols.len());
             }
             symbols.push(Symbol {
                 id,
@@ -377,6 +417,10 @@ pub fn extract_entities(
         }
     }
 
+    // Before the grouping below: a namespace that shares an id with a declaration
+    // must not make that declaration's id `#N`.
+    let mut symbols = drop_merged_namespaces(symbols, &namespaces);
+
     for sym in &mut symbols {
         if matches!(sym.kind, SymbolKind::Function | SymbolKind::Method)
             && (is_test_by_docstring(&sym.docstring)
@@ -441,6 +485,42 @@ pub fn extract_entities(
         }
     }
     result
+}
+
+/// The symbol of a TypeScript namespace name and the path it is declared under:
+/// `A.B` is `B` under `A`.
+fn split_namespace_name(full: &str) -> (String, Option<String>) {
+    match full.rsplit_once('.') {
+        Some((path, last)) => (last.to_string(), Some(path.replace('.', "::"))),
+        None => (full.to_string(), None),
+    }
+}
+
+/// Drops each TypeScript namespace whose id another symbol already has: a
+/// `namespace N {}` next to `class N`, `interface N`, `function N` or `const N`
+/// in the same scope is one symbol, the declaration's, and so is every block of
+/// one namespace (the first block's). The namespace's members keep their
+/// `file::N::m` ids either way. `namespaces` are indices into `symbols`, in
+/// source order.
+fn drop_merged_namespaces(symbols: Vec<Symbol>, namespaces: &[usize]) -> Vec<Symbol> {
+    let is_namespace: std::collections::HashSet<usize> = namespaces.iter().copied().collect();
+    let mut taken: std::collections::HashSet<String> = symbols
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !is_namespace.contains(i))
+        .map(|(_, sym)| sym.id.clone())
+        .collect();
+    let mut keep = vec![true; symbols.len()];
+    for &i in namespaces {
+        if !taken.insert(symbols[i].id.clone()) {
+            keep[i] = false;
+        }
+    }
+    symbols
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(sym, keep)| keep.then_some(sym))
+        .collect()
 }
 
 /// Look at preceding siblings for attribute/decorator nodes.

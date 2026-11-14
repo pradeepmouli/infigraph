@@ -1,7 +1,9 @@
 //! `scripts/prune-build-cache.sh` refuses only while a running cargo or rustc
 //! builds into the target directory it would prune. The process list is the
-//! `PRUNE_BUILD_CACHE_PROCESSES` seam: one line per process, `name<TAB>cwd<TAB>args`,
-//! with `?` for a working directory that cannot be read.
+//! `PRUNE_BUILD_CACHE_PROCESSES` seam: one line per process,
+//! `name<TAB>cwd<TAB>args<TAB>held`, with `?` for a working directory that
+//! cannot be read, and `held` the first file under the target directory that a
+//! cargo holds open (empty when none; a line of three fields holds none).
 //!
 //! The checkout that owns a target directory is the directory holding it, so
 //! these tests build a fake checkout with its own `.shared-target` in a tempdir.
@@ -110,6 +112,38 @@ fn an_unreadable_working_directory_blocks() {
     let (_dir, _owner, target) = checkout();
     let listing = "rustc\t?\trustc --crate-name x\n";
     assert_refuses(&prune(&target, listing), "unreadable cwd");
+}
+
+#[test]
+fn a_cargo_elsewhere_holding_files_in_the_target_blocks() {
+    let (dir, _owner, target) = checkout();
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    // Its rustc children may all be idle; its open lock file names the target.
+    let listing = format!(
+        "cargo\t{}\tcargo check --workspace\t{}/debug/.cargo-lock\n",
+        elsewhere.display(),
+        target.display()
+    );
+    assert_refuses(
+        &prune(&target, &listing),
+        "cargo holding a lock file in the target",
+    );
+}
+
+#[test]
+fn a_cargo_elsewhere_holding_files_in_another_target_does_not_block() {
+    let (dir, _owner, target) = checkout();
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let listing = format!(
+        "cargo\t{}\tcargo check --workspace\t/other/target/debug/.cargo-lock\n",
+        elsewhere.display()
+    );
+    assert_proceeds(
+        &prune(&target, &listing),
+        "cargo holding files in another target",
+    );
 }
 
 #[test]

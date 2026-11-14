@@ -172,10 +172,15 @@ pub(super) fn ts_member_owner(node: Node, source: &[u8]) -> Option<String> {
             .filter(|name| {
                 matches!(
                     name.kind(),
-                    "identifier" | "type_identifier" | "property_identifier"
+                    "identifier" | "type_identifier" | "property_identifier" | "string"
                 )
             })
-            .map(|name| node_text(name, source))
+            // A quoted key owns its members under the name without quotes, as
+            // the property itself is named (`entities::extract_entities`).
+            .map(|name| match name.kind() {
+                "string" => entities::strip_string_delimiters(&node_text(name, source)),
+                _ => node_text(name, source),
+            })
     };
     // names of properties between the node and its declaration, innermost first
     let mut between: Vec<String> = Vec::new();
