@@ -24,9 +24,11 @@
 # It refuses to run while a cargo or rustc builds into the target directory being
 # pruned: a rustc whose arguments name that directory, a cargo whose working
 # directory is inside the checkout that owns it (rust-analyzer's background
-# `cargo check` counts), or any such process whose working directory cannot be
-# read. A build in another checkout, with its own target, does not block it:
-# deleting under a running build races it, but only under the same directory.
+# `cargo check` counts), a cargo holding files open in that directory (its lock
+# files, which it keeps open for the whole build) wherever it runs, or any such
+# process whose working directory cannot be read. A build in another checkout,
+# with its own target, does not block it: deleting under a running build races
+# it, but only under the same directory.
 #
 # Why incremental/ comes back although CARGO_INCREMENTAL = "0" is configured:
 # the `[env]` table of ~/.cargo/config.toml only sets variables for the
@@ -90,10 +92,23 @@ target_dir="$(cd "$target_dir" && pwd -P)"
 # both sit directly under it.
 owner="$(dirname "$target_dir")"
 
-# Every running cargo or rustc, one line each: "name<TAB>cwd<TAB>args", with cwd
-# "?" when it cannot be read. Prints nothing when none runs.
+# The first file under the target directory that a process holds open, "" when
+# it holds none. A cargo keeps its lock files (`<target>/<profile>/.cargo-lock`,
+# `.cargo-build-lock`, `.cargo-artifact-lock`) open for the whole build, so this
+# says a cargo is building into the target wherever it was started, and whatever
+# its environment says. The environment itself cannot be read here: macOS `ps`
+# shows none, and KERN_PROCARGS2 returns only argv.
+held_in_target() {
+  lsof -a -p "$1" -Fn 2>/dev/null |
+    awk -v prefix="$target_dir/" 'substr($0, 1, 1) == "n" && index(substr($0, 2), prefix) == 1 { print substr($0, 2); exit }'
+}
+
+# Every running cargo or rustc, one line each: "name<TAB>cwd<TAB>args<TAB>held",
+# with cwd "?" when it cannot be read, and held the first file under the target
+# directory that a cargo has open ("" when none; a rustc's is always "").
+# Prints nothing when none runs.
 live_builds() {
-  local pid comm cwd args
+  local pid comm cwd args held
   ps -axo pid=,comm= | while read -r pid comm; do
     case "${comm##*/}" in
       cargo | rustc) ;;
@@ -101,7 +116,11 @@ live_builds() {
     esac
     cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | awk '/^n/ {print substr($0, 2); exit}')"
     args="$(ps -ww -o args= -p "$pid" 2>/dev/null || true)"
-    printf '%s\t%s\t%s\n' "${comm##*/}" "${cwd:-?}" "$args"
+    held=""
+    if [ "${comm##*/}" = cargo ]; then
+      held="$(held_in_target "$pid")"
+    fi
+    printf '%s\t%s\t%s\t%s\n' "${comm##*/}" "${cwd:-?}" "$args" "$held"
   done
 }
 
@@ -118,7 +137,7 @@ fi
 # arguments name it, a cargo whose working directory is inside the owning
 # checkout, or any of them whose working directory cannot be read (fail closed).
 busy=""
-while IFS=$'\t' read -r name cwd args; do
+while IFS=$'\t' read -r name cwd args held; do
   name="${name##*/}"
   case "$name" in
     cargo | rustc) ;;
@@ -135,6 +154,16 @@ while IFS=$'\t' read -r name cwd args; do
       ;;
   esac
   if [ "$name" = cargo ]; then
+    # A cargo started anywhere, with CARGO_TARGET_DIR at this target, builds
+    # into it whatever its arguments say; its rustc children may be idle (a
+    # build script, a pause between crates) and so name nothing. Its open lock
+    # files show it.
+    case "${held:-}" in
+      "$target_dir"/*)
+        busy="$busy $name(holds files in the target)"
+        continue
+        ;;
+    esac
     case "$cwd/" in
       "$owner"/*)
         busy="$busy $name(in $owner)"
