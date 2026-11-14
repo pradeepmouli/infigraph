@@ -497,7 +497,8 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     if no_embed {
         if infigraph_core::scip_switch::index_enriches(root, full, scip_generation(prism.backend()))
         {
-            auto_scip(root, &result, prism.backend())?;
+            let backend = prism.backend().context("graph not initialized")?;
+            auto_scip(root, &result, backend)?;
         }
         return Ok(());
     }
@@ -820,7 +821,7 @@ pub(crate) fn import_scip_and_cleanup(
     label: &str,
     root: &Path,
     scip_path: Option<&std::path::Path>,
-    existing_backend: Option<&dyn infigraph_core::graph::GraphBackend>,
+    backend: &dyn infigraph_core::graph::GraphBackend,
 ) -> Option<Result<infigraph_core::scip::ImportStats, String>> {
     let scip_out = scip_path
         .map(|p| p.to_path_buf())
@@ -828,48 +829,20 @@ pub(crate) fn import_scip_and_cleanup(
     if !scip_out.exists() {
         return None;
     }
-
-    let import = |backend: &dyn infigraph_core::graph::GraphBackend| {
-        let outcome = import_and_settle(backend, root, label, &scip_out);
-        match &outcome {
-            Ok(stats) => println!("Auto-SCIP: {stats}"),
-            Err(e) => eprintln!("Auto-SCIP: import failed: {e}"),
-        }
-        infigraph_core::scip::remove_scratch(&scip_out);
-        Some(outcome.map_err(|e| format!("{e:#}")))
-    };
-    if let Some(backend) = existing_backend {
-        return import(backend);
+    let outcome = import_and_settle(backend, root, label, &scip_out);
+    match &outcome {
+        Ok(stats) => println!("Auto-SCIP: {stats}"),
+        Err(e) => eprintln!("Auto-SCIP: import failed: {e}"),
     }
-
-    let registry = match bundled_registry() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Auto-SCIP: import failed: {e}");
-            return Some(Err(format!("{e:#}")));
-        }
-    };
-    let mut prism = match CodeIndex::open(root, registry) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Auto-SCIP: import failed: {e}");
-            return Some(Err(format!("{e:#}")));
-        }
-    };
-    if let Err(e) = prism.init() {
-        return Some(Err(format!("could not open the graph: {e:#}")));
-    }
-    match prism.backend() {
-        Some(backend) => import(backend),
-        None => Some(Err("the graph is not initialized".to_string())),
-    }
+    infigraph_core::scip::remove_scratch(&scip_out);
+    Some(outcome.map_err(|e| format!("{e:#}")))
 }
 
 /// Foreground SCIP execution using scip_download catalog for all detected languages.
 pub(crate) fn auto_scip(
     root: &Path,
     result: &infigraph_core::IndexResult,
-    backend: Option<&dyn infigraph_core::graph::GraphBackend>,
+    backend: &dyn infigraph_core::graph::GraphBackend,
 ) -> Result<()> {
     use crate::scip_download;
     use std::collections::HashSet;
@@ -965,13 +938,9 @@ pub(crate) fn auto_scip(
                     None => {}
                 }
             }
-            IndexerVerdict::EmptyIndex { hash, .. } => match backend {
-                Some(backend) => settle_empty_index(backend, root, indexer.binary_name, *hash),
-                None => eprintln!(
-                    "Auto-SCIP: {} produced an empty index; not recorded in the SCIP ledger (no graph is open)",
-                    indexer.binary_name
-                ),
-            },
+            IndexerVerdict::EmptyIndex { hash, .. } => {
+                settle_empty_index(backend, root, indexer.binary_name, *hash);
+            }
             IndexerVerdict::Failed(_) => {}
         }
     }
@@ -1623,18 +1592,11 @@ impl ScipRun {
 /// in the same `scip-tmp` are never touched (#139).
 pub(crate) fn import_scip_results_and_embed(
     root: &Path,
-    prism: &CodeIndex,
+    backend: &dyn infigraph_core::graph::GraphBackend,
     results: &[IndexerResult],
 ) {
     let scip_tmp = root.join(".infigraph").join("scip-tmp");
 
-    let Some(backend) = prism.backend() else {
-        for result in results {
-            infigraph_core::scip::remove_scratch(&result.path);
-        }
-        let _ = std::fs::remove_dir(&scip_tmp);
-        return;
-    };
     let mut run = ScipRun::new();
     for result in results {
         run.indexer_result(result);
@@ -1665,9 +1627,6 @@ pub(crate) fn import_scip_results_and_embed(
     // Embed any new symbols SCIP added (skips existing embeddings)
     let root_buf = root.to_path_buf();
     let pre_count = infigraph_core::embed::embedding_count(&root_buf);
-    let Some(backend) = prism.backend() else {
-        return;
-    };
     #[allow(unused_mut)]
     let mut done = false;
     #[cfg(feature = "remote")]
@@ -1718,7 +1677,7 @@ pub(crate) fn import_scip_results_and_embed(
 /// whole duration (unlike the daemon's own request-serving loop).
 pub(crate) fn run_auto_scip_on(
     root: &Path,
-    prism: &CodeIndex,
+    backend: &dyn infigraph_core::graph::GraphBackend,
     detected_languages: &std::collections::HashSet<String>,
 ) {
     // The standalone CLI path has no daemon-lifetime token to thread through
@@ -1730,7 +1689,7 @@ pub(crate) fn run_auto_scip_on(
     if results.is_empty() {
         return;
     }
-    import_scip_results_and_embed(root, prism, &results);
+    import_scip_results_and_embed(root, backend, &results);
 }
 
 /// Background SCIP pipeline for the standalone CLI path: opens its own
@@ -1760,10 +1719,15 @@ fn auto_scip_background(root: &Path, detected_languages: &std::collections::Hash
             return;
         }
     };
-    if prism.init().is_err() {
+    if let Err(e) = prism.init() {
+        eprintln!("Auto-SCIP: could not open the graph: {e:#}");
         return;
     }
-    run_auto_scip_on(root, &prism, detected_languages);
+    let Some(backend) = prism.backend() else {
+        eprintln!("Auto-SCIP: the graph did not open; nothing imported");
+        return;
+    };
+    run_auto_scip_on(root, backend, detected_languages);
 }
 
 fn should_run_indexer(root: &Path, indexer: &crate::scip_download::ScipIndexer) -> bool {
