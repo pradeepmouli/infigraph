@@ -2,6 +2,7 @@
 //! separately and uses only part of it.
 #![allow(dead_code)]
 
+pub mod cli;
 pub mod daemon;
 pub mod registry;
 pub mod stdio;

@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -104,26 +103,7 @@ impl Drop for KillPidOnDrop {
     }
 }
 
-/// infigraph-core has no dev-dependency on infigraph-cli, so
-/// `env!("CARGO_BIN_EXE_infigraph")` isn't available here (cargo only sets
-/// that var for a test binary's own crate-graph binaries). Resolve the CLI
-/// binary the same way Task 2's watch_daemon.rs test does.
-fn cli_binary() -> PathBuf {
-    infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(
-        &std::env::current_exe().unwrap(),
-    )
-    .expect("infigraph CLI binary must already be built (shared target dir)")
-}
-
-/// The CLI under test with implicit SCIP enrichment off: `infigraph index`
-/// otherwise leaves a detached `scip-enrich` child running after it returns,
-/// which would hold `index.lock` and keep writing into the tempdir this test
-/// is about to delete. The env name comes from the settings definition.
-fn cli_command() -> Command {
-    let mut command = Command::new(cli_binary());
-    command.env(infigraph_core::scip_switch::enabled_env_name(), "0");
-    command
-}
+use common::cli::{cli_binary, cli_command};
 
 /// Bootstrap-index `project_dir` directly (BackendKind::Kuzu, no daemon
 /// involved, so `.infigraph/` exists), then start a real detached

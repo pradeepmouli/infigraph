@@ -4,7 +4,6 @@
 //! they keep opening it themselves, read-only.
 
 use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use infigraph_core::doctor::{check_one_compaction_drift, CheckStatus};
@@ -25,15 +24,8 @@ impl Drop for KillOnDrop {
     }
 }
 
-fn cli_command() -> Command {
-    let cli = infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(
-        &std::env::current_exe().unwrap(),
-    )
-    .expect("infigraph CLI binary must already be built (shared target dir)");
-    let mut command = Command::new(cli);
-    command.env(infigraph_core::scip_switch::enabled_env_name(), "0");
-    command
-}
+mod common;
+use common::cli::cli_command;
 
 /// Index `project` directly (no daemon), then start a real detached daemon
 /// on it and wait for `watch.lock`.

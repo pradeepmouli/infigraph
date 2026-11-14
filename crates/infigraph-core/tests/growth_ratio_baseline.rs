@@ -6,6 +6,8 @@
 // writes in a row) never trips the breaker, even though its cumulative
 // growth vastly exceeds the ratio relative to its *original* healthy size.
 
+mod common;
+use common::cli::cli_command;
 use infigraph_core::lang::{LanguagePack, LanguageRegistry};
 use infigraph_core::CodeIndex;
 
@@ -95,15 +97,10 @@ fn ordinary_incremental_writes_do_not_move_the_growth_ratio_baseline() {
 /// one after a legitimate rebuild.
 #[test]
 fn a_full_reindex_does_refresh_the_growth_ratio_baseline() {
-    let cli = infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(
-        &std::env::current_exe().unwrap(),
-    )
-    .expect("infigraph CLI binary must already be built (shared target dir)");
-
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.py"), "def a():\n    return 1\n").unwrap();
 
-    let status = std::process::Command::new(&cli)
+    let status = cli_command()
         .arg("index")
         .arg("--no-embed")
         .current_dir(dir.path())
@@ -135,7 +132,7 @@ fn a_full_reindex_does_refresh_the_growth_ratio_baseline() {
     )
     .unwrap();
 
-    let status = std::process::Command::new(&cli)
+    let status = cli_command()
         .arg("index")
         .arg("--full")
         .arg("--no-embed")
