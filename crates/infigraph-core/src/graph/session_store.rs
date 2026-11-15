@@ -208,6 +208,33 @@ pub fn record_id(date_id: &str, key: Option<&str>) -> String {
     }
 }
 
+/// What [`SessionStore::sweep_embeddings`] removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmbeddingSweep {
+    /// Entries whose id names no record.
+    pub no_record: usize,
+    /// Older entries of an id that has a newer one.
+    pub duplicates: usize,
+}
+
+impl EmbeddingSweep {
+    pub fn removed(&self) -> usize {
+        self.no_record + self.duplicates
+    }
+
+    /// One line saying what went, or `None` when nothing did.
+    pub fn report(&self) -> Option<String> {
+        (self.removed() > 0).then(|| {
+            format!(
+                "Embedding sweep removed {} entries ({} with no record, {} duplicate).",
+                self.removed(),
+                self.no_record,
+                self.duplicates
+            )
+        })
+    }
+}
+
 /// A session file that did not read, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skipped {
@@ -365,6 +392,36 @@ impl SessionStore {
             }
         }
         Ok(deleted)
+    }
+
+    /// Drop the `embeddings.bin` entries nothing reads: one whose id names no
+    /// record (its record was purged or expired without it), and every entry
+    /// of an id but the newest (the file is written newest last). A record is
+    /// never touched, and an id whose record cannot be read keeps its entry.
+    /// The caller holds [`SessionStore::lock`]. Writes only if something went.
+    pub fn sweep_embeddings(&self) -> Result<EmbeddingSweep> {
+        let path = self.sessions_dir.join("embeddings.bin");
+        let mut sweep = EmbeddingSweep::default();
+        if !path.exists() {
+            return Ok(sweep);
+        }
+        let entries = crate::embed::load_embeddings(&path)?;
+        let mut kept: Vec<(String, Vec<f32>)> = Vec::with_capacity(entries.len());
+        let mut seen = std::collections::HashSet::new();
+        for (id, vector) in entries.into_iter().rev() {
+            if !seen.insert(id.clone()) {
+                sweep.duplicates += 1;
+            } else if matches!(self.load(&id), Ok(None)) {
+                sweep.no_record += 1;
+            } else {
+                kept.push((id, vector));
+            }
+        }
+        if sweep.removed() > 0 {
+            kept.reverse();
+            crate::embed::save_embeddings(&path, &kept)?;
+        }
+        Ok(sweep)
     }
 
     pub fn touch_session(&self, session_id: &str) -> Result<()> {
@@ -776,5 +833,65 @@ mod tests {
         assert_eq!(owner_of(&id), Owner::Session("abcd1234"));
         assert_eq!(record_id("session_2026-11-14", None), "session_2026-11-14");
         assert_eq!(owner_of("session_2026-11-14"), Owner::Legacy);
+    }
+
+    #[test]
+    fn the_sweep_removes_orphans_and_older_duplicates_and_keeps_live_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        for id in ["live", "consolidated_1"] {
+            store
+                .save(&SessionData {
+                    id: id.to_string(),
+                    name: String::new(),
+                    summary: "s".to_string(),
+                    pending_tasks: String::new(),
+                    decisions: String::new(),
+                    files_touched: String::new(),
+                    constraints: String::new(),
+                    assumptions: String::new(),
+                    blockers: String::new(),
+                    created_at: 1,
+                    updated_at: 1,
+                    confidence: 0.9,
+                    last_accessed: 1,
+                })
+                .unwrap();
+        }
+        let path = store.sessions_dir().join("embeddings.bin");
+        let entries = vec![
+            ("live".to_string(), vec![1.0, 0.0]),
+            ("orphan".to_string(), vec![0.0, 1.0]),
+            ("consolidated_1".to_string(), vec![1.0, 1.0]),
+            ("consolidated_1".to_string(), vec![2.0, 2.0]),
+        ];
+        crate::embed::save_embeddings(&path, &entries).unwrap();
+
+        let sweep = store.sweep_embeddings().unwrap();
+        assert_eq!(
+            sweep,
+            EmbeddingSweep {
+                no_record: 1,
+                duplicates: 1
+            }
+        );
+        assert!(sweep.report().unwrap().contains("removed 2 entries"));
+
+        let left = crate::embed::load_embeddings(&path).unwrap();
+        assert_eq!(
+            left,
+            vec![
+                ("live".to_string(), vec![1.0, 0.0]),
+                ("consolidated_1".to_string(), vec![2.0, 2.0]),
+            ],
+            "the newest entry of a duplicated id survives, order kept"
+        );
+        // A second pass has nothing to do and says nothing.
+        let again = store.sweep_embeddings().unwrap();
+        assert_eq!(again.removed(), 0);
+        assert_eq!(again.report(), None);
+        for id in ["live", "consolidated_1"] {
+            assert!(store.load(id).unwrap().is_some(), "{id} is untouched");
+        }
     }
 }

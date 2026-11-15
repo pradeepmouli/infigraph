@@ -115,6 +115,8 @@ Merges related sessions to reduce redundancy and boost signal.
    - Source sessions preserved with halved confidence
    - Re-embed consolidated session
 
+**Embedding sweep:** `purge_sessions` and `consolidate_memory` (where expired records are deleted) also drop the `embeddings.bin` entries nothing reads: an id with no record, and all but the newest entry of a duplicated id. No record is touched, an id whose record cannot be read keeps its entry, and the answer says what was removed.
+
 **No auto-trigger:** a save never consolidates. When more than 50 records are active, `save_session` says so and `consolidate_memory` is the explicit call. (It used to run after every save once `embeddings.bin` held more than 50 entries, a count of file entries rather than sessions, and merged records of different sessions.)
 
 **Source:** `tool_consolidate_memory` in `crates/infigraph-mcp/src/tools/session.rs`
@@ -146,5 +148,5 @@ Merges related sessions to reduce redundancy and boost signal.
 |------|----------|
 | `.infigraph/sessions/db/` | KuzuDB instance for session nodes + TOUCHED edges |
 | `.infigraph/sessions/embeddings.bin` | Session embedding vectors for semantic search |
-| `.infigraph/sessions/session_YYYY-MM-DD.md` | Narrative logs (human-readable, appended per save) |
+| `.infigraph/sessions/session_YYYY-MM-DD[_<key>].md` | Narrative logs (human-readable, appended per save); `<key>` is the first eight alphanumerics of the saving session's id |
 | `.infigraph/sessions/named_*.json` | Named identity sessions |

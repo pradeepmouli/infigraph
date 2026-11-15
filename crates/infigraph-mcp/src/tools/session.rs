@@ -644,10 +644,6 @@ fn latest_session_with(args: &Value, env: &dyn Fn(&str) -> Option<String>) -> Re
 
 pub fn tool_purge_sessions(args: &Value) -> Result<String> {
     let store = open_session_store(args)?;
-    let path = args
-        .get("path")
-        .and_then(|p| p.as_str())
-        .context("missing 'path'")?;
     let older_than_days = args
         .get("older_than_days")
         .and_then(|v| v.as_u64())
@@ -662,27 +658,17 @@ pub fn tool_purge_sessions(args: &Value) -> Result<String> {
     let all = store.list_all()?;
     let to_purge: Vec<&SessionData> = all.iter().filter(|s| s.created_at < cutoff).collect();
 
+    for s in &to_purge {
+        store.delete(&s.id)?;
+    }
+    let sweep = store.sweep_embeddings()?;
+
     if to_purge.is_empty() {
-        return Ok(format!(
-            "No sessions older than {older_than_days} days found."
-        ));
-    }
-
-    let purged_ids: Vec<String> = to_purge.iter().map(|s| s.id.clone()).collect();
-    let root = PathBuf::from(path);
-    let sessions_dir = root.join(".infigraph").join("sessions");
-    for id in &purged_ids {
-        store.delete(id)?;
-    }
-
-    let emb_path = sessions_dir.join("embeddings.bin");
-    if emb_path.exists() {
-        let mut emb_store = embed::load_embeddings(&emb_path).unwrap_or_default();
-        let before = emb_store.len();
-        emb_store.retain(|(id, _)| !purged_ids.contains(id));
-        if emb_store.len() < before {
-            embed::save_embeddings(&emb_path, &emb_store)?;
+        let mut out = format!("No sessions older than {older_than_days} days found.");
+        if let Some(line) = sweep.report() {
+            out.push_str(&format!("\n{line}"));
         }
+        return Ok(out);
     }
 
     let mut out = format!(
@@ -697,6 +683,9 @@ pub fn tool_purge_sessions(args: &Value) -> Result<String> {
             &s.summary
         };
         out.push_str(&format!("- {}: {preview}\n", s.id));
+    }
+    if let Some(line) = sweep.report() {
+        out.push_str(&format!("{line}\n"));
     }
     Ok(out)
 }
@@ -832,6 +821,13 @@ pub fn tool_consolidate_memory(args: &Value) -> Result<String> {
 
         // Purge expired sessions (confidence < 0.1)
         let purged = store.purge_expired(now)?;
+        // An expired record's embedding goes with it, and so does any entry
+        // nothing reads; said at the end of every answer.
+        let swept = store
+            .sweep_embeddings()?
+            .report()
+            .map(|line| format!("\n{line}"))
+            .unwrap_or_default();
 
         let emb_path = sessions_dir.join("embeddings.bin");
 
@@ -844,12 +840,14 @@ pub fn tool_consolidate_memory(args: &Value) -> Result<String> {
                     purged.len()
                 )
             };
-            return Ok(msg);
+            return Ok(format!("{msg}{swept}"));
         }
 
         let emb_store = embed::load_embeddings(&emb_path)?;
         if emb_store.len() < 2 {
-            return Ok("Fewer than 2 sessions — nothing to consolidate.".to_string());
+            return Ok(format!(
+                "Fewer than 2 sessions — nothing to consolidate.{swept}"
+            ));
         }
 
         // Load all active sessions with embeddings
@@ -863,7 +861,9 @@ pub fn tool_consolidate_memory(args: &Value) -> Result<String> {
         }
 
         if sessions_with_emb.len() < 2 {
-            return Ok("Fewer than 2 active sessions — nothing to consolidate.".to_string());
+            return Ok(format!(
+                "Fewer than 2 active sessions — nothing to consolidate.{swept}"
+            ));
         }
 
         // Union-find clustering by similarity
@@ -1020,6 +1020,7 @@ pub fn tool_consolidate_memory(args: &Value) -> Result<String> {
             consolidated_count += 1;
         }
 
+        out.push_str(&swept);
         (consolidated_count, withheld_pairs, out)
     };
     // `_session_lock` is dropped here — the symbol-cluster lookup below
@@ -1673,5 +1674,51 @@ mod tests {
                 .unwrap();
         assert!(out.starts_with("Caller unknown: pass `session`"), "{out}");
         assert!(out.contains("work of B"), "{out}");
+    }
+
+    /// An orphan entry (its record is gone) in `embeddings.bin`, as left by
+    /// the expiry path before it swept.
+    fn plant_orphan_embedding(root: &std::path::Path) -> std::path::PathBuf {
+        let emb = root.join(".infigraph/sessions/embeddings.bin");
+        let mut entries = embed::load_embeddings(&emb).unwrap();
+        let vector = entries[0].1.clone();
+        entries.push(("session_2020-01-01_deadbeef".to_string(), vector));
+        embed::save_embeddings(&emb, &entries).unwrap();
+        emb
+    }
+
+    #[test]
+    fn consolidate_sweeps_orphan_embeddings_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        save_as(dir.path(), Some("aaaa1111"), "work of A");
+        let emb = plant_orphan_embedding(dir.path());
+        assert_eq!(embed::load_embeddings(&emb).unwrap().len(), 2);
+
+        let out = tool_consolidate_memory(&json!({"path": dir.path().to_str().unwrap()})).unwrap();
+        assert!(
+            out.contains("Embedding sweep removed 1 entries (1 with no record"),
+            "{out}"
+        );
+        let left = embed::load_embeddings(&emb).unwrap();
+        assert_eq!(left.len(), 1);
+        assert!(left[0].0.ends_with("_aaaa1111"), "{:?}", left[0].0);
+    }
+
+    #[test]
+    fn purge_sweeps_orphan_embeddings_even_when_no_record_is_old_enough() {
+        let dir = tempfile::tempdir().unwrap();
+        save_as(dir.path(), Some("aaaa1111"), "work of A");
+        let emb = plant_orphan_embedding(dir.path());
+
+        let out = tool_purge_sessions(&json!({"path": dir.path().to_str().unwrap()})).unwrap();
+        assert!(
+            out.starts_with("No sessions older than 30 days found."),
+            "{out}"
+        );
+        assert!(out.contains("Embedding sweep removed 1 entries"), "{out}");
+        assert_eq!(embed::load_embeddings(&emb).unwrap().len(), 1);
+        // The record itself is untouched.
+        let store = SessionStore::open(dir.path()).unwrap();
+        assert_eq!(store.list_all().unwrap().len(), 1);
     }
 }

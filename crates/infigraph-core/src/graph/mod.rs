@@ -47,8 +47,8 @@ pub use queries::{
     SymbolRow, SymbolWithDocstring, TestContext, TestCoverage, TestTarget, TypeHierarchy,
 };
 pub use session_store::{
-    caller_key, owner_of, record_id, session_key, Owner, Scan, SessionData, SessionStore, Skipped,
-    SESSION_ENV_VARS,
+    caller_key, owner_of, record_id, session_key, EmbeddingSweep, Owner, Scan, SessionData,
+    SessionStore, Skipped, SESSION_ENV_VARS,
 };
 pub use store::{
     db_lock_path, is_checkpoint_in_progress_error, is_lock_contention_error,
