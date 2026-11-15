@@ -448,25 +448,74 @@ pub fn installed_build_hash_of(binary: &std::path::Path) -> Option<String> {
 /// was taken from.
 type ProbedBuild = (std::path::PathBuf, std::time::SystemTime, u64, String);
 
+/// How long a failed probe of an unchanged binary is not repeated.
+const FAILED_PROBE_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What the probe has learned: the build it read, and the stamp it last
+/// failed on, with when.
+struct ProbeCache {
+    found: Option<ProbedBuild>,
+    failed: Option<(
+        std::path::PathBuf,
+        std::time::SystemTime,
+        u64,
+        std::time::Instant,
+    )>,
+}
+
+impl ProbeCache {
+    const fn new() -> Self {
+        ProbeCache {
+            found: None,
+            failed: None,
+        }
+    }
+}
+
 /// `probe(cli)`, remembered while `cli`'s (mtime, length) stays as it was. A
 /// probe that fails -- the file mid-install, an unsigned binary killed at
-/// start -- is `None` and is not remembered, so the next call asks again.
+/// start -- is `None` and is not taken as an answer: the next call asks again,
+/// except that an unchanged file is not asked again for
+/// [`FAILED_PROBE_RETRY`], so a broken install costs one subprocess per period
+/// and not one per tool call. A different stamp (the install finished) is
+/// probed at once.
 fn probe_if_changed(
-    cache: &std::sync::Mutex<Option<ProbedBuild>>,
+    cache: &std::sync::Mutex<ProbeCache>,
     cli: &std::path::Path,
     probe: &dyn Fn(&std::path::Path) -> Option<String>,
+    now: std::time::Instant,
 ) -> Option<String> {
     let meta = std::fs::metadata(cli).ok()?;
     let (mtime, len) = (meta.modified().ok()?, meta.len());
-    if let Some((path, at, size, hash)) = cache.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-        if path == cli && *at == mtime && *size == len {
-            return Some(hash.clone());
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((path, at, size, hash)) = guard.found.as_ref() {
+            if path == cli && *at == mtime && *size == len {
+                return Some(hash.clone());
+            }
+        }
+        if let Some((path, at, size, when)) = guard.failed.as_ref() {
+            if path == cli
+                && *at == mtime
+                && *size == len
+                && now.saturating_duration_since(*when) < FAILED_PROBE_RETRY
+            {
+                return None;
+            }
         }
     }
-    let hash = probe(cli).filter(|h| !h.is_empty())?;
-    *cache.lock().unwrap_or_else(|e| e.into_inner()) =
-        Some((cli.to_path_buf(), mtime, len, hash.clone()));
-    Some(hash)
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    match probe(cli).filter(|h| !h.is_empty()) {
+        Some(hash) => {
+            guard.found = Some((cli.to_path_buf(), mtime, len, hash.clone()));
+            guard.failed = None;
+            Some(hash)
+        }
+        None => {
+            guard.failed = Some((cli.to_path_buf(), mtime, len, now));
+            None
+        }
+    }
 }
 
 /// Build hash of the infigraph install this process's binary sits in: the
@@ -478,12 +527,17 @@ fn probe_if_changed(
 /// `INFIGRAPH_TEST_BUILD_HASH_OVERRIDE_FILE` set nothing is remembered, so a
 /// test can change the answer.
 pub fn installed_build_hash() -> Option<String> {
-    static CACHE: std::sync::Mutex<Option<ProbedBuild>> = std::sync::Mutex::new(None);
+    static CACHE: std::sync::Mutex<ProbeCache> = std::sync::Mutex::new(ProbeCache::new());
     let cli = lifecycle::resolve_cli_binary_sibling_of(&std::env::current_exe().ok()?).ok()?;
     if std::env::var_os("INFIGRAPH_TEST_BUILD_HASH_OVERRIDE_FILE").is_some() {
         return installed_build_hash_of(&cli);
     }
-    probe_if_changed(&CACHE, &cli, &installed_build_hash_of)
+    probe_if_changed(
+        &CACHE,
+        &cli,
+        &installed_build_hash_of,
+        std::time::Instant::now(),
+    )
 }
 
 /// Warn, once per binary path per process, when the `infigraph` CLI this
@@ -6201,62 +6255,95 @@ mod extensioned_swap_lock_tests {
 mod installed_build_probe_tests {
     use super::*;
     use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    fn cache() -> std::sync::Mutex<ProbeCache> {
+        std::sync::Mutex::new(ProbeCache::new())
+    }
 
     #[test]
     fn a_probe_is_remembered_until_the_binary_changes() {
         let dir = tempfile::tempdir().unwrap();
         let cli = dir.path().join("infigraph");
         std::fs::write(&cli, b"one").unwrap();
-        let cache = std::sync::Mutex::new(None);
+        let cache = cache();
+        let now = Instant::now();
         let calls = Cell::new(0);
         let probe = |_: &std::path::Path| {
             calls.set(calls.get() + 1);
             Some(format!("build{}", calls.get()))
         };
         assert_eq!(
-            probe_if_changed(&cache, &cli, &probe).as_deref(),
+            probe_if_changed(&cache, &cli, &probe, now).as_deref(),
             Some("build1")
         );
         assert_eq!(
-            probe_if_changed(&cache, &cli, &probe).as_deref(),
+            probe_if_changed(&cache, &cli, &probe, now).as_deref(),
             Some("build1")
         );
         assert_eq!(calls.get(), 1, "an unchanged binary is not probed again");
         // A different length is a different file (an install replaced it).
         std::fs::write(&cli, b"longer").unwrap();
         assert_eq!(
-            probe_if_changed(&cache, &cli, &probe).as_deref(),
+            probe_if_changed(&cache, &cli, &probe, now).as_deref(),
             Some("build2")
         );
         assert_eq!(calls.get(), 2);
     }
 
+    /// A broken install is asked about once per period, not once per call; the
+    /// period ending, or the file changing, asks again; and a probe that then
+    /// succeeds is remembered.
     #[test]
-    fn a_failed_probe_is_not_remembered() {
+    fn a_failed_probe_is_not_repeated_within_the_retry_period() {
         let dir = tempfile::tempdir().unwrap();
         let cli = dir.path().join("infigraph");
         std::fs::write(&cli, b"half-written").unwrap();
-        let cache = std::sync::Mutex::new(None);
+        let cache = cache();
+        let start = Instant::now();
         let calls = Cell::new(0);
         let probe = |_: &std::path::Path| {
             calls.set(calls.get() + 1);
-            (calls.get() > 1).then(|| "settled".to_string())
+            (calls.get() >= 4).then(|| "settled".to_string())
         };
-        assert_eq!(probe_if_changed(&cache, &cli, &probe), None);
+        assert_eq!(probe_if_changed(&cache, &cli, &probe, start), None);
+        for tick in 1..10 {
+            let now = start + Duration::from_secs(tick);
+            assert_eq!(probe_if_changed(&cache, &cli, &probe, now), None);
+        }
+        assert_eq!(calls.get(), 1, "ten calls within the period: one probe");
+
+        let later = start + FAILED_PROBE_RETRY + Duration::from_secs(1);
+        assert_eq!(probe_if_changed(&cache, &cli, &probe, later), None);
+        assert_eq!(calls.get(), 2, "the period over: asked again");
+
+        // The install finishes: a new stamp is probed at once.
+        std::fs::write(&cli, b"finished install").unwrap();
+        assert_eq!(probe_if_changed(&cache, &cli, &probe, later), None);
+        assert_eq!(calls.get(), 3);
+        let after = later + FAILED_PROBE_RETRY + Duration::from_secs(1);
         assert_eq!(
-            probe_if_changed(&cache, &cli, &probe).as_deref(),
-            Some("settled"),
-            "the same stamp is asked again after a failure"
+            probe_if_changed(&cache, &cli, &probe, after).as_deref(),
+            Some("settled")
         );
-        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            probe_if_changed(&cache, &cli, &probe, after).as_deref(),
+            Some("settled")
+        );
+        assert_eq!(calls.get(), 4, "a success is remembered");
     }
 
     #[test]
     fn a_missing_binary_is_unknown() {
-        let cache = std::sync::Mutex::new(None);
+        let cache = cache();
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            probe_if_changed(&cache, &dir.path().join("nope"), &|_| Some("x".into())),
+            probe_if_changed(
+                &cache,
+                &dir.path().join("nope"),
+                &|_| Some("x".into()),
+                Instant::now()
+            ),
             None
         );
     }

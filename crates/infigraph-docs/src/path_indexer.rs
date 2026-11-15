@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use infigraph_core::watch::sink::{PathIndexer, PathOutcome};
 
-use crate::{embed, find_repo_root, is_document_file, is_local_document_id, DocIndex};
+use crate::{find_repo_root, is_document_file, is_local_document_id, DocIndex};
 
 impl DocIndex {
     /// The stored id of the document at `path` (absolute, or relative to the
@@ -59,7 +59,7 @@ impl DocIndex {
         let refs: Vec<&str> = doomed.iter().map(String::as_str).collect();
         store.delete_docs_by_ids(&refs)?;
         if !self.skip_file_embeddings {
-            embed::update_doc_embeddings(store, &self.root, &[], &refs)?;
+            self.update_embeddings(store, &[], &refs)?;
         }
         Ok(doomed.len())
     }

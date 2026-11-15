@@ -521,6 +521,9 @@ pub fn tool_index_confluence_pages(args: &Value) -> Result<String> {
         let chunk_refs: Vec<&infigraph_docs::chunk::Chunk> = all_chunks.iter().collect();
         let changed_files: Vec<&str> = docs.iter().map(|d| d.file.as_str()).collect();
         infigraph_docs::embed::update_doc_embeddings(store, &root, &chunk_refs, &changed_files)?;
+    } else {
+        // Nothing to embed: see `infigraph_confluence::sync`.
+        infigraph_docs::embed::confirm_doc_embeddings(&root);
     }
 
     if !docs.is_empty() {

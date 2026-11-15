@@ -55,6 +55,12 @@ pub struct DocIndex {
     namespace: Option<String>,
     /// How long a pipeline plugin may take to start and to answer.
     pipeline_timeouts: ChildTimeouts,
+    /// Set when the run in progress wrote document embeddings. A run that did
+    /// is not confirmed at its end (`settle_embeddings`): an embedder that
+    /// failed for some chunk leaves them without vectors and the call still
+    /// returns, so "finished" does not say "complete". Only a run that
+    /// embedded nothing leaves the file as it was and can vouch for it.
+    embedded_this_run: std::sync::atomic::AtomicBool,
     /// The shared docs lock, held for this index's lifetime when it opened
     /// the store locally for reading (`open_existing`). Declared last so
     /// the store closes before the lock is released.
@@ -98,6 +104,7 @@ impl DocIndex {
             skip_file_embeddings: false,
             namespace: None,
             pipeline_timeouts: ChildTimeouts::DEFAULT,
+            embedded_this_run: std::sync::atomic::AtomicBool::new(false),
             read_lock: None,
         })
     }
@@ -398,6 +405,19 @@ impl DocIndex {
         })
     }
 
+    /// `embed::update_doc_embeddings` for this run, which it marks as one that
+    /// embedded (`embedded_this_run`).
+    fn update_embeddings(
+        &self,
+        store: &dyn DocBackend,
+        chunks: &[&Chunk],
+        changed_files: &[&str],
+    ) -> Result<usize> {
+        self.embedded_this_run
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        embed::update_doc_embeddings(store, &self.root, chunks, changed_files)
+    }
+
     /// The end of a run that did not fail, called from every kind of run (full,
     /// by paths, by deletion) after its last write: it confirms the embeddings
     /// file against the store (`embed::confirm_doc_embeddings`) and reports the
@@ -407,7 +427,13 @@ impl DocIndex {
     /// told to skip embeddings does neither.
     fn settle_embeddings(&self, store: &dyn DocBackend) {
         if !self.skip_file_embeddings && !infigraph_core::daemon::lifecycle::is_remote_backend() {
-            embed::confirm_doc_embeddings(&self.root);
+            // A run that wrote embeddings is not confirmed: see `embedded_this_run`.
+            if !self
+                .embedded_this_run
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                embed::confirm_doc_embeddings(&self.root);
+            }
             if let Ok(stats) = store.stats() {
                 infigraph_core::degraded::live::note_doc_embeddings(&self.root, stats.chunk_count);
             }
@@ -505,10 +531,10 @@ impl DocIndex {
                     );
                 }
             } else {
-                embed::update_doc_embeddings(store, &self.root, &all_chunks, &changed_files)?;
+                self.update_embeddings(store, &all_chunks, &changed_files)?;
             }
             #[cfg(not(feature = "remote"))]
-            embed::update_doc_embeddings(store, &self.root, &all_chunks, &changed_files)?;
+            self.update_embeddings(store, &all_chunks, &changed_files)?;
         }
         Ok(())
     }
@@ -793,7 +819,7 @@ impl DocIndex {
         if !new_chunks.is_empty() {
             let chunk_refs: Vec<&Chunk> = new_chunks.iter().collect();
             let changed_file_refs: Vec<&str> = changed_files.iter().map(String::as_str).collect();
-            embed::update_doc_embeddings(store, &self.root, &chunk_refs, &changed_file_refs)?;
+            self.update_embeddings(store, &chunk_refs, &changed_file_refs)?;
         }
 
         // Re-run link extraction for all docs (newly discovered may link to each other).
