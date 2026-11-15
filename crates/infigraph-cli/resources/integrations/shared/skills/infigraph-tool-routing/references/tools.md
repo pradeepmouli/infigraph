@@ -1014,9 +1014,9 @@ LM2 memory update: merges similar session records into consolidated summaries (s
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
+| `cross_owner` | boolean |  | `false` | Also merge records written by different sessions (default false) |
 | `path` | string |  |  | see Common parameters |
 | `threshold` | number |  | `0.7` | Similarity threshold for grouping sessions (0.0-1.0, default 0.7) |
-| `cross_owner` | boolean |  | `false` | Also merge records written by different sessions (default false) |
 
 
 ## Context compression
