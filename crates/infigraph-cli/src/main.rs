@@ -1148,7 +1148,7 @@ pub(crate) enum WorktreeAction {
         #[arg(long)]
         global: bool,
     },
-    /// Reclaim the graphs and build directories of finished worktrees (dry run unless --apply)
+    /// Reclaim the graphs and build directories of worktrees (dry run unless --apply)
     ///
     /// A worktree is finished when git says so -- clean, on a branch contained in
     /// another ref (or detached at a reachable commit), not locked -- and nothing
@@ -1156,20 +1156,35 @@ pub(crate) enum WorktreeAction {
     /// sessions/ and anything unlisted stay.
     /// A brand-new worktree on a fresh branch with no commits of its own counts as
     /// finished (its branch is contained in its base); only its derived files go.
+    ///
+    /// Name trees to clean only those (any path inside each; the rest are left
+    /// out of the list). --unfinished also takes trees with uncommitted changes or
+    /// unmerged commits: from them the same derived data goes (the graph, a
+    /// git-ignored target/, with --deps a git-ignored node_modules/), never a source
+    /// file, tracked or not, and never their restore points. A tree some process or
+    /// lock holds, a locked one, the main one and the current directory are always
+    /// skipped, and a named tree that is skipped is shown with its reason. Dry run
+    /// is the default; --apply re-checks each tree right before it deletes.
     Clean {
+        /// Trees to clean: any path inside each. Default: every worktree of the repo
+        #[arg(value_name = "PATH")]
+        paths: Vec<std::path::PathBuf>,
         /// Look at every registered project's repo instead of just the current one
         #[arg(long)]
         global: bool,
         /// Delete. Without it, print what would go and change nothing
         #[arg(long)]
         apply: bool,
+        /// Also take trees with uncommitted changes or unmerged commits (derived data only)
+        #[arg(long)]
+        unfinished: bool,
         /// Also remove node_modules/ (git-ignored ones only)
         #[arg(long)]
         deps: bool,
         /// Also remove the document index and its sidecars
         #[arg(long)]
         docs: bool,
-        /// Also remove snapshots and quarantined or retired graphs
+        /// Also remove snapshots and quarantined or retired graphs (never from an unfinished tree)
         #[arg(long)]
         restore_points: bool,
     },
@@ -1650,8 +1665,10 @@ fn run(command: Commands, root: &Path, root_given: bool) -> Result<()> {
                 worktree_commands::cmd_worktree_reconcile(global)
             }
             WorktreeAction::Clean {
+                paths,
                 global,
                 apply,
+                unfinished,
                 deps,
                 docs,
                 restore_points,
@@ -1662,6 +1679,8 @@ fn run(command: Commands, root: &Path, root_given: bool) -> Result<()> {
                     deps,
                     docs,
                     restore_points,
+                    unfinished,
+                    only: paths,
                 },
             ),
         },

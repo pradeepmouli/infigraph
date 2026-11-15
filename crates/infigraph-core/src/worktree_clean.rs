@@ -29,15 +29,26 @@ use crate::ops::{classify_entry, EntryClass};
 use crate::project::canonicalize_lenient;
 use crate::worktree::{find_worktree_drift, git_common_dir, list_worktrees, GitWorktree};
 
-/// What to remove beyond the always-derived artifacts.
-#[derive(Debug, Clone, Copy, Default)]
+/// What to remove beyond the always-derived artifacts, and which trees.
+#[derive(Debug, Clone, Default)]
 pub struct Options {
     /// Also `node_modules/` (git-ignored ones only).
     pub deps: bool,
     /// Also the document index and its sidecars.
     pub docs: bool,
-    /// Also snapshots and quarantined or retired graphs.
+    /// Also snapshots and quarantined or retired graphs, but never from an
+    /// unfinished tree: they are the safety net of work still in progress.
     pub restore_points: bool,
+    /// Also trees that are not finished: with uncommitted changes, or on a
+    /// branch no other ref contains. Only what a finished tree gives up goes
+    /// (never a tracked or untracked source file); every other refusal
+    /// (main, the current directory, `git worktree lock`, a held lock or
+    /// process, a missing directory, a git failure) still applies.
+    pub unfinished: bool,
+    /// Only these trees, each named by any path inside it; empty means every
+    /// worktree of the repos in scope. A named tree that is skipped is shown
+    /// with its reason.
+    pub only: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +102,31 @@ impl std::fmt::Display for Skip {
     }
 }
 
+/// Why a tree counts as unfinished, when `--unfinished` took it anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unfinished {
+    /// Paths git reports as changed or untracked.
+    pub dirty: usize,
+    /// No other ref contains its commit.
+    pub not_contained: bool,
+}
+
+impl Unfinished {
+    /// What is unfinished about it, in words.
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        match self.dirty {
+            0 => {}
+            1 => parts.push("1 path with uncommitted changes".to_string()),
+            n => parts.push(format!("{n} paths with uncommitted changes")),
+        }
+        if self.not_contained {
+            parts.push("not merged into any other ref".to_string());
+        }
+        parts.join("; ")
+    }
+}
+
 /// Something deliberately left in place, with its size.
 #[derive(Debug, Clone)]
 pub struct Kept {
@@ -104,6 +140,8 @@ pub struct WorktreePlan {
     /// The branch's short name; `None` when detached.
     pub branch: Option<String>,
     pub skip: Option<Skip>,
+    /// Set when the tree is not finished and `--unfinished` selected it.
+    pub unfinished: Option<Unfinished>,
     /// Empty when the worktree is skipped.
     pub items: Vec<Item>,
     pub kept: Vec<Kept>,
@@ -115,10 +153,17 @@ pub struct WorktreePlan {
 pub struct RepoPlan {
     pub main: PathBuf,
     pub worktrees: Vec<WorktreePlan>,
+    /// Worktrees of the repo that `Options::only` did not name (not listed).
+    pub not_selected: usize,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct CleanPlan {
+    /// `--unfinished` was asked for.
+    pub unfinished_mode: bool,
+    /// Named paths that are inside no worktree of any repo. Nothing may be
+    /// applied while there are any: a mistyped name must not widen the scope.
+    pub unmatched: Vec<PathBuf>,
     pub repos: Vec<RepoPlan>,
     /// Registry entries whose directory is gone: evicted by the same
     /// teardown `worktree reconcile` uses.
@@ -138,47 +183,118 @@ pub struct Applied {
 
 /// Plan a clean. `scope` is the repo to look at (any path in it), or `None`
 /// for every repo in the registry; `cwd` is the directory the process runs in.
+/// With `options.only`, the trees it names are planned (in whatever repo they
+/// are) and nothing else, and no registry entry is evicted.
 pub fn plan(registry: &Registry, scope: Option<&Path>, cwd: &Path, options: &Options) -> CleanPlan {
-    let anchors: Vec<PathBuf> = match scope {
-        Some(path) => vec![path.to_path_buf()],
-        None => registry.repos.values().map(|e| e.path.clone()).collect(),
+    let mut plan = CleanPlan {
+        unfinished_mode: options.unfinished,
+        ..CleanPlan::default()
     };
-    let mut plan = CleanPlan::default();
-    let mut seen = HashSet::new();
-    for anchor in anchors {
-        // A registry path that is gone has no repo to look at; it shows up
-        // in `dead_registry` below instead.
-        let Ok(common) = git_common_dir(&anchor) else {
-            continue;
+    // A repo to look at, and the named paths that lie in it.
+    let mut groups: Vec<(PathBuf, PathBuf, Vec<&Path>)> = Vec::new();
+    if options.only.is_empty() {
+        let anchors: Vec<PathBuf> = match scope {
+            Some(path) => vec![path.to_path_buf()],
+            None => registry.repos.values().map(|e| e.path.clone()).collect(),
         };
-        if !seen.insert(common) {
-            continue;
+        for anchor in anchors {
+            // A registry path that is gone has no repo to look at; it shows
+            // up in `dead_registry` below instead.
+            let Ok(common) = git_common_dir(&anchor) else {
+                continue;
+            };
+            if !groups.iter().any(|(c, _, _)| *c == common) {
+                groups.push((common, anchor, Vec::new()));
+            }
         }
-        if let Some(repo) = plan_repo(&anchor, cwd, options) {
-            plan.repos.push(repo);
+    } else {
+        for named in &options.only {
+            let Ok(common) = git_common_dir(named) else {
+                plan.unmatched.push(named.clone());
+                continue;
+            };
+            match groups.iter_mut().find(|(c, _, _)| *c == common) {
+                Some((_, _, named_paths)) => named_paths.push(named),
+                None => groups.push((common, named.clone(), vec![named])),
+            }
+        }
+    }
+    for (_, anchor, named) in &groups {
+        match plan_repo(anchor, cwd, options, named) {
+            Some((repo, unmatched)) => {
+                plan.repos.push(repo);
+                plan.unmatched.extend(unmatched);
+            }
+            // The repo could not be listed: its named paths are not placed.
+            None => plan.unmatched.extend(named.iter().map(|p| p.to_path_buf())),
         }
     }
     plan.repos.sort_by(|a, b| a.main.cmp(&b.main));
 
-    // The same pure function `worktree reconcile` acts on.
-    let mut dead = find_worktree_drift(registry, scope).teardown_candidates;
-    dead.sort();
-    plan.dead_registry = dead;
+    if options.only.is_empty() {
+        // The same pure function `worktree reconcile` acts on.
+        let mut dead = find_worktree_drift(registry, scope).teardown_candidates;
+        dead.sort();
+        plan.dead_registry = dead;
+    }
     plan.free_bytes = fs2::available_space(scope.unwrap_or(cwd)).ok();
     plan
 }
 
-fn plan_repo(anchor: &Path, cwd: &Path, options: &Options) -> Option<RepoPlan> {
+/// The index in `listed` of the worktree that contains `path`: the deepest
+/// one, since a linked worktree may sit inside the main checkout.
+fn owning_worktree(listed: &[GitWorktree], path: &Path) -> Option<usize> {
+    let path = canonicalize_lenient(path);
+    listed
+        .iter()
+        .enumerate()
+        .filter(|(_, wt)| path.starts_with(canonicalize_lenient(&wt.path)))
+        .max_by_key(|(_, wt)| canonicalize_lenient(&wt.path).components().count())
+        .map(|(i, _)| i)
+}
+
+/// The plan of one repo. `named` is the part of `options.only` that lies in it;
+/// the paths of it that no worktree contains come back as the second value.
+fn plan_repo(
+    anchor: &Path,
+    cwd: &Path,
+    options: &Options,
+    named: &[&Path],
+) -> Option<(RepoPlan, Vec<PathBuf>)> {
     let listed = list_worktrees(anchor).ok()?;
     let main = listed.first()?.path.clone();
     let paths: Vec<&Path> = listed.iter().map(|w| w.path.as_path()).collect();
     let procs = crate::ps::list_infigraph_processes(&paths);
-    let worktrees = listed
+    let mut unmatched = Vec::new();
+    let selected: Option<HashSet<usize>> = if options.only.is_empty() {
+        None
+    } else {
+        let mut chosen = HashSet::new();
+        for path in named {
+            match owning_worktree(&listed, path) {
+                Some(i) => {
+                    chosen.insert(i);
+                }
+                None => unmatched.push(path.to_path_buf()),
+            }
+        }
+        Some(chosen)
+    };
+    let worktrees: Vec<WorktreePlan> = listed
         .iter()
         .enumerate()
+        .filter(|(i, _)| selected.as_ref().is_none_or(|chosen| chosen.contains(i)))
         .map(|(i, wt)| plan_worktree(anchor, wt, i == 0, cwd, options, &procs))
         .collect();
-    Some(RepoPlan { main, worktrees })
+    let not_selected = listed.len() - worktrees.len();
+    Some((
+        RepoPlan {
+            main,
+            worktrees,
+            not_selected,
+        },
+        unmatched,
+    ))
 }
 
 fn short_branch(wt: &GitWorktree) -> Option<String> {
@@ -197,10 +313,12 @@ fn plan_worktree(
     options: &Options,
     procs: &[crate::ps::ProcessRow],
 ) -> WorktreePlan {
+    let (skip, unfinished) = judge(repo_dir, wt, is_main, cwd, options, procs);
     let mut plan = WorktreePlan {
         path: wt.path.clone(),
         branch: short_branch(wt),
-        skip: skip_reason(repo_dir, wt, is_main, cwd, procs),
+        skip,
+        unfinished,
         items: Vec::new(),
         kept: Vec::new(),
         notes: Vec::new(),
@@ -211,36 +329,52 @@ fn plan_worktree(
     plan
 }
 
-fn skip_reason(
+/// Whether the worktree is left alone, or taken, and if it is taken though not
+/// finished, why it is not. Without `options.unfinished` a tree that is dirty
+/// or unmerged is skipped; with it, that is all that changes: every other
+/// refusal below stands, and a held tree is skipped last, whatever else is
+/// true of it.
+fn judge(
     repo_dir: &Path,
     wt: &GitWorktree,
     is_main: bool,
     cwd: &Path,
+    options: &Options,
     procs: &[crate::ps::ProcessRow],
-) -> Option<Skip> {
+) -> (Option<Skip>, Option<Unfinished>) {
     if is_main {
-        return Some(Skip::Main);
+        return (Some(Skip::Main), None);
     }
     if canonicalize_lenient(cwd).starts_with(canonicalize_lenient(&wt.path)) {
-        return Some(Skip::CurrentDirectory);
+        return (Some(Skip::CurrentDirectory), None);
     }
     if let Some(reason) = &wt.locked {
-        return Some(Skip::GitLocked(reason.clone()));
+        return (Some(Skip::GitLocked(reason.clone())), None);
     }
     if wt.prunable || !wt.path.is_dir() {
-        return Some(Skip::PathGone);
+        return (Some(Skip::PathGone), None);
     }
+    let mut unfinished = Unfinished {
+        dirty: 0,
+        not_contained: false,
+    };
     match dirty_paths(&wt.path) {
         Ok(0) => {}
-        Ok(n) => return Some(Skip::Dirty(n)),
-        Err(e) => return Some(Skip::Unreadable(format!("{e:#}"))),
+        Ok(n) if options.unfinished => unfinished.dirty = n,
+        Ok(n) => return (Some(Skip::Dirty(n)), None),
+        Err(e) => return (Some(Skip::Unreadable(format!("{e:#}"))), None),
     }
     match is_contained(repo_dir, wt) {
         Ok(true) => {}
-        Ok(false) => return Some(Skip::NotContained),
-        Err(e) => return Some(Skip::Unreadable(format!("{e:#}"))),
+        Ok(false) if options.unfinished => unfinished.not_contained = true,
+        Ok(false) => return (Some(Skip::NotContained), None),
+        Err(e) => return (Some(Skip::Unreadable(format!("{e:#}"))), None),
     }
-    holder(wt, procs).map(Skip::Held)
+    if let Some(held) = holder(wt, procs) {
+        return (Some(Skip::Held(held)), None);
+    }
+    let unfinished = (unfinished.dirty > 0 || unfinished.not_contained).then_some(unfinished);
+    (None, unfinished)
 }
 
 fn git_output(dir: &Path, args: &[&str]) -> Result<String> {
@@ -370,18 +504,24 @@ fn collect_items(plan: &mut WorktreePlan, options: &Options) {
                     bytes: bytes(),
                 }),
                 EntryClass::DocsStore => docs_bytes += bytes(),
-                EntryClass::RestorePoint if options.restore_points => plan.items.push(Item {
-                    path: entry.path(),
-                    kind: ItemKind::RestorePoint,
-                    bytes: bytes(),
-                }),
+                EntryClass::RestorePoint if options.restore_points && plan.unfinished.is_none() => {
+                    plan.items.push(Item {
+                        path: entry.path(),
+                        kind: ItemKind::RestorePoint,
+                        bytes: bytes(),
+                    })
+                }
                 EntryClass::RestorePoint => restore_bytes += bytes(),
             }
         }
     }
     if restore_bytes > 0 {
         plan.kept.push(Kept {
-            what: "restore points",
+            what: if plan.unfinished.is_some() {
+                "restore points: never taken from an unfinished tree"
+            } else {
+                "restore points"
+            },
             bytes: restore_bytes,
         });
     }
@@ -506,6 +646,15 @@ fn remove_item(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// What an unfinished tree needs afterwards: without its code store it
+/// resolves to itself as `worktree-has-no-index`.
+fn index_again(path: &Path) -> String {
+    format!(
+        "run `infigraph worktree init {}` to index it again",
+        path.display()
+    )
+}
+
 fn human(bytes: u64) -> String {
     const MB: f64 = 1024.0 * 1024.0;
     if bytes >= 1024 * 1024 * 1024 {
@@ -535,9 +684,31 @@ pub fn render(plan: &CleanPlan, applied: Option<&Applied>) -> String {
         };
         let _ = writeln!(out, "free space: {} ({verdict})", human(free));
     }
+    if plan.unfinished_mode {
+        let taken = plan
+            .repos
+            .iter()
+            .flat_map(|r| &r.worktrees)
+            .filter(|w| w.skip.is_none() && w.unfinished.is_some())
+            .count();
+        let _ = writeln!(
+            out,
+            "--unfinished: {taken} tree{} with uncommitted or unmerged work {} selected; only derived data is removed, source is never touched",
+            if taken == 1 { "" } else { "s" },
+            if taken == 1 { "is" } else { "are" },
+        );
+    }
     let mut reclaimable = 0;
     for repo in &plan.repos {
         let _ = writeln!(out, "\nrepo {}", repo.main.display());
+        if repo.not_selected > 0 {
+            let _ = writeln!(
+                out,
+                "  ({} other worktree{} not selected)",
+                repo.not_selected,
+                if repo.not_selected == 1 { "" } else { "s" }
+            );
+        }
         for w in &repo.worktrees {
             let branch = w.branch.as_deref().unwrap_or("(detached)");
             match &w.skip {
@@ -547,9 +718,13 @@ pub fn render(plan: &CleanPlan, applied: Option<&Applied>) -> String {
                 None => {
                     let bytes: u64 = w.items.iter().map(|i| i.bytes).sum();
                     reclaimable += bytes;
+                    let label = match &w.unfinished {
+                        Some(why) => format!(" (unfinished: {})", why.describe()),
+                        None => String::new(),
+                    };
                     let _ = writeln!(
                         out,
-                        "  {} [{branch}]  eligible: reclaim {}",
+                        "  {} [{branch}]  eligible{label}: reclaim {}",
                         w.path.display(),
                         human(bytes)
                     );
@@ -567,6 +742,9 @@ pub fn render(plan: &CleanPlan, applied: Option<&Applied>) -> String {
                     }
                     for note in &w.notes {
                         let _ = writeln!(out, "      note: {note}");
+                    }
+                    if w.unfinished.is_some() {
+                        let _ = writeln!(out, "      {}", index_again(&w.path));
                     }
                 }
             }
@@ -592,6 +770,14 @@ pub fn render(plan: &CleanPlan, applied: Option<&Applied>) -> String {
         let _ = writeln!(out, "\napplied:");
         for (path, bytes) in &applied.cleaned {
             let _ = writeln!(out, "  cleaned {} ({})", path.display(), human(*bytes));
+            let unfinished = plan
+                .repos
+                .iter()
+                .flat_map(|r| &r.worktrees)
+                .any(|w| w.path == *path && w.unfinished.is_some());
+            if unfinished {
+                let _ = writeln!(out, "      {}", index_again(path));
+            }
         }
         for (path, why) in &applied.changed {
             let _ = writeln!(out, "  skipped {}: {why}", path.display());
@@ -647,6 +833,13 @@ mod tests {
             let main = std::fs::canonicalize(tmp.path()).unwrap().join("main");
             std::fs::create_dir_all(&main).unwrap();
             git(&main, &["init", "-q", "-b", "main"]);
+            // Git's automatic maintenance runs in the background after a
+            // commit and creates `.git/objects/maintenance.lock` while it does,
+            // which the tests that compare the whole tree before and after
+            // (`a_dry_run_changes_nothing`) took for a change. Off, so a real
+            // stray file is still what fails them.
+            git(&main, &["config", "maintenance.auto", "false"]);
+            git(&main, &["config", "gc.auto", "0"]);
             write(&main.join(".gitignore"), 0);
             std::fs::write(
                 main.join(".gitignore"),
@@ -811,6 +1004,7 @@ mod tests {
                 deps: true,
                 docs: false,
                 restore_points: false,
+                ..Options::default()
             },
         );
         let listed = names(find(&plan, &wt));
@@ -841,6 +1035,7 @@ mod tests {
                 deps: false,
                 docs: true,
                 restore_points: true,
+                ..Options::default()
             },
         );
         let listed = names(find(&plan, &wt));
@@ -1181,6 +1376,7 @@ mod tests {
                 deps: true,
                 docs: true,
                 restore_points: true,
+                ..Options::default()
             },
         );
         let _ = render(&plan, None);
@@ -1331,5 +1527,334 @@ mod tests {
         assert!(table.contains("kept (restore points)"), "{table}");
         assert!(table.contains("kept (docs store)"), "{table}");
         assert!(table.contains("dry run"), "{table}");
+    }
+
+    // ---- --unfinished and named trees ----
+
+    fn unfinished_options() -> Options {
+        Options {
+            unfinished: true,
+            ..Options::default()
+        }
+    }
+
+    /// A tree with unmerged work: a commit no other ref has, a modified tracked
+    /// file, an untracked file, a seeded `.infigraph/` and an ignored `target/`.
+    fn unfinished_tree(repo: &Repo, name: &str) -> PathBuf {
+        let wt = repo.branch(name);
+        std::fs::write(wt.join("a.txt"), b"edited").unwrap();
+        write(&wt.join("scratch.txt"), 7);
+        seed(&wt);
+        write(&wt.join("target").join("debug").join("f"), 3000);
+        wt
+    }
+
+    #[test]
+    fn an_unfinished_tree_is_skipped_unless_asked() {
+        let repo = Repo::new();
+        let wt = unfinished_tree(&repo, "wip");
+        let plan = plan_for(&repo, &options());
+        assert!(
+            matches!(find(&plan, &wt).skip, Some(Skip::Dirty(2))),
+            "{:?}",
+            find(&plan, &wt).skip
+        );
+        assert!(!plan.unfinished_mode);
+    }
+
+    /// The point of the flag: derived data goes from a tree with uncommitted
+    /// and unmerged work, and not one byte of that work changes.
+    #[test]
+    fn unfinished_takes_only_derived_data_and_leaves_every_source_file() {
+        let repo = Repo::new();
+        let wt = unfinished_tree(&repo, "wip");
+        let head = git(&wt, &["rev-parse", "HEAD"]);
+        let status = git(&wt, &["status", "--porcelain"]);
+
+        let plan = plan_for(&repo, &unfinished_options());
+        let w = find(&plan, &wt);
+        assert_eq!(w.skip, None);
+        assert_eq!(
+            w.unfinished,
+            Some(Unfinished {
+                dirty: 2,
+                not_contained: true
+            })
+        );
+        let applied = apply(&plan, &repo.main, &unfinished_options(), &mut no_teardown());
+        assert!(applied.failed.is_empty(), "{:?}", applied.failed);
+        assert_eq!(applied.cleaned.len(), 1);
+
+        let ig = wt.join(".infigraph");
+        for gone in [
+            crate::graph::names::STEM,
+            "embeddings.bin",
+            "bm25_cache.bin",
+            "daemon.log",
+        ] {
+            assert!(!ig.join(gone).exists(), "{gone} should have gone");
+        }
+        assert!(!wt.join("target").exists(), "an ignored target/ goes");
+
+        // Source, tracked and untracked, is exactly as it was.
+        assert_eq!(std::fs::read(wt.join("a.txt")).unwrap(), b"edited");
+        assert_eq!(
+            std::fs::read(wt.join("scratch.txt")).unwrap(),
+            vec![b'x'; 7]
+        );
+        assert_eq!(git(&wt, &["status", "--porcelain"]), status);
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]), head);
+        // And what is the user's, or opt-in, stays.
+        for kept in [
+            "config.toml",
+            "sessions/s.md",
+            "structured-schemas/x.toml",
+            "learned/l.json",
+            "my-notes.txt",
+            "docs.kuzu",
+            "docs_embeddings.bin",
+        ] {
+            assert!(ig.join(kept).exists(), "{kept} should have stayed");
+        }
+        assert!(ig.join("snapshots").exists(), "a restore point stays");
+    }
+
+    #[test]
+    fn unfinished_never_takes_restore_points_even_when_asked() {
+        let repo = Repo::new();
+        let wt = unfinished_tree(&repo, "wip");
+        let options = Options {
+            unfinished: true,
+            restore_points: true,
+            ..Options::default()
+        };
+        let plan = plan_for(&repo, &options);
+        let w = find(&plan, &wt);
+        let listed = names(w);
+        assert!(!listed.contains(&"snapshots".to_string()), "{listed:?}");
+        assert!(
+            !listed.iter().any(|n| n.contains(".corrupt.")),
+            "{listed:?}"
+        );
+        assert!(
+            w.kept
+                .iter()
+                .any(|k| k.what.starts_with("restore points: never taken")),
+            "{:?}",
+            w.kept
+        );
+        // A finished tree with the same flags still gives them up.
+        let done = repo.branch("done");
+        repo.merge("done");
+        seed(&done);
+        let plan = plan_for(&repo, &options);
+        assert!(names(find(&plan, &done)).contains(&"snapshots".to_string()));
+    }
+
+    /// `--unfinished` lifts the dirty and unmerged refusals and no other.
+    #[test]
+    fn unfinished_does_not_override_the_other_refusals() {
+        use fs2::FileExt;
+        let repo = Repo::new();
+        let options = unfinished_options();
+
+        // Held by a process.
+        let held_wt = unfinished_tree(&repo, "held");
+        let lock_path = held_wt.join(".infigraph").join("watch.lock");
+        write(&lock_path, 0);
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        held.try_lock_exclusive().unwrap();
+
+        // Locked by the user.
+        let locked_wt = unfinished_tree(&repo, "locked");
+        git(
+            &repo.main,
+            &["worktree", "lock", locked_wt.to_str().unwrap()],
+        );
+
+        // The one the process runs in.
+        let here_wt = unfinished_tree(&repo, "here");
+
+        let plan = plan(&repo.registry(), Some(&repo.main), &here_wt, &options);
+        assert!(
+            matches!(find(&plan, &held_wt).skip, Some(Skip::Held(ref why)) if why.contains("watch.lock")),
+            "{:?}",
+            find(&plan, &held_wt).skip
+        );
+        assert!(
+            matches!(find(&plan, &locked_wt).skip, Some(Skip::GitLocked(_))),
+            "{:?}",
+            find(&plan, &locked_wt).skip
+        );
+        assert_eq!(find(&plan, &here_wt).skip, Some(Skip::CurrentDirectory));
+        assert_eq!(find(&plan, &repo.main).skip, Some(Skip::Main));
+        // Applying removes nothing from any of them.
+        let applied = apply(&plan, &here_wt, &options, &mut no_teardown());
+        assert!(applied.cleaned.is_empty(), "{:?}", applied.cleaned);
+        assert!(held_wt
+            .join(".infigraph")
+            .join(crate::graph::names::STEM)
+            .exists());
+        assert!(locked_wt.join("target").exists());
+        drop(held);
+    }
+
+    #[test]
+    fn a_tree_that_becomes_held_before_the_delete_is_left_alone() {
+        use fs2::FileExt;
+        let repo = Repo::new();
+        let wt = unfinished_tree(&repo, "wip");
+        let plan = plan_for(&repo, &unfinished_options());
+        assert_eq!(find(&plan, &wt).skip, None);
+
+        let lock_path = wt.join(".infigraph").join("watch.lock");
+        write(&lock_path, 0);
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        held.try_lock_exclusive().unwrap();
+        let applied = apply(&plan, &repo.main, &unfinished_options(), &mut no_teardown());
+        assert!(applied.cleaned.is_empty(), "{:?}", applied.cleaned);
+        assert_eq!(applied.changed.len(), 1, "{:?}", applied.changed);
+        assert!(wt.join("target").exists());
+        drop(held);
+    }
+
+    #[test]
+    fn a_target_git_does_not_ignore_stays_in_an_unfinished_tree() {
+        let repo = Repo::new();
+        let wt = unfinished_tree(&repo, "wip");
+        std::fs::write(wt.join(".gitignore"), ".infigraph/\n").unwrap();
+        let plan = plan_for(&repo, &unfinished_options());
+        let w = find(&plan, &wt);
+        assert!(!names(w).contains(&"target".to_string()));
+        assert!(
+            w.notes.iter().any(|n| n.contains("not git-ignored")),
+            "{:?}",
+            w.notes
+        );
+    }
+
+    #[test]
+    fn a_named_tree_is_the_only_one_planned_and_no_registry_entry_is_evicted() {
+        let repo = Repo::new();
+        let a = unfinished_tree(&repo, "wa");
+        let b = unfinished_tree(&repo, "wb");
+        std::fs::create_dir_all(a.join("sub")).unwrap();
+        let options = Options {
+            unfinished: true,
+            only: vec![a.join("sub")],
+            ..Options::default()
+        };
+        let plan = plan_for(&repo, &options);
+        assert!(plan.unmatched.is_empty(), "{:?}", plan.unmatched);
+        let listed: Vec<&Path> = plan
+            .repos
+            .iter()
+            .flat_map(|r| r.worktrees.iter())
+            .map(|w| w.path.as_path())
+            .collect();
+        assert_eq!(listed, vec![a.as_path()]);
+        assert_eq!(plan.repos[0].not_selected, 2, "the main tree and b");
+        assert!(plan.dead_registry.is_empty());
+
+        let applied = apply(&plan, &repo.main, &options, &mut no_teardown());
+        assert_eq!(applied.cleaned.len(), 1);
+        assert!(!a.join("target").exists());
+        assert!(b.join("target").exists(), "b was not named");
+        assert!(applied.evicted.is_empty());
+        assert!(render(&plan, None).contains("2 other worktrees not selected"));
+    }
+
+    #[test]
+    fn a_named_tree_that_is_skipped_is_shown_with_its_reason() {
+        let repo = Repo::new();
+        let options = Options {
+            only: vec![repo.main.clone()],
+            ..Options::default()
+        };
+        let plan = plan_for(&repo, &options);
+        assert_eq!(find(&plan, &repo.main).skip, Some(Skip::Main));
+        assert!(render(&plan, None).contains("skipped: the main worktree"));
+    }
+
+    #[test]
+    fn a_named_path_in_no_worktree_is_reported_and_nothing_is_planned_for_it() {
+        let repo = Repo::new();
+        let stray = tempfile::tempdir().unwrap();
+        let options = Options {
+            only: vec![stray.path().to_path_buf()],
+            ..Options::default()
+        };
+        let plan = plan_for(&repo, &options);
+        assert_eq!(plan.unmatched, vec![stray.path().to_path_buf()]);
+        assert!(plan.repos.is_empty());
+    }
+
+    /// The preview says the scope in words before the detail, an unfinished
+    /// tree's line ends with the way back (dry run and apply alike), and a
+    /// finished tree's does not.
+    #[test]
+    fn the_output_names_the_scope_and_the_way_back() {
+        let repo = Repo::new();
+        let wip = unfinished_tree(&repo, "wip");
+        let done = repo.branch("done");
+        repo.merge("done");
+        seed(&done);
+        let plan = plan_for(&repo, &unfinished_options());
+        let dry = render(&plan, None);
+        let scope = "--unfinished: 1 tree with uncommitted or unmerged work is selected; only derived data is removed, source is never touched";
+        assert!(dry.contains(scope), "{dry}");
+        assert!(
+            dry.find(scope).unwrap() < dry.find("repo ").unwrap(),
+            "the scope comes before the list: {dry}"
+        );
+        let hint = format!(
+            "run `infigraph worktree init {}` to index it again",
+            wip.display()
+        );
+        assert!(dry.contains(&hint), "{dry}");
+        assert!(
+            dry.contains(
+                "(unfinished: 2 paths with uncommitted changes; not merged into any other ref)"
+            ),
+            "{dry}"
+        );
+        assert!(
+            !dry.contains(&format!("worktree init {}", done.display())),
+            "a finished tree needs no re-indexing hint: {dry}"
+        );
+
+        let applied = apply(&plan, &repo.main, &unfinished_options(), &mut no_teardown());
+        let after = render(&plan, Some(&applied));
+        assert!(
+            after.matches(&hint).count() >= 2,
+            "the way back is in the applied part too: {after}"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_changes_nothing_in_an_unfinished_tree_either() {
+        let repo = Repo::new();
+        let _wt = unfinished_tree(&repo, "wip");
+        let before = tree(repo.main.parent().unwrap());
+        let plan = plan_for(
+            &repo,
+            &Options {
+                unfinished: true,
+                deps: true,
+                docs: true,
+                restore_points: true,
+                ..Options::default()
+            },
+        );
+        let _ = render(&plan, None);
+        assert_eq!(tree(repo.main.parent().unwrap()), before);
     }
 }
