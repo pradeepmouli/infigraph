@@ -96,6 +96,10 @@ pub enum DegradedMode {
     /// Documents are indexed but their embeddings are absent, so document
     /// search ranks by keywords only.
     DocEmbeddingsMissing,
+    /// `docs_embeddings.bin` exists but lacks a vector for `chunks` chunks the
+    /// document store holds (the embedder failed on them), so document search
+    /// ranks those by keywords only.
+    DocEmbeddingsPartial { chunks: usize },
     /// `clone-bodies.bin` is missing, so clone detection compares signature
     /// text, not function bodies.
     CloneBodiesUnavailable,
@@ -191,6 +195,7 @@ impl DegradedMode {
             DegradedMode::StoreMigrationPending => "store-migration-pending",
             DegradedMode::WorktreeHasNoIndex => "worktree-has-no-index",
             DegradedMode::DocEmbeddingsMissing => "doc-embeddings-missing",
+            DegradedMode::DocEmbeddingsPartial { .. } => "doc-embeddings-partial",
             DegradedMode::CloneBodiesUnavailable => CLONE_BODIES_UNAVAILABLE,
             DegradedMode::CloneBodiesPartial { .. } => CLONE_BODIES_PARTIAL,
             DegradedMode::DocLinksUnscanned { .. } => DOC_LINKS_UNSCANNED,
@@ -277,6 +282,10 @@ impl DegradedMode {
                 "document embeddings are missing: document search ranks by keywords only"
                     .to_string()
             }
+            DegradedMode::DocEmbeddingsPartial { chunks } => format!(
+                "{chunks} document chunk(s) have no embedding: document search ranks them by \
+                 keywords only"
+            ),
             DegradedMode::CloneBodiesUnavailable => {
                 "clone-bodies.bin is missing: clone detection compares signature text, not \
                  function bodies"
@@ -393,6 +402,10 @@ impl DegradedMode {
                  `[index] max_concurrent_reindexes` in ~/.infigraph/config.toml sets the cap"
             }
             DegradedMode::DocEmbeddingsMissing => "run `infigraph index-docs` to rebuild them",
+            DegradedMode::DocEmbeddingsPartial { .. } => {
+                "the next `infigraph index-docs` run tries them again; if it persists, the \
+                 embedder is failing: `infigraph doctor` reports it"
+            }
             DegradedMode::DocLinksUnscanned { .. } => "run `infigraph index-docs`",
             DegradedMode::DocSyncUnknown { .. } => {
                 "documents are compared with code through git history: use a git checkout where \
@@ -860,6 +873,12 @@ pub fn derived_from_disk(root: &Path) -> Vec<DegradedMode> {
         modes.push(DegradedMode::StoreMigrationPending);
         return modes;
     }
+    // A file establishes it, so every process that looks reports it, not just
+    // the one whose run found the shortfall.
+    let unembedded = crate::embed::read_unembedded_count(&ig.join("docs_embeddings.bin"));
+    if unembedded > 0 {
+        modes.push(DegradedMode::DocEmbeddingsPartial { chunks: unembedded });
+    }
     if crate::daemon::lifecycle::is_remote_backend() || !ig.join(crate::graph::names::STEM).exists()
     {
         return modes;
@@ -1234,6 +1253,7 @@ mod tests {
             DegradedMode::EmbeddingsStale { minutes: 90 },
             DegradedMode::HnswMissing,
             DegradedMode::DocEmbeddingsMissing,
+            DegradedMode::DocEmbeddingsPartial { chunks: 4 },
             DegradedMode::DocLinksUnscanned {
                 unscanned: 3,
                 total: 10,

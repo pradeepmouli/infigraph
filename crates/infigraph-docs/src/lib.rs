@@ -415,7 +415,7 @@ impl DocIndex {
     ) -> Result<usize> {
         self.embedded_this_run
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        embed::update_doc_embeddings(store, &self.root, chunks, changed_files)
+        embed::update_doc_embeddings(store, &self.root, chunks, changed_files).map(|o| o.stored)
     }
 
     /// The end of a run that did not fail, called from every kind of run (full,
@@ -432,7 +432,12 @@ impl DocIndex {
                 .embedded_this_run
                 .swap(false, std::sync::atomic::Ordering::Relaxed)
             {
-                embed::confirm_doc_embeddings(&self.root);
+                // A run with nothing new to embed still makes the one attempt
+                // per run at chunks an earlier run could not embed; the file it
+                // then writes needs no confirmation, one that stayed whole does.
+                if !embed::retry_unembedded(store, &self.root) {
+                    embed::confirm_doc_embeddings(&self.root);
+                }
             }
             if let Ok(stats) = store.stats() {
                 infigraph_core::degraded::live::note_doc_embeddings(&self.root, stats.chunk_count);

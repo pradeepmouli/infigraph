@@ -1,12 +1,12 @@
 use std::path::Path;
+
 use std::sync::Arc;
 
 use anyhow::Result;
-use rayon::prelude::*;
-
 use infigraph_core::embed::{
-    doc_embedder, invalidate_embeddings_cache, load_embeddings, record_unchanged_generation,
-    save_embeddings, sync_hnsw_index_delta, EmbStamp, HnswDelta, HnswSync,
+    doc_embedder, embed_in_batches, invalidate_embeddings_cache, load_embeddings,
+    read_unembedded_count, record_unchanged_generation, save_embeddings, sync_hnsw_index_delta,
+    write_unembedded_count, EmbStamp, EmbedProvider, HnswDelta, HnswSync,
 };
 
 use crate::backend::DocBackend;
@@ -28,7 +28,10 @@ const DOCS_HNSW_FILE: &str = "docs_hnsw_index.usearch";
 pub fn confirm_doc_embeddings(root: &Path) {
     let tg_dir = root.join(".infigraph");
     let emb_path = tg_dir.join("docs_embeddings.bin");
-    if !emb_path.exists() {
+    // A file that lacks vectors for chunks the store holds is not "up to date
+    // with it", whatever the run that is ending changed: the marker moves only
+    // when nothing is missing (see `read_unembedded_count`).
+    if !emb_path.exists() || read_unembedded_count(&emb_path) > 0 {
         return;
     }
     let now = std::time::SystemTime::now()
@@ -38,13 +41,58 @@ pub fn confirm_doc_embeddings(root: &Path) {
     record_unchanged_generation(&emb_path, &tg_dir.join(DOCS_HNSW_FILE), now);
 }
 
+/// What an update of `docs_embeddings.bin` left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocEmbedOutcome {
+    /// Vectors in the file.
+    pub stored: usize,
+    /// Chunks the store holds that have no vector in it (the embedder failed or
+    /// returned too few, now or on an earlier run). Also recorded beside the
+    /// file (`write_unembedded_count`), where a process that did not run the
+    /// update reads it.
+    pub not_embedded: usize,
+}
+
+/// The text a chunk is embedded as: its file's path context and heading in front
+/// of its text, so a query that names the topic or the place matches it.
+fn chunk_embed_text(doc_file: &str, heading: Option<&str>, text: &str) -> String {
+    match (doc_path_context(doc_file), heading) {
+        (Some(ctx), Some(h)) => format!("{ctx} > {h}: {text}"),
+        (Some(ctx), None) => format!("{ctx}: {text}"),
+        (None, Some(h)) => format!("{h}: {text}"),
+        (None, None) => text.to_string(),
+    }
+}
+
+/// A docs run that had nothing new to embed: if an earlier run left chunks
+/// without a vector (`read_unembedded_count`), try them once more, so the
+/// shortfall closes without waiting for their files to change. `true` when it
+/// ran an update (the file was rewritten, so the caller does not confirm it).
+/// A failing embedder costs one empty batch call and one log line per run.
+pub fn retry_unembedded(store: &dyn DocBackend, root: &Path) -> bool {
+    retry_unembedded_with(store, root, &doc_embedder)
+}
+
+/// [`retry_unembedded`] with the embedder it runs, for a test that has to fail one.
+pub(crate) fn retry_unembedded_with(
+    store: &dyn DocBackend,
+    root: &Path,
+    make_embedder: &dyn Fn() -> Arc<dyn EmbedProvider>,
+) -> bool {
+    let emb_path = root.join(".infigraph").join("docs_embeddings.bin");
+    if read_unembedded_count(&emb_path) == 0 {
+        return false;
+    }
+    update_doc_embeddings_with(store, root, &[], &[], make_embedder).is_ok()
+}
+
 pub fn update_doc_embeddings(
     store: &dyn DocBackend,
     root: &Path,
     new_chunks: &[&Chunk],
     changed_files: &[&str],
-) -> Result<usize> {
-    update_doc_embeddings_synced(store, root, new_chunks, changed_files).map(|(count, _)| count)
+) -> Result<DocEmbedOutcome> {
+    update_doc_embeddings_synced(store, root, new_chunks, changed_files).map(|(out, _)| out)
 }
 
 /// [`update_doc_embeddings`], also saying what it did to the HNSW index
@@ -54,7 +102,19 @@ pub(crate) fn update_doc_embeddings_synced(
     root: &Path,
     new_chunks: &[&Chunk],
     changed_files: &[&str],
-) -> Result<(usize, Option<HnswSync>)> {
+) -> Result<(DocEmbedOutcome, Option<HnswSync>)> {
+    update_doc_embeddings_with(store, root, new_chunks, changed_files, &doc_embedder)
+}
+
+/// [`update_doc_embeddings_synced`] with the embedder it runs (asked for only
+/// when something needs embedding, as the singleton loads a model).
+pub(crate) fn update_doc_embeddings_with(
+    store: &dyn DocBackend,
+    root: &Path,
+    new_chunks: &[&Chunk],
+    changed_files: &[&str],
+    make_embedder: &dyn Fn() -> Arc<dyn EmbedProvider>,
+) -> Result<(DocEmbedOutcome, Option<HnswSync>)> {
     let tg_dir = root.join(".infigraph");
     let emb_path = tg_dir.join("docs_embeddings.bin");
     // Which file the HNSW index on disk reflects, taken before this run writes
@@ -84,49 +144,60 @@ pub(crate) fn update_doc_embeddings_synced(
         });
     }
 
-    // Embed new chunks with file path context for better semantic matching
-    let to_embed: Vec<(&str, String)> = new_chunks
+    let all_store_chunks = store.get_all_chunks().unwrap_or_default();
+    let valid_ids: std::collections::HashSet<String> =
+        all_store_chunks.into_iter().map(|(id, _)| id).collect();
+
+    // Embed new chunks with file path context for better semantic matching.
+    let mut to_embed: Vec<(String, String)> = new_chunks
         .iter()
         .map(|c| {
-            let file_context = doc_path_context(&c.doc_file);
-            let text = match (&file_context, &c.heading) {
-                (Some(ctx), Some(h)) => format!("{} > {}: {}", ctx, h, c.text),
-                (Some(ctx), None) => format!("{}: {}", ctx, c.text),
-                (None, Some(h)) => format!("{}: {}", h, c.text),
-                (None, None) => c.text.clone(),
-            };
-            (c.id.as_str(), text)
+            (
+                c.id.clone(),
+                chunk_embed_text(&c.doc_file, c.heading.as_deref(), &c.text),
+            )
         })
         .collect();
+    // And one more attempt, per run, at every chunk the store holds that still
+    // has no vector: an embedder that failed on an earlier run left them out,
+    // and nothing else would put them back until their file changed.
+    let new_ids: std::collections::HashSet<&str> =
+        new_chunks.iter().map(|c| c.id.as_str()).collect();
+    let retry_ids: Vec<&str> = valid_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !existing.contains_key(*id) && !new_ids.contains(id))
+        .collect();
+    if !retry_ids.is_empty() {
+        for d in store.get_chunk_details(&retry_ids).unwrap_or_default() {
+            to_embed.push((
+                d.id.clone(),
+                chunk_embed_text(&d.doc_file, d.heading.as_deref(), &d.text),
+            ));
+        }
+    }
 
     if !to_embed.is_empty() {
-        let embedder = doc_embedder();
-        const BATCH: usize = 256;
-        let results: Vec<Vec<(String, Vec<f32>)>> = to_embed
-            .par_chunks(BATCH)
-            .map(|chunk| {
-                let emb = Arc::clone(&embedder);
-                let texts: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
-                let vecs = emb.embed_batch(&texts).unwrap_or_default();
-                chunk
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, (id, _))| vecs.get(i).map(|v| (id.to_string(), v.clone())))
-                    .collect()
-            })
-            .collect();
-        for batch in results {
-            for (id, v) in batch {
-                upserted.push((id.clone(), v.clone()));
-                existing.insert(id, v);
-            }
+        let embedder = make_embedder();
+        let texts: Vec<&str> = to_embed.iter().map(|(_, t)| t.as_str()).collect();
+        let batched = embed_in_batches(&*embedder, &texts);
+        let failure = batched.failure.clone();
+        for (i, v) in batched.vectors {
+            let id = to_embed[i].0.clone();
+            upserted.push((id.clone(), v.clone()));
+            existing.insert(id, v);
+        }
+        if let Some(reason) = failure {
+            // One line for the run, whatever the number of chunks.
+            let left = valid_ids
+                .iter()
+                .filter(|id| !existing.contains_key(*id))
+                .count();
+            eprintln!("[docs-embeddings] {left} chunk(s) not embedded: {reason}");
         }
     }
 
     // Also keep existing chunks that are still in the store
-    let all_store_chunks = store.get_all_chunks().unwrap_or_default();
-    let valid_ids: std::collections::HashSet<String> =
-        all_store_chunks.into_iter().map(|(id, _)| id).collect();
     existing.retain(|id, _| {
         let keep = valid_ids.contains(id);
         if !keep {
@@ -134,10 +205,18 @@ pub(crate) fn update_doc_embeddings_synced(
         }
         keep
     });
+    let not_embedded = valid_ids
+        .iter()
+        .filter(|id| !existing.contains_key(*id))
+        .count();
 
     let embeddings: Vec<(String, Vec<f32>)> = existing.into_iter().collect();
     let count = embeddings.len();
     save_embeddings(&emb_path, &embeddings)?;
+    // After the file, so a marker never claims a count for bytes that were not
+    // written; best-effort like the others (a failed write leaves the earlier
+    // count, which `confirm_doc_embeddings` still honours).
+    let _ = write_unembedded_count(&emb_path, not_embedded);
 
     // Build HNSW if above threshold or existing index
     const HNSW_THRESHOLD: usize = 200_000;
@@ -162,7 +241,13 @@ pub(crate) fn update_doc_embeddings_synced(
     };
 
     invalidate_embeddings_cache();
-    Ok((count, synced))
+    Ok((
+        DocEmbedOutcome {
+            stored: count,
+            not_embedded,
+        },
+        synced,
+    ))
 }
 
 /// Store doc chunk embeddings in Postgres pgvector (remote mode).
@@ -203,21 +288,21 @@ pub fn update_doc_embeddings_remote(
 
     if !to_embed.is_empty() {
         let embedder = doc_embedder();
-        const BATCH: usize = 256;
-        let results: Vec<Vec<(String, Vec<f32>)>> = to_embed
-            .par_chunks(BATCH)
-            .map(|chunk| {
-                let emb = Arc::clone(&embedder);
-                let texts: Vec<&str> = chunk.iter().map(|(_, t)| *t).collect();
-                let vecs = emb.embed_batch(&texts).unwrap_or_default();
-                chunk
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, (id, _))| vecs.get(i).map(|v| (id.to_string(), v.clone())))
-                    .collect()
-            })
+        let texts: Vec<&str> = to_embed.iter().map(|(_, t)| *t).collect();
+        let batched = embed_in_batches(&*embedder, &texts);
+        // Asked for again by the next update (pgvector still lacks them), so
+        // reported here and not recorded.
+        if let Some(reason) = &batched.failure {
+            eprintln!(
+                "[docs-embeddings] {} chunk(s) not embedded: {reason}",
+                batched.shortfall(to_embed.len())
+            );
+        }
+        all_embeddings = batched
+            .vectors
+            .into_iter()
+            .map(|(i, v)| (to_embed[i].0.to_string(), v))
             .collect();
-        all_embeddings = results.into_iter().flatten().collect();
     }
 
     let count = all_embeddings.len();
@@ -377,7 +462,7 @@ mod hnsw_patch_tests {
         .unwrap();
 
         assert_eq!(
-            count,
+            count.stored,
             60 * 2 + 1,
             "119 untouched vectors plus the three new"
         );
@@ -419,6 +504,187 @@ mod hnsw_patch_tests {
         .unwrap();
 
         assert_eq!(synced, None);
+    }
+
+    // ---- chunks the embedder could not embed ----
+
+    use infigraph_core::embed::{read_unembedded_count, TrigramEmbedder};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Embeds like the trigram embedder, or fails every batch while `fail` is set.
+    struct Flaky {
+        fail: Arc<AtomicBool>,
+        inner: TrigramEmbedder,
+    }
+
+    impl EmbedProvider for Flaky {
+        fn dimension(&self) -> usize {
+            self.inner.dimension()
+        }
+        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            if self.fail.load(Ordering::SeqCst) {
+                anyhow::bail!("the model is not loaded");
+            }
+            self.inner.embed_batch(texts)
+        }
+        fn name(&self) -> &'static str {
+            "flaky"
+        }
+    }
+
+    fn flaky(fail: &Arc<AtomicBool>) -> impl Fn() -> Arc<dyn EmbedProvider> {
+        let fail = Arc::clone(fail);
+        move || {
+            Arc::new(Flaky {
+                fail: Arc::clone(&fail),
+                inner: TrigramEmbedder::default(),
+            })
+        }
+    }
+
+    /// The fixture's store plus one new two-chunk document that is in the store
+    /// but not yet embedded.
+    fn with_an_unembedded_document(f: &Fixture) -> Vec<Chunk> {
+        let file = "docs/new.md";
+        let chunks = vec![chunk(file, 0), chunk(file, 1)];
+        f.idx
+            .store()
+            .unwrap()
+            .upsert_docs(&[&doc(file)], &chunks.iter().collect::<Vec<_>>())
+            .unwrap();
+        chunks
+    }
+
+    fn sidecar(f: &Fixture) -> std::path::PathBuf {
+        f.root.join(".infigraph").join("docs_embeddings.bin")
+    }
+
+    #[test]
+    fn a_failed_batch_is_counted_recorded_and_reported_not_swallowed() {
+        let f = fixture();
+        let chunks = with_an_unembedded_document(&f);
+        let fail = Arc::new(AtomicBool::new(true));
+        let (out, _) = update_doc_embeddings_with(
+            f.idx.store().unwrap(),
+            &f.root,
+            &chunks.iter().collect::<Vec<_>>(),
+            &["docs/new.md"],
+            &flaky(&fail),
+        )
+        .unwrap();
+        assert_eq!(out.not_embedded, 2);
+        assert_eq!(out.stored, 60 * 2, "the 120 earlier vectors are kept");
+        // On disk, so a process that did not run the update sees it.
+        assert_eq!(read_unembedded_count(&sidecar(&f)), 2);
+        let modes = infigraph_core::degraded::derived_from_disk(&f.root);
+        assert!(
+            modes.contains(
+                &infigraph_core::degraded::DegradedMode::DocEmbeddingsPartial { chunks: 2 }
+            ),
+            "{modes:?}"
+        );
+    }
+
+    /// The marker that says the file is up to date with its store must not
+    /// move while chunks have no vector; it moves once they have one.
+    #[test]
+    fn the_file_is_not_confirmed_while_chunks_lack_vectors() {
+        let f = fixture();
+        let chunks = with_an_unembedded_document(&f);
+        let fail = Arc::new(AtomicBool::new(true));
+        update_doc_embeddings_with(
+            f.idx.store().unwrap(),
+            &f.root,
+            &chunks.iter().collect::<Vec<_>>(),
+            &["docs/new.md"],
+            &flaky(&fail),
+        )
+        .unwrap();
+        let bin = sidecar(&f);
+        let marker = f.root.join(".infigraph/docs_embeddings.bin.generation");
+        let _ = std::fs::remove_file(&marker);
+
+        confirm_doc_embeddings(&f.root);
+        assert!(!marker.exists(), "confirmed a file that lacks vectors");
+
+        fail.store(false, Ordering::SeqCst);
+        assert!(retry_unembedded_with(
+            f.idx.store().unwrap(),
+            &f.root,
+            &flaky(&fail)
+        ));
+        assert_eq!(read_unembedded_count(&bin), 0);
+        confirm_doc_embeddings(&f.root);
+        assert!(marker.exists(), "a complete file is confirmed again");
+    }
+
+    /// The next run that can embed them does, and the marker, the mode and the
+    /// file's own count all agree afterwards.
+    #[test]
+    fn a_later_run_embeds_what_an_earlier_one_could_not() {
+        let f = fixture();
+        let chunks = with_an_unembedded_document(&f);
+        let fail = Arc::new(AtomicBool::new(true));
+        update_doc_embeddings_with(
+            f.idx.store().unwrap(),
+            &f.root,
+            &chunks.iter().collect::<Vec<_>>(),
+            &["docs/new.md"],
+            &flaky(&fail),
+        )
+        .unwrap();
+        fail.store(false, Ordering::SeqCst);
+        // Nothing new and nothing changed: only the retry brings them in.
+        let (out, _) =
+            update_doc_embeddings_with(f.idx.store().unwrap(), &f.root, &[], &[], &flaky(&fail))
+                .unwrap();
+        assert_eq!(out.not_embedded, 0);
+        assert_eq!(out.stored, 60 * 2 + 2);
+        assert_eq!(read_unembedded_count(&sidecar(&f)), 0);
+        assert!(!f
+            .root
+            .join(".infigraph/docs_embeddings.bin.unembedded")
+            .exists());
+        assert!(infigraph_core::degraded::derived_from_disk(&f.root)
+            .iter()
+            .all(|m| m.key() != "doc-embeddings-partial"));
+    }
+
+    /// An embedder that fails every run costs one attempt per run: the count
+    /// stays what it was and the file keeps every vector it has.
+    #[test]
+    fn a_permanently_failing_embedder_is_one_attempt_per_run() {
+        let f = fixture();
+        let chunks = with_an_unembedded_document(&f);
+        let fail = Arc::new(AtomicBool::new(true));
+        update_doc_embeddings_with(
+            f.idx.store().unwrap(),
+            &f.root,
+            &chunks.iter().collect::<Vec<_>>(),
+            &["docs/new.md"],
+            &flaky(&fail),
+        )
+        .unwrap();
+        for _ in 0..3 {
+            assert!(retry_unembedded_with(
+                f.idx.store().unwrap(),
+                &f.root,
+                &flaky(&fail)
+            ));
+            assert_eq!(read_unembedded_count(&sidecar(&f)), 2);
+        }
+        assert_eq!(load_embeddings(&sidecar(&f)).unwrap().len(), 60 * 2);
+    }
+
+    #[test]
+    fn a_run_with_nothing_missing_does_not_retry() {
+        let f = fixture();
+        let fail = Arc::new(AtomicBool::new(true));
+        assert!(!retry_unembedded_with(
+            f.idx.store().unwrap(),
+            &f.root,
+            &flaky(&fail)
+        ));
     }
 }
 
