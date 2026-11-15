@@ -139,6 +139,11 @@ impl ConfluenceSync {
             let chunk_refs: Vec<&Chunk> = all_chunks.iter().collect();
             let changed_files: Vec<&str> = docs.iter().map(|d| d.file.as_str()).collect();
             infigraph_docs::embed::update_doc_embeddings(store, root, &chunk_refs, &changed_files)?;
+        } else {
+            // Nothing to embed: the sidecar is as the store needs it, and a
+            // run that only moved links and sources says so (a run that
+            // embedded does not: some chunk's embedding may have failed).
+            infigraph_docs::embed::confirm_doc_embeddings(root);
         }
 
         // Create LINKS_TO edges

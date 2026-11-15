@@ -42,9 +42,12 @@ fn a_run_that_changes_nothing_moves_the_embeddings_marker() {
     let bytes = std::fs::read(&bin).unwrap();
     age(&bin, Duration::from_secs(3 * 3600));
     let marker = ig.join("docs_embeddings.bin.generation");
-    if marker.exists() {
-        age(&marker, Duration::from_secs(3 * 3600));
-    }
+    // The run that embedded is not confirmed: a chunk the embedder failed
+    // on would be missing, and the call would still have returned.
+    assert!(
+        !marker.exists(),
+        "a run that wrote embeddings does not confirm them"
+    );
     let aged = std::fs::metadata(&bin).unwrap().modified().unwrap();
 
     let second = idx.index().unwrap();
