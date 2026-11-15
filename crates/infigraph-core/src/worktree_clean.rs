@@ -647,6 +647,13 @@ mod tests {
             let main = std::fs::canonicalize(tmp.path()).unwrap().join("main");
             std::fs::create_dir_all(&main).unwrap();
             git(&main, &["init", "-q", "-b", "main"]);
+            // Git's automatic maintenance runs in the background after a
+            // commit and creates `.git/objects/maintenance.lock` while it does,
+            // which the tests that compare the whole tree before and after
+            // (`a_dry_run_changes_nothing`) took for a change. Off, so a real
+            // stray file is still what fails them.
+            git(&main, &["config", "maintenance.auto", "false"]);
+            git(&main, &["config", "gc.auto", "0"]);
             write(&main.join(".gitignore"), 0);
             std::fs::write(
                 main.join(".gitignore"),
