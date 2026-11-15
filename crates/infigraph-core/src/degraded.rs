@@ -57,8 +57,10 @@ pub enum DegradedMode {
     /// The graph exists but `embeddings.bin` does not, so code search embeds
     /// every symbol at query time.
     EmbeddingsMissing,
-    /// `embeddings.bin` is older than the graph it was built from, judged by
-    /// file times: the rule a process without the graph open can apply.
+    /// `embeddings.bin` was last confirmed against the graph (its own time, or
+    /// its generation marker's, whichever is newer) long before the graph's
+    /// last write, judged by file times: the rule a process without the graph
+    /// open can apply.
     EmbeddingsStale { minutes: u64 },
     /// `embeddings.bin` reflects an older graph generation than the live one.
     /// Only the process that holds the graph (the daemon) can say so, and
@@ -201,8 +203,8 @@ impl DegradedMode {
                     .to_string()
             }
             DegradedMode::EmbeddingsStale { minutes } => format!(
-                "embeddings.bin is {minutes} minutes older than the graph: semantic ranking may \
-                 be stale"
+                "embeddings.bin was last confirmed against the graph {minutes} minutes before the \
+                 graph's last write: semantic ranking may be stale"
             ),
             DegradedMode::EmbeddingsBehindGraph { recorded, current } => format!(
                 "embeddings.bin was built from graph generation {recorded}, but the graph is \
@@ -949,6 +951,41 @@ mod tests {
         // A little behind is not stale.
         p.age("embeddings.bin", Duration::from_secs(10 * 60));
         assert_eq!(derived_from_disk(p.root()), vec![]);
+    }
+
+    /// A reconcile that finds nothing to embed leaves `embeddings.bin` alone
+    /// and rewrites only its generation marker: that is a confirmation, and
+    /// the footer must not call the file stale because of its own mtime.
+    #[test]
+    fn a_marker_newer_than_the_graph_confirms_old_embeddings() {
+        let p = Project::new();
+        p.embeddings(10);
+        p.age("embeddings.bin", Duration::from_secs(3 * 60 * 60));
+        let bin = p.root().join(".infigraph").join("embeddings.bin");
+        crate::embed::write_generation_marker(&bin, 7).unwrap();
+        assert_eq!(derived_from_disk(p.root()), vec![]);
+        // doctor judges the same file by the same rule.
+        assert_eq!(crate::doctor::sidecar_lag(p.root(), "embeddings.bin"), None);
+    }
+
+    /// A failed update moves neither file, so both are old and it still warns.
+    #[test]
+    fn an_old_marker_does_not_hide_stale_embeddings() {
+        let p = Project::new();
+        p.embeddings(10);
+        let bin = p.root().join(".infigraph").join("embeddings.bin");
+        crate::embed::write_generation_marker(&bin, 7).unwrap();
+        p.age("embeddings.bin", Duration::from_secs(3 * 60 * 60));
+        p.age(
+            "embeddings.bin.generation",
+            Duration::from_secs(2 * 60 * 60),
+        );
+        match derived_from_disk(p.root()).as_slice() {
+            [DegradedMode::EmbeddingsStale { minutes }] => {
+                assert!((119..=120).contains(minutes), "{minutes}")
+            }
+            other => panic!("expected one stale mode, got {other:?}"),
+        }
     }
 
     #[test]

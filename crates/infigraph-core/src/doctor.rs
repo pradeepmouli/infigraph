@@ -1196,18 +1196,27 @@ fn check_one_sidecar(project_path: &Path, sidecar_name: &str) -> Option<CheckRes
 /// How much older than the store it is derived from a sidecar is: `None`
 /// when either file is missing or the sidecar is the newer one. The one
 /// derivation of sidecar staleness, shared with `degraded::gather`.
+///
+/// `embeddings.bin` is confirmed against the graph by every successful
+/// reconcile, including one that finds nothing to embed and so leaves the
+/// file alone; each of those rewrites its generation marker. The sidecar is
+/// as fresh as the newer of the two, so a body-only edit stream does not
+/// age it into a warning that no `index` run could clear. A failed update
+/// moves neither file, and still warns. With no marker the file's own time
+/// is all there is.
 pub(crate) fn sidecar_lag(project_path: &Path, sidecar_name: &str) -> Option<std::time::Duration> {
     let infigraph_dir = project_path.join(".infigraph");
     let (anchor_name, _) = sidecar_anchor(sidecar_name);
-    let anchor_mtime = std::fs::metadata(infigraph_dir.join(anchor_name))
-        .ok()?
-        .modified()
-        .ok()?;
-    let sidecar_mtime = std::fs::metadata(infigraph_dir.join(sidecar_name))
-        .ok()?
-        .modified()
-        .ok()?;
-    anchor_mtime.duration_since(sidecar_mtime).ok()
+    let mtime = |path: &Path| std::fs::metadata(path).ok()?.modified().ok();
+    let anchor_mtime = mtime(&infigraph_dir.join(anchor_name))?;
+    let sidecar_path = infigraph_dir.join(sidecar_name);
+    let mut confirmed = mtime(&sidecar_path)?;
+    if sidecar_name == "embeddings.bin" {
+        if let Some(marker) = mtime(&crate::embed::generation_marker_path(&sidecar_path)) {
+            confirmed = confirmed.max(marker);
+        }
+    }
+    anchor_mtime.duration_since(confirmed).ok()
 }
 
 const DEGRADED_CATEGORY: &str = "degraded modes";
