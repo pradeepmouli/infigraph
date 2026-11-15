@@ -155,16 +155,57 @@ pub(crate) fn is_file_form(span: &str) -> bool {
     file_form().is_match(span)
 }
 
-/// A span that is a file name (`tasks.md`), which no symbol is.
-fn names_a_file(span: &str) -> bool {
+/// Whether `span` ends in the extension of a source or document file.
+fn has_file_extension(span: &str) -> bool {
     const EXTENSIONS: [&str; 18] = [
         "md", "json", "toml", "yml", "yaml", "lock", "txt", "log", "sh", "css", "html", "ts",
         "tsx", "js", "mjs", "cjs", "py", "rs",
     ];
-    !span.contains("::")
-        && span
-            .rsplit_once('.')
-            .is_some_and(|(_, ext)| EXTENSIONS.contains(&ext))
+    span.rsplit_once('.')
+        .is_some_and(|(_, ext)| EXTENSIONS.contains(&ext))
+}
+
+/// A span that is a file name (`tasks.md`), which no symbol is.
+fn names_a_file(span: &str) -> bool {
+    !span.contains("::") && has_file_extension(span)
+}
+
+/// A level 2-4 heading that looks like a key but is not one: its whole text is
+/// one backtick span naming a path (no `::`), so it is no entry and nothing
+/// reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeylessHeading {
+    /// 1-based line of the heading.
+    pub line: usize,
+    /// The heading's text, as written (`` `src/a.ts` ``).
+    pub text: String,
+    /// The path inside the backticks.
+    pub path: String,
+}
+
+/// The keyless path headings of `text`, outside fenced code, from the same scan
+/// that finds key headings. A span names a path when it has no whitespace and no
+/// `::` or `://`, and contains a `/` or ends in a file extension
+/// ([`has_file_extension`]); a command, a flag or a single identifier does not.
+pub fn keyless_headings(text: &str) -> Vec<KeylessHeading> {
+    let prose = prose_lines(text);
+    scan_headings(&prose.lines)
+        .into_iter()
+        .filter(|h| (2..=4).contains(&h.level) && h.key.is_none())
+        .filter_map(|h| {
+            let path = h.text.strip_prefix('`')?.strip_suffix('`')?;
+            let names_a_path = !path.is_empty()
+                && !path.contains(['`', ' ', '\t'])
+                && !path.contains("::")
+                && !path.contains("://")
+                && (path.contains('/') || has_file_extension(path));
+            names_a_path.then(|| KeylessHeading {
+                line: h.line,
+                path: path.to_string(),
+                text: h.text.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Whether a span is shaped like something the reader could resolve.
@@ -879,5 +920,61 @@ mod tests {
         let cut = excerpt(&line, "`Foo.bar`");
         assert!(cut.contains("Foo.bar"));
         assert!(cut.chars().count() <= EXCERPT_CHARS + 2, "{}", cut.len());
+    }
+
+    #[test]
+    fn a_bare_path_heading_is_keyless_and_a_real_key_is_not() {
+        let doc = "# T\n\n### `packages/codegen/src/render-body.ts`\n\nx\n\n\
+                   ### `packages/tools/tests/argument-optional-honesty.test.ts`\n\ny\n\n\
+                   ## `closure.ts`\n\nz\n\n### `src/a.py::f`\n\nw\n";
+        let all = keyless_headings(doc);
+        let found: Vec<(usize, &str)> = all.iter().map(|k| (k.line, k.path.as_str())).collect();
+        assert_eq!(
+            found,
+            [
+                (3, "packages/codegen/src/render-body.ts"),
+                (7, "packages/tools/tests/argument-optional-honesty.test.ts"),
+                (11, "closure.ts"),
+            ]
+        );
+    }
+
+    #[test]
+    fn prose_in_backticks_is_not_a_keyless_heading() {
+        for heading in [
+            "### `cargo build`",
+            "### `--apply`",
+            "### `CodeIndex`",
+            "### `a::b`",
+            "### `https://example.com/x`",
+            "### `git log -p src/a.rs`",
+            "### Notes on `src/a.rs`",
+            "# `src/a.rs`",
+            "##### `src/a.rs`",
+        ] {
+            assert!(
+                keyless_headings(&format!("{heading}\n\ntext\n")).is_empty(),
+                "{heading}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_keyless_heading_in_a_code_fence_is_not_one() {
+        let doc = "## Format\n\n```\n### `src/a.ts`\n```\n";
+        assert!(keyless_headings(doc).is_empty());
+    }
+
+    /// The scan that gets stored is untouched: a keyless heading adds no row, so
+    /// `CODE_LINKS_VERSION` stays and no document is rescanned.
+    #[test]
+    fn a_keyless_heading_adds_no_stored_row() {
+        let with = "### `src/a.ts`\n\nWhy.\n";
+        let without = "### Plain heading\n\nWhy.\n";
+        assert_eq!(
+            extract_markdown("d.md", with).len(),
+            extract_markdown("d.md", without).len()
+        );
+        assert_eq!(CODE_LINKS_VERSION, 4);
     }
 }

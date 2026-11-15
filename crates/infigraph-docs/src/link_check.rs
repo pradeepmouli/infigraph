@@ -29,7 +29,7 @@ use infigraph_core::graph::observe::ObservedGraph;
 use infigraph_core::graph::query_exec::{LocalExec, QueryExec};
 use infigraph_core::graph::remote_exec::RemoteExec;
 
-use crate::code_links::{CodeLinkRow, LinkKind, CODE_LINKS_VERSION};
+use crate::code_links::{self, CodeLinkRow, LinkKind, CODE_LINKS_VERSION};
 use crate::query::DocQuery;
 use crate::stale_docs::{judge, rank, Judgement, COARSE_UNDER_REPORTS};
 use crate::store::DocStore;
@@ -696,6 +696,56 @@ pub fn missing_symbols(root: &Path) -> Result<Vec<MissingKey>> {
     Ok(rows)
 }
 
+/// The keyless path headings of the project's Markdown documents, as one WARN,
+/// or `None` when there are none. Read at check time from the files, never from
+/// the store: the stored scan keeps only key headings, and a new stored kind
+/// would rescan every document once. A document whose file is gone is skipped
+/// (the file wins over the index, as in `missing_docs`).
+fn keyless_result(root: &Path, ids: &[&String]) -> Option<CheckResult> {
+    let mut found: Vec<(String, code_links::KeylessHeading)> = Vec::new();
+    for id in ids {
+        if !id.ends_with(".md") && !id.ends_with(".markdown") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(root.join(id.as_str())) else {
+            continue;
+        };
+        found.extend(
+            code_links::keyless_headings(&text)
+                .into_iter()
+                .map(|h| ((*id).clone(), h)),
+        );
+    }
+    if found.is_empty() {
+        return None;
+    }
+    found.sort_by(|a, b| (&a.0, a.1.line).cmp(&(&b.0, b.1.line)));
+    let mut message = format!(
+        "{} heading(s) name a file in backticks but are not keys, so they are no entry, \
+         and no tool reads them",
+        found.len()
+    );
+    for (doc, h) in found.iter().take(EXAMPLES) {
+        let advice = if root.join(&h.path).is_file() {
+            format!("write it as `{}::module`", h.path)
+        } else {
+            "it names a file that is not in the project; remove the section or correct the path"
+                .to_string()
+        };
+        message.push_str(&format!("\n    {doc}:{}  {}  ->  {advice}", h.line, h.text));
+    }
+    if found.len() > EXAMPLES {
+        message.push_str(&format!("\n    ... and {} more", found.len() - EXAMPLES));
+    }
+    Some(CheckResult::warn(
+        CATEGORY,
+        format!("{}: keyless headings", root.display()),
+        message,
+        "edit each heading line to `<path>::module` (the entry for the file itself), then run \
+         `infigraph index-docs`; the edit guard does not block it, a keyless heading is no entry",
+    ))
+}
+
 pub fn check_project(root: &Path, docs_sync: bool) -> Vec<CheckResult> {
     if !docs_switch::docs_enabled(root) || !docs_switch::docs_store_path(root).exists() {
         return Vec::new();
@@ -745,6 +795,7 @@ pub fn check_project(root: &Path, docs_sync: bool) -> Vec<CheckResult> {
             "run `infigraph index-docs`",
         ));
     }
+    results.extend(keyless_result(root, &local));
     if documents.is_empty() && near_misses.is_empty() && unclosed.is_empty() && fenced.is_empty() {
         return results;
     }
@@ -1314,5 +1365,46 @@ mod tests {
             ),
             "the second member changed after the entry"
         );
+    }
+
+    #[test]
+    fn keyless_headings_are_listed_with_file_line_and_a_remedy_that_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::create_dir_all(root.join("pkg/src")).unwrap();
+        std::fs::write(root.join("pkg/src/render.ts"), "export {}").unwrap();
+        std::fs::write(
+            root.join("docs/g.md"),
+            "# G\n\n### `pkg/src/render.ts`\n\nx\n\n### `pkg/src/deleted.ts`\n\ny\n\n\
+             ### `cargo build`\n\nz\n\n### `pkg/src/render.ts::f`\n\nw\n",
+        )
+        .unwrap();
+        let ids = ["docs/g.md".to_string(), "docs/missing.md".to_string()];
+        let refs: Vec<&String> = ids.iter().collect();
+        let result = keyless_result(root, &refs).expect("two headings");
+        let text = format!("{result:?}");
+        assert!(text.contains("2 heading(s)"), "{text}");
+        assert!(
+            text.contains(
+                "docs/g.md:3  `pkg/src/render.ts`  ->  write it as `pkg/src/render.ts::module`"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "docs/g.md:7  `pkg/src/deleted.ts`  ->  it names a file that is not in the project"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("cargo build"), "{text}");
+    }
+
+    #[test]
+    fn no_keyless_headings_is_no_result() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("g.md"), "### `a.ts::f`\n\nx\n").unwrap();
+        let id = "g.md".to_string();
+        assert!(keyless_result(dir.path(), &[&id]).is_none());
     }
 }
