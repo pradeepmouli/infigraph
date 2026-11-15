@@ -169,6 +169,45 @@ impl Owner<'_> {
     }
 }
 
+/// Environment variables a client sets to its own session id, tried in order.
+/// Claude Code exports `CLAUDE_CODE_SESSION_ID` to the MCP servers it starts;
+/// another client is one more entry here.
+pub const SESSION_ENV_VARS: &[&str] = &["CLAUDE_CODE_SESSION_ID"];
+
+/// Length of the key a client session id is shortened to in a record id.
+const SESSION_KEY_LEN: usize = 8;
+
+/// The short key of a client's session id: its first eight ASCII
+/// alphanumerics, lowercased (a UUID's first block). `None` when it has none.
+pub fn session_key(raw: &str) -> Option<String> {
+    let key: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(SESSION_KEY_LEN)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    (!key.is_empty()).then_some(key)
+}
+
+/// Who is calling: the `session` argument when given, else the first of
+/// [`SESSION_ENV_VARS`] that `env` knows. `None` is "caller unknown".
+pub fn caller_key(arg: Option<&str>, env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    arg.and_then(session_key).or_else(|| {
+        SESSION_ENV_VARS
+            .iter()
+            .find_map(|var| env(var).as_deref().and_then(session_key))
+    })
+}
+
+/// The id of a day's record: `session_<yyyy-mm-dd>` made the caller's own by
+/// its key, or left as the shared day record when the caller is unknown.
+pub fn record_id(date_id: &str, key: Option<&str>) -> String {
+    match key {
+        Some(key) => format!("{date_id}_{key}"),
+        None => date_id.to_string(),
+    }
+}
+
 /// A session file that did not read, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skipped {
@@ -704,5 +743,38 @@ mod tests {
         let active = store.list_active(now).unwrap();
         assert_eq!(active.len(), 1, "should filter out archived session");
         assert_eq!(active[0].id, "session_recent");
+    }
+
+    #[test]
+    fn a_session_key_is_the_first_eight_alphanumerics_lowercased() {
+        assert_eq!(
+            session_key("ABCD1234-5678-90ab").as_deref(),
+            Some("abcd1234")
+        );
+        assert_eq!(session_key("--ab"), Some("ab".to_string()));
+        assert_eq!(session_key("---"), None);
+        assert_eq!(session_key(""), None);
+    }
+
+    #[test]
+    fn the_argument_names_the_caller_before_the_environment_does() {
+        let env = |v: &str| (v == "CLAUDE_CODE_SESSION_ID").then(|| "envkey99-x".to_string());
+        assert_eq!(
+            caller_key(Some("argkey11"), &env).as_deref(),
+            Some("argkey11")
+        );
+        assert_eq!(caller_key(None, &env).as_deref(), Some("envkey99"));
+        // An argument with no usable characters falls through to the environment.
+        assert_eq!(caller_key(Some("--"), &env).as_deref(), Some("envkey99"));
+        assert_eq!(caller_key(None, &|_| None), None);
+    }
+
+    #[test]
+    fn a_record_id_round_trips_through_owner_of() {
+        let id = record_id("session_2026-11-14", Some("abcd1234"));
+        assert_eq!(id, "session_2026-11-14_abcd1234");
+        assert_eq!(owner_of(&id), Owner::Session("abcd1234"));
+        assert_eq!(record_id("session_2026-11-14", None), "session_2026-11-14");
+        assert_eq!(owner_of("session_2026-11-14"), Owner::Legacy);
     }
 }

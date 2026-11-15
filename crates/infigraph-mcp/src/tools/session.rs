@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use infigraph_core::embed;
-use infigraph_core::graph::{owner_of, SessionData, SessionStore};
+use infigraph_core::graph::{caller_key, owner_of, record_id, Owner, SessionData, SessionStore};
 
 pub fn open_session_store(args: &Value) -> Result<SessionStore> {
     let path = args
@@ -104,7 +104,23 @@ fn score_session_value(
     0.5
 }
 
+/// A variable of this server's own environment, which a client sets to its
+/// session id before it starts the server.
+fn process_env(var: &str) -> Option<String> {
+    std::env::var(var).ok()
+}
+
+/// The caller's key, from the `session` argument or the server's environment.
+fn caller_of(args: &Value, env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    caller_key(args.get("session").and_then(|s| s.as_str()), env)
+}
+
 pub fn tool_save_session(args: &Value) -> Result<String> {
+    save_session_with(args, &process_env)
+}
+
+fn save_session_with(args: &Value, env: &dyn Fn(&str) -> Option<String>) -> Result<String> {
+    let caller = caller_of(args, env);
     let store = open_session_store(args)?;
     let path = args
         .get("path")
@@ -144,7 +160,7 @@ pub fn tool_save_session(args: &Value) -> Result<String> {
         let _session_lock = store.lock()?;
 
         let session_id = if session_name.is_empty() {
-            session_date_id()
+            record_id(&session_date_id(), caller.as_deref())
         } else {
             format!("named_{}", session_name.to_lowercase().replace(' ', "_"))
         };
@@ -265,6 +281,12 @@ pub fn tool_save_session(args: &Value) -> Result<String> {
         " (narrative omitted)"
     });
 
+    if session_name.is_empty() && caller.is_none() {
+        result.push_str(&format!(
+            "\n{CALLER_UNKNOWN} This record is the shared day record."
+        ));
+    }
+
     if active_records > CONSOLIDATION_HINT_ABOVE {
         result.push_str(&format!(
             "\n{active_records} active session records: `consolidate_memory` merges similar ones."
@@ -273,6 +295,9 @@ pub fn tool_save_session(args: &Value) -> Result<String> {
 
     Ok(result)
 }
+
+/// Said when no `session` argument or client variable names the caller.
+const CALLER_UNKNOWN: &str = "Caller unknown: pass `session` (your session id).";
 
 /// Active records above which a save mentions `consolidate_memory`.
 pub const CONSOLIDATION_HINT_ABOVE: usize = 50;
@@ -518,6 +543,37 @@ pub fn append_old_session_hint(sessions_dir: &std::path::Path, out: &mut String)
 }
 
 pub fn tool_get_latest_session(args: &Value) -> Result<String> {
+    latest_session_with(args, &process_env)
+}
+
+/// Compact index or full fields for `sessions`, as `get_latest_session` shows
+/// them.
+fn render_sessions(sessions: &[SessionData], path: &str, detail: bool) -> String {
+    let mut out = String::new();
+    let total = sessions.len();
+    if total > 1 && !detail {
+        let newest_date = date_from_session_id(&sessions[0].id);
+        let oldest_date = date_from_session_id(&sessions[total - 1].id);
+        out.push_str(&format!(
+            "## {total} recent sessions ({oldest_date} — {newest_date})\n\n\
+             All sessions updated within 72h of the newest save. \
+             Compact index below; use `name='<label>'` or `detail=true` for full fields.\n\n"
+        ));
+        for (idx, session) in sessions.iter().enumerate() {
+            out.push_str(&format_session_compact(session, idx, total, path));
+        }
+    } else {
+        for (idx, session) in sessions.iter().enumerate() {
+            out.push_str(&format_session_output(session, idx, total, path));
+            if idx < total - 1 {
+                out.push_str("\n---\n\n");
+            }
+        }
+    }
+    out
+}
+
+fn latest_session_with(args: &Value, env: &dyn Fn(&str) -> Option<String>) -> Result<String> {
     let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
     let explicit_limit = args.get("limit").and_then(|v| v.as_u64());
     let session_name = args.get("name").and_then(|s| s.as_str()).unwrap_or("");
@@ -547,26 +603,35 @@ pub fn tool_get_latest_session(args: &Value) -> Result<String> {
         return Ok("No previous sessions found. This is a fresh start.".to_string());
     }
 
+    // Own records first. A record of another session is shown apart and says
+    // so, so a session does not resume another one's work as its own; a named
+    // record is shared by design and stays with the caller's.
+    let caller = caller_of(args, env);
     let mut out = String::new();
-    let total = sessions.len();
-    let multi = total > 1 && !detail;
-
-    if multi {
-        let newest_date = date_from_session_id(&sessions[0].id);
-        let oldest_date = date_from_session_id(&sessions[total - 1].id);
-        out.push_str(&format!(
-            "## {total} recent sessions ({oldest_date} — {newest_date})\n\n\
-             All sessions updated within 72h of the newest save. \
-             Compact index below; use `name='<label>'` or `detail=true` for full fields.\n\n"
-        ));
-        for (idx, session) in sessions.iter().enumerate() {
-            out.push_str(&format_session_compact(session, idx, total, path));
+    match caller.as_deref() {
+        None => {
+            out.push_str(&format!(
+                "{CALLER_UNKNOWN} Records of every session follow.\n\n"
+            ));
+            out.push_str(&render_sessions(&sessions, path, detail));
         }
-    } else {
-        for (idx, session) in sessions.iter().enumerate() {
-            out.push_str(&format_session_output(session, idx, total, path));
-            if idx < total - 1 {
-                out.push_str("\n---\n\n");
+        Some(key) => {
+            let (yours, others): (Vec<_>, Vec<_>) = sessions.into_iter().partition(|s| {
+                matches!(owner_of(&s.id), Owner::Named) || owner_of(&s.id) == Owner::Session(key)
+            });
+            if yours.is_empty() {
+                out.push_str("No record of this session yet.\n\n");
+            } else {
+                out.push_str(&render_sessions(&yours, path, detail));
+            }
+            if !others.is_empty() {
+                out.push_str(&format!(
+                    "\n## Not yours ({}): other sessions' records, or day records from before sessions were told apart\n\n",
+                    others.len()
+                ));
+                for (idx, session) in others.iter().enumerate() {
+                    out.push_str(&format_session_compact(session, idx, others.len(), path));
+                }
             }
         }
     }
@@ -998,6 +1063,17 @@ pub fn tool_consolidate_memory(args: &Value) -> Result<String> {
 mod tests {
     use super::*;
     use infigraph_core::graph::{SessionData, SessionStore};
+
+    // These tests name their caller by argument or not at all: the real tools
+    // read this process's environment, which under Claude Code holds a session
+    // id of its own.
+    fn tool_save_session(args: &Value) -> Result<String> {
+        save_session_with(args, &|_| None)
+    }
+
+    fn tool_get_latest_session(args: &Value) -> Result<String> {
+        latest_session_with(args, &|_| None)
+    }
 
     fn make_session(id: &str, created_at: i64, updated_at: i64) -> SessionData {
         SessionData {
@@ -1479,5 +1555,123 @@ mod tests {
             .join("embeddings.bin");
         let loaded = embed::load_embeddings(&emb_path);
         assert!(loaded.is_ok(), "embeddings.bin corrupted: {loaded:?}");
+    }
+
+    fn save_as(root: &std::path::Path, session: Option<&str>, summary: &str) -> String {
+        let mut args = serde_json::json!({"path": root.to_str().unwrap(), "summary": summary});
+        if let Some(session) = session {
+            args["session"] = Value::String(session.to_string());
+        }
+        tool_save_session(&args).unwrap()
+    }
+
+    #[test]
+    fn a_save_is_filed_under_the_callers_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = save_as(
+            dir.path(),
+            Some("ABCD1234-5678-90ab-cdef-000000000000"),
+            "mine",
+        );
+        assert!(
+            out.contains(&format!("{}_abcd1234", session_date_id())),
+            "{out}"
+        );
+        assert!(!out.contains("Caller unknown"), "{out}");
+    }
+
+    #[test]
+    fn the_server_environment_names_the_caller_when_no_argument_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({"path": dir.path().to_str().unwrap(), "summary": "s"});
+        let env =
+            |var: &str| (var == "CLAUDE_CODE_SESSION_ID").then(|| "feed0001-aaaa".to_string());
+        let out = save_session_with(&args, &env).unwrap();
+        assert!(
+            out.contains(&format!("{}_feed0001", session_date_id())),
+            "{out}"
+        );
+        // The argument wins over the environment.
+        let args = serde_json::json!({"path": dir.path().to_str().unwrap(), "summary": "s", "session": "cafe0002"});
+        let out = save_session_with(&args, &env).unwrap();
+        assert!(out.contains("_cafe0002"), "{out}");
+    }
+
+    #[test]
+    fn an_unknown_caller_writes_the_day_record_and_is_told_to_pass_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = save_as(dir.path(), None, "anon");
+        assert!(
+            out.contains(&format!("Session saved: {}", session_date_id())),
+            "{out}"
+        );
+        assert!(out.contains("Caller unknown: pass `session`"), "{out}");
+    }
+
+    #[test]
+    fn two_callers_on_one_day_keep_separate_records() {
+        let dir = tempfile::tempdir().unwrap();
+        save_as(dir.path(), Some("aaaa1111"), "work of A");
+        save_as(dir.path(), Some("bbbb2222"), "work of B");
+        let store = SessionStore::open(dir.path()).unwrap();
+        let day = session_date_id();
+        assert_eq!(
+            store
+                .load(&format!("{day}_aaaa1111"))
+                .unwrap()
+                .unwrap()
+                .summary,
+            "work of A"
+        );
+        assert_eq!(
+            store
+                .load(&format!("{day}_bbbb2222"))
+                .unwrap()
+                .unwrap()
+                .summary,
+            "work of B"
+        );
+    }
+
+    #[test]
+    fn get_latest_shows_the_callers_records_first_and_marks_the_rest_not_yours() {
+        let dir = tempfile::tempdir().unwrap();
+        save_as(dir.path(), Some("aaaa1111"), "work of A");
+        save_as(dir.path(), Some("bbbb2222"), "work of B");
+        let path = dir.path().to_str().unwrap();
+        let out = latest_session_with(
+            &serde_json::json!({"path": path, "session": "aaaa1111"}),
+            &|_| None,
+        )
+        .unwrap();
+        let mine = out.find("work of A").expect(&out);
+        let not_yours = out.find("Not yours (1)").expect(&out);
+        let theirs = out.find("work of B").expect(&out);
+        assert!(mine < not_yours && not_yours < theirs, "{out}");
+        assert!(!out.contains("Caller unknown"), "{out}");
+    }
+
+    #[test]
+    fn get_latest_for_a_caller_with_no_record_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        save_as(dir.path(), Some("bbbb2222"), "work of B");
+        let out = latest_session_with(
+            &serde_json::json!({"path": dir.path().to_str().unwrap(), "session": "cccc3333"}),
+            &|_| None,
+        )
+        .unwrap();
+        assert!(out.starts_with("No record of this session yet."), "{out}");
+        assert!(out.contains("Not yours (1)"), "{out}");
+    }
+
+    #[test]
+    fn get_latest_for_an_unknown_caller_carries_the_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        save_as(dir.path(), Some("bbbb2222"), "work of B");
+        let out =
+            tool_get_latest_session(&serde_json::json!({"path": dir.path().to_str().unwrap()}))
+                .unwrap();
+        assert!(out.starts_with("Caller unknown: pass `session`"), "{out}");
+        assert!(out.contains("work of B"), "{out}");
     }
 }
