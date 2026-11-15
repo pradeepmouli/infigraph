@@ -99,6 +99,85 @@ pub fn list_worktree_paths(path: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
+/// How long [`linked_worktrees`] keeps an answer for a project.
+pub const LINKED_WORKTREES_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The linked worktrees of the project at `root`, besides `root` itself, kept
+/// for [`LINKED_WORKTREES_TTL`] so a caller on every tool call does not run git
+/// on every tool call. `None` is "unknown" (git could not say), kept for the
+/// TTL as well: a failure is not retried at once, and no caller may treat it as
+/// "there are none".
+///
+/// The answer for a checkout with no `.git/worktrees` entries is read from the
+/// file system alone: git is asked only when something is there to list.
+#[derive(Default)]
+pub struct WorktreeProbe {
+    seen: std::sync::Mutex<std::collections::HashMap<PathBuf, Answer>>,
+}
+
+/// When a project's worktrees were last asked about, and what the answer was.
+type Answer = (std::time::Instant, Option<Vec<PathBuf>>);
+
+impl WorktreeProbe {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `root`'s linked worktrees at `now`, from the cache while it is fresh,
+    /// else from `list` (every worktree of the repository, as `git worktree
+    /// list` gives them, `root`'s own among them).
+    pub fn linked(
+        &self,
+        root: &Path,
+        now: std::time::Instant,
+        list: &dyn Fn(&Path) -> Result<Vec<PathBuf>>,
+    ) -> Option<Vec<PathBuf>> {
+        let key = canonicalize_lenient(root);
+        if let Some((at, answer)) = self
+            .seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            if now.saturating_duration_since(*at) < LINKED_WORKTREES_TTL {
+                return answer.clone();
+            }
+        }
+        let answer = if has_linked_worktree_entries(&key) {
+            list(&key).ok().map(|all| {
+                all.into_iter()
+                    .filter(|p| canonicalize_lenient(p) != key)
+                    .collect()
+            })
+        } else {
+            Some(Vec::new())
+        };
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, (now, answer.clone()));
+        answer
+    }
+}
+
+/// Whether `<root>/.git/worktrees` holds an entry: git records a linked
+/// worktree there, so with none (or a `.git` that is a file, a linked worktree's
+/// own) there is nothing to list.
+fn has_linked_worktree_entries(root: &Path) -> bool {
+    std::fs::read_dir(root.join(".git").join("worktrees"))
+        .is_ok_and(|mut entries| entries.next().is_some())
+}
+
+/// [`WorktreeProbe::linked`] on the process's own cache, asking git.
+pub fn linked_worktrees(root: &Path) -> Option<Vec<PathBuf>> {
+    static PROBE: std::sync::OnceLock<WorktreeProbe> = std::sync::OnceLock::new();
+    PROBE.get_or_init(WorktreeProbe::new).linked(
+        root,
+        std::time::Instant::now(),
+        &list_worktree_paths,
+    )
+}
+
 pub fn main_worktree_path(path: &Path) -> Result<PathBuf> {
     list_worktree_paths(path)?
         .into_iter()
@@ -241,5 +320,95 @@ pub(crate) mod tests {
     fn a_directory_outside_git_is_not_a_linked_worktree() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(!is_linked_worktree(tmp.path()));
+    }
+
+    // ---- WorktreeProbe: one cached answer, git only when there is something to list ----
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// A lister that counts its calls, answering what git would for `all`.
+    fn counting(
+        all: Vec<PathBuf>,
+        calls: &AtomicUsize,
+    ) -> impl Fn(&Path) -> Result<Vec<PathBuf>> + '_ {
+        move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(all.clone())
+        }
+    }
+
+    #[test]
+    fn a_project_with_a_linked_worktree_lists_it_and_asks_git_once_per_ttl() {
+        let (_tmp, main, linked) = repo_with_linked_worktree();
+        let calls = AtomicUsize::new(0);
+        let list = counting(vec![main.clone(), linked.clone()], &calls);
+        let probe = WorktreeProbe::new();
+        let t0 = Instant::now();
+        assert_eq!(probe.linked(&main, t0, &list), Some(vec![linked.clone()]));
+        assert_eq!(
+            probe.linked(&main, t0 + Duration::from_secs(59), &list),
+            Some(vec![linked.clone()])
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "within the TTL: no second git call"
+        );
+        probe.linked(&main, t0 + LINKED_WORKTREES_TTL, &list);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "after the TTL it asks again"
+        );
+    }
+
+    /// No `.git/worktrees` entry, no git: the common case costs a stat.
+    #[test]
+    fn a_checkout_with_no_worktrees_never_runs_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        git(tmp.path(), &["init", "-q"]);
+        let calls = AtomicUsize::new(0);
+        let list = counting(vec![tmp.path().to_path_buf()], &calls);
+        let probe = WorktreeProbe::new();
+        assert_eq!(
+            probe.linked(tmp.path(), Instant::now(), &list),
+            Some(vec![])
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_linked_worktree_itself_and_a_non_repository_have_none_to_list() {
+        let (_tmp, _main, linked) = repo_with_linked_worktree();
+        let plain = tempfile::tempdir().unwrap();
+        let calls = AtomicUsize::new(0);
+        let list = counting(vec![], &calls);
+        let probe = WorktreeProbe::new();
+        assert_eq!(probe.linked(&linked, Instant::now(), &list), Some(vec![]));
+        assert_eq!(
+            probe.linked(plain.path(), Instant::now(), &list),
+            Some(vec![])
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A failure to list is "unknown", not "none", and is not retried at once.
+    #[test]
+    fn a_listing_failure_is_unknown_and_is_kept_for_the_ttl() {
+        let (_tmp, main, _linked) = repo_with_linked_worktree();
+        let calls = AtomicUsize::new(0);
+        let failing = |_: &Path| -> Result<Vec<PathBuf>> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("git is not available")
+        };
+        let probe = WorktreeProbe::new();
+        let t0 = Instant::now();
+        assert_eq!(probe.linked(&main, t0, &failing), None);
+        assert_eq!(
+            probe.linked(&main, t0 + Duration::from_secs(1), &failing),
+            None
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

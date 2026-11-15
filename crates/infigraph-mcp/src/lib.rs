@@ -775,6 +775,9 @@ pub fn handle_tools_call(id: &Value, request: &Value) -> Value {
         }
     };
     let ignored_note = tools::helpers::ignored_args_note(tool_name, &ignored);
+    // Whether the caller named a project, taken here once, before scoping
+    // fills `path` in: the footer's root notice asks it.
+    let named = raw_args.get("path").is_some();
     let args = tools::helpers::scope_to_project(tool_name, raw_args);
 
     tools::helpers::log_activity(tool_name, &args);
@@ -805,7 +808,7 @@ pub fn handle_tools_call(id: &Value, request: &Value) -> Value {
             session_context::record_tool_call(tool_name, detail_requested);
             session_context::record_focus(tool_name, &args);
             let mut compressed = compress::compress_pipeline_safe(&content, tool_name, &args);
-            if let Some(footer) = health::health_footer(tool_name, &args) {
+            if let Some(footer) = health::health_footer(tool_name, &args, named) {
                 compressed.push('\n');
                 compressed.push_str(&footer);
             }
