@@ -50,7 +50,7 @@ pub fn atomic_write(path: &Path, buf: &[u8]) -> Result<()> {
 /// their own to extend at all.
 const GENERATION_MARKER_SUFFIX: &str = ".generation";
 
-fn generation_marker_path(sidecar_path: &Path) -> PathBuf {
+pub(crate) fn generation_marker_path(sidecar_path: &Path) -> PathBuf {
     let name = sidecar_path
         .file_name()
         .and_then(|n| n.to_str())
