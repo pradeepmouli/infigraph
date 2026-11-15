@@ -1623,11 +1623,12 @@ pub(crate) fn cmd_memory_context(
     Ok(())
 }
 
-pub(crate) fn cmd_consolidate_memory(root: &Path, threshold: f64) -> Result<()> {
+pub(crate) fn cmd_consolidate_memory(root: &Path, threshold: f64, cross_owner: bool) -> Result<()> {
     let path = root.to_string_lossy();
     let args = json!({
         "path": path.as_ref(),
         "threshold": threshold,
+        "cross_owner": cross_owner,
     });
     let result = infigraph_mcp::tools::session::tool_consolidate_memory(&args)?;
     println!("{result}");

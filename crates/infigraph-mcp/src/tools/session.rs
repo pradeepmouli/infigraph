@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use infigraph_core::embed;
-use infigraph_core::graph::{SessionData, SessionStore};
+use infigraph_core::graph::{owner_of, SessionData, SessionStore};
 
 pub fn open_session_store(args: &Value) -> Result<SessionStore> {
     let path = args
@@ -140,7 +140,7 @@ pub fn tool_save_session(args: &Value) -> Result<String> {
     let sessions_dir = root.join(".infigraph").join("sessions");
 
     let wrote_narrative;
-    let (session_id, session_count) = {
+    let session_id = {
         let _session_lock = store.lock()?;
 
         let session_id = if session_name.is_empty() {
@@ -237,20 +237,15 @@ pub fn tool_save_session(args: &Value) -> Result<String> {
         emb_store.push((session_id.clone(), vec));
         embed::save_embeddings(&emb_path, &emb_store)?;
 
-        (session_id, emb_store.len())
+        session_id
     };
 
-    // `_session_lock` is dropped here (end of block), released before the
-    // auto-consolidation call below — tool_consolidate_memory acquires the
-    // same sessions.lock itself (Task 3), so holding it across that call
-    // would self-deadlock.
-
-    let auto_consolidated = if session_count > 50 {
-        let consolidate_args = serde_json::json!({ "path": path, "threshold": 0.7 });
-        tool_consolidate_memory(&consolidate_args).ok()
-    } else {
-        None
-    };
+    // A save never consolidates. It used to, once `embeddings.bin` held more
+    // than 50 entries -- a count of file entries (orphans and duplicates
+    // included), not of sessions, so it was true on every save -- and each run
+    // merged whichever records embedded alike, across sessions. Saying so is
+    // all a save does now; `consolidate_memory` is the explicit call.
+    let active_records = store.list_active(now).map(|s| s.len()).unwrap_or(0);
 
     let mut result = if session_name.is_empty() {
         format!("Session saved: {session_id}")
@@ -270,14 +265,17 @@ pub fn tool_save_session(args: &Value) -> Result<String> {
         " (narrative omitted)"
     });
 
-    if let Some(consolidation_msg) = auto_consolidated {
+    if active_records > CONSOLIDATION_HINT_ABOVE {
         result.push_str(&format!(
-            "\n\n**Auto-consolidation triggered ({session_count} sessions):**\n{consolidation_msg}"
+            "\n{active_records} active session records: `consolidate_memory` merges similar ones."
         ));
     }
 
     Ok(result)
 }
+
+/// Active records above which a save mentions `consolidate_memory`.
+pub const CONSOLIDATION_HINT_ABOVE: usize = 50;
 
 pub const CLUSTER_GAP_SECS: i64 = 72 * 3600;
 
@@ -749,6 +747,12 @@ pub fn tool_consolidate_memory(args: &Value) -> Result<String> {
         .get("threshold")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.7) as f32;
+    // Records of different sessions are different lines of work, however alike
+    // they embed: they merge only when the caller says so.
+    let cross_owner = args
+        .get("cross_owner")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -758,7 +762,7 @@ pub fn tool_consolidate_memory(args: &Value) -> Result<String> {
     let root = PathBuf::from(path);
     let sessions_dir = root.join(".infigraph").join("sessions");
 
-    let (consolidated_count, mut out) = {
+    let (consolidated_count, withheld_pairs, mut out) = {
         let _session_lock = store.lock()?;
 
         // Purge expired sessions (confidence < 0.1)
@@ -808,11 +812,19 @@ pub fn tool_consolidate_memory(args: &Value) -> Result<String> {
             parent[i]
         }
 
+        let mut withheld_pairs = 0usize;
         for i in 0..n {
             for j in (i + 1)..n {
                 let sim =
                     embed::cosine_similarity(&sessions_with_emb[i].1, &sessions_with_emb[j].1);
                 if sim >= similarity_threshold {
+                    if !cross_owner
+                        && !owner_of(&sessions_with_emb[i].0.id)
+                            .may_merge_with(&owner_of(&sessions_with_emb[j].0.id))
+                    {
+                        withheld_pairs += 1;
+                        continue;
+                    }
                     let pi = find(&mut parent, i);
                     let pj = find(&mut parent, j);
                     if pi != pj {
@@ -921,6 +933,9 @@ pub fn tool_consolidate_memory(args: &Value) -> Result<String> {
             let embedder = embed::code_embedder();
             if let Ok(emb_vec) = embedder.embed(&embed_text) {
                 let mut all_embs = embed::load_embeddings(&emb_path)?;
+                // One entry per id: the same cluster consolidated again
+                // replaces its embedding (they used to pile up).
+                all_embs.retain(|(id, _)| id != &consolidated_id);
                 all_embs.push((consolidated_id.clone(), emb_vec));
                 embed::save_embeddings(&emb_path, &all_embs)?;
             }
@@ -940,7 +955,7 @@ pub fn tool_consolidate_memory(args: &Value) -> Result<String> {
             consolidated_count += 1;
         }
 
-        (consolidated_count, out)
+        (consolidated_count, withheld_pairs, out)
     };
     // `_session_lock` is dropped here — the symbol-cluster lookup below
     // touches unrelated graph state, not sessions.lock resources, so it
@@ -954,6 +969,13 @@ pub fn tool_consolidate_memory(args: &Value) -> Result<String> {
         out.push_str(&format!(
             "\n**Created {} consolidated session(s).** Source sessions preserved with reduced confidence.\n",
             consolidated_count
+        ));
+    }
+
+    if withheld_pairs > 0 {
+        out.push_str(&format!(
+            "\n{withheld_pairs} similar pair(s) belong to different sessions and were not merged; \
+             pass `cross_owner=true` to merge them.\n"
         ));
     }
 
@@ -1043,6 +1065,183 @@ mod tests {
             .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
             .collect();
         assert_eq!(md.len(), 1, "exactly the one narrative was written");
+    }
+
+    const ALIKE: &str = "JWT token validation in the auth middleware: RS256 signatures and expiry";
+
+    /// A project whose sessions directory holds `records` (id, created_at),
+    /// each with its embedding, the way saves leave it. Every record has the
+    /// same text, so any two are above any similarity threshold.
+    fn project_with_embedded_records(records: &[(&str, i64)]) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let now = session_epoch();
+        let embedder = embed::code_embedder();
+        let mut embeddings = Vec::new();
+        for (id, created) in records {
+            store.save(&active_record(id, *created, now)).unwrap();
+            embeddings.push((id.to_string(), embedder.embed(ALIKE).unwrap()));
+        }
+        embed::save_embeddings(&store.sessions_dir().join("embeddings.bin"), &embeddings).unwrap();
+        (dir, root)
+    }
+
+    fn active_record(id: &str, created: i64, now: i64) -> SessionData {
+        let mut s = make_session(id, created, now);
+        s.summary = ALIKE.to_string();
+        s.confidence = 0.9;
+        s.last_accessed = now;
+        s
+    }
+
+    fn sessions_dir_of(root: &str) -> std::path::PathBuf {
+        std::path::Path::new(root)
+            .join(".infigraph")
+            .join("sessions")
+    }
+
+    /// The ids of the `consolidated_*` records on disk.
+    fn consolidated_records(root: &str) -> Vec<String> {
+        let mut ids: Vec<String> = std::fs::read_dir(sessions_dir_of(root))
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|n| n.starts_with("consolidated_") && n.ends_with(".json"))
+            .map(|n| n.trim_end_matches(".json").to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// The gate was `embeddings.bin` holding more than 50 entries: a count of
+    /// file entries (orphans and duplicates included), so it was true on every
+    /// save and every save consolidated.
+    #[test]
+    fn a_save_never_consolidates_however_many_embeddings_entries_there_are() {
+        let (dir, root) = project_with_embedded_records(&[("named_a", 1000), ("named_b", 2000)]);
+        let emb_path = sessions_dir_of(&root).join("embeddings.bin");
+        let mut entries = embed::load_embeddings(&emb_path).unwrap();
+        let vector = entries[0].1.clone();
+        for i in 0..60 {
+            entries.push((format!("session_2026-01-01_orphan{i}"), vector.clone()));
+        }
+        embed::save_embeddings(&emb_path, &entries).unwrap();
+
+        let out = tool_save_session(&serde_json::json!({
+            "path": root, "name": "c", "summary": ALIKE,
+        }))
+        .unwrap();
+
+        assert!(!out.contains("Auto-consolidation"), "{out}");
+        assert!(
+            consolidated_records(&root).is_empty(),
+            "a save merged records"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn a_save_says_so_only_when_many_records_are_active() {
+        let ids: Vec<String> = (0..=CONSOLIDATION_HINT_ABOVE)
+            .map(|i| format!("session_2026-01-01_key{i:05}"))
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let now = session_epoch();
+        for id in &ids {
+            store.save(&active_record(id, now - 100, now)).unwrap();
+        }
+        // 51 records, and the save adds a 52nd.
+        let out =
+            tool_save_session(&serde_json::json!({"path": root, "summary": "one more"})).unwrap();
+        assert!(out.contains("consolidate_memory"), "{out}");
+
+        let (_few, few_root) = project_with_embedded_records(&[("named_a", 1000)]);
+        let out =
+            tool_save_session(&serde_json::json!({"path": few_root, "summary": "x"})).unwrap();
+        assert!(!out.contains("consolidate_memory"), "{out}");
+    }
+
+    /// Records of different sessions, and the date-keyed records several
+    /// sessions wrote to, embed alike (one repository) and must not merge: that
+    /// was a day's two lines of work becoming one.
+    #[test]
+    fn consolidation_withholds_records_of_different_owners() {
+        let (_dir, root) = project_with_embedded_records(&[
+            ("session_2026-11-13_aaaaaaaa", 1000),
+            ("session_2026-11-14_bbbbbbbb", 2000),
+            ("session_2026-11-13", 1500),
+            ("session_2026-11-14", 1600),
+        ]);
+
+        let out = tool_consolidate_memory(&serde_json::json!({"path": root})).unwrap();
+        assert!(consolidated_records(&root).is_empty(), "{out}");
+        assert!(out.contains("not merged"), "{out}");
+
+        // The override is explicit.
+        let out = tool_consolidate_memory(&serde_json::json!({"path": root, "cross_owner": true}))
+            .unwrap();
+        assert_eq!(consolidated_records(&root).len(), 1, "{out}");
+    }
+
+    #[test]
+    fn consolidation_merges_the_records_of_one_session_and_only_those() {
+        let (_dir, root) = project_with_embedded_records(&[
+            ("session_2026-11-13_aaaaaaaa", 1000),
+            ("session_2026-11-14_aaaaaaaa", 2000),
+            ("session_2026-11-14_bbbbbbbb", 3000),
+        ]);
+
+        let out = tool_consolidate_memory(&serde_json::json!({"path": root})).unwrap();
+
+        assert_eq!(consolidated_records(&root), ["consolidated_1000"], "{out}");
+        assert!(out.contains("session_2026-11-13_aaaaaaaa"), "{out}");
+        assert!(out.contains("session_2026-11-14_aaaaaaaa"), "{out}");
+        assert!(
+            !out.contains("Sources: session_2026-11-14_bbbbbbbb"),
+            "{out}"
+        );
+        let store = SessionStore::open(std::path::Path::new(&root)).unwrap();
+        let other = store.load("session_2026-11-14_bbbbbbbb").unwrap().unwrap();
+        assert!(
+            other.confidence >= 0.9,
+            "the other session's record was touched: {}",
+            other.confidence
+        );
+    }
+
+    /// The same cluster consolidated again replaces its embedding: each run
+    /// used to push another copy, which is how `embeddings.bin` held 12.
+    #[test]
+    fn consolidating_a_cluster_again_leaves_one_embedding_for_it() {
+        let (_dir, root) = project_with_embedded_records(&[
+            ("session_2026-11-13_aaaaaaaa", 1000),
+            ("session_2026-11-14_aaaaaaaa", 2000),
+        ]);
+        tool_consolidate_memory(&serde_json::json!({"path": root})).unwrap();
+        // The sources are halved after a merge; make them mergeable again.
+        let store = SessionStore::open(std::path::Path::new(&root)).unwrap();
+        let now = session_epoch();
+        for (id, created) in [
+            ("session_2026-11-13_aaaaaaaa", 1000),
+            ("session_2026-11-14_aaaaaaaa", 2000),
+        ] {
+            store.save(&active_record(id, created, now)).unwrap();
+        }
+        tool_consolidate_memory(&serde_json::json!({"path": root})).unwrap();
+
+        let entries =
+            embed::load_embeddings(&sessions_dir_of(&root).join("embeddings.bin")).unwrap();
+        let copies = entries
+            .iter()
+            .filter(|(id, _)| id == "consolidated_1000")
+            .count();
+        assert_eq!(
+            copies, 1,
+            "the consolidated record's embedding was duplicated"
+        );
     }
 
     #[test]
