@@ -39,6 +39,7 @@ pub const SCIP_LITERAL_OWNERS_UNAVAILABLE: &str = "scip-literal-owners-unavailab
 pub const SESSIONS_UNREADABLE: &str = "sessions-unreadable";
 pub const SCIP_UNKNOWN_LANGUAGE: &str = "scip-unknown-language";
 pub const KEYLESS_DUPLICATE_EDGES: &str = "keyless-duplicate-edges";
+pub const WATCHER_MISSING: &str = "watcher-missing";
 
 /// One way infigraph is running degraded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +140,13 @@ pub enum DegradedMode {
     /// is the holder as `lockfile::holder_summary` words it (role, pid, how
     /// long it has held the lock).
     GraphHeldByWriter { pid: u32, summary: String },
+    /// An indexed project has no process watching it and none left on
+    /// purpose, so edits are not seen until one starts. Derived from
+    /// `watch.lock` and the daemon's idle-exit note by [`watcher_missing`];
+    /// not part of [`derived_from_disk`], since `doctor` judges a watcher on
+    /// its own (it passes a project whose daemon went idle) and only a
+    /// footer, after a call that never needed the daemon, has reason to say so.
+    WatcherMissing { root: String },
 }
 
 impl DegradedMode {
@@ -174,6 +182,7 @@ impl DegradedMode {
             DegradedMode::ScipUnknownLanguage { .. } => SCIP_UNKNOWN_LANGUAGE,
             DegradedMode::KeylessDuplicateEdges { .. } => KEYLESS_DUPLICATE_EDGES,
             DegradedMode::GraphHeldByWriter { .. } => GRAPH_HELD_BY_WRITER,
+            DegradedMode::WatcherMissing { .. } => WATCHER_MISSING,
         }
     }
 
@@ -310,6 +319,9 @@ impl DegradedMode {
                 "{HELD_BY_WRITER_PHRASE}{summary}: writes wait for it, and no fault is latched \
                  while it runs"
             ),
+            DegradedMode::WatcherMissing { root } => format!(
+                "No file watcher running for {root}: edits made now are not seen until one starts"
+            ),
         }
     }
 
@@ -385,6 +397,9 @@ impl DegradedMode {
             DegradedMode::GraphHeldByWriter { .. } => {
                 "it finishes on its own; `infigraph kill <pid>` if it is stuck (the pid is in \
                  the message)"
+            }
+            DegradedMode::WatcherMissing { .. } => {
+                "the next search or index starts one, or run `infigraph watch`"
             }
         }
     }
@@ -751,6 +766,30 @@ pub fn embedder_modes(root: &Path, process_embedder: Option<&str>) -> Vec<Degrad
     modes
 }
 
+/// [`DegradedMode::WatcherMissing`] for `root`, or `None`. A project is
+/// watched when a live process holds `watch.lock` (the daemon, a CLI watch or
+/// an MCP worker's own); one whose daemon left after sitting idle left on
+/// purpose and its next use starts another (`daemon::idle_exit`), and a
+/// project with no index, a linked worktree included, has nothing to watch
+/// (`worktree-has-no-index` already says so). A live daemon holds the lock, so
+/// its answer and this one cannot differ. Probes only: opens no store, starts
+/// no daemon, creates nothing.
+pub fn watcher_missing(root: &Path) -> Option<DegradedMode> {
+    let ig = root.join(".infigraph");
+    if crate::daemon::lifecycle::is_remote_backend() || !crate::graph::names::store_present(&ig) {
+        return None;
+    }
+    if crate::lockfile::is_held(&ig.join("watch.lock")) {
+        return None;
+    }
+    if crate::daemon::idle_exit::note(root).is_some() {
+        return None;
+    }
+    Some(DegradedMode::WatcherMissing {
+        root: root.display().to_string(),
+    })
+}
+
 /// The modes that files on disk alone establish. No process state, no store.
 pub fn derived_from_disk(root: &Path) -> Vec<DegradedMode> {
     let mut modes = Vec::new();
@@ -989,6 +1028,66 @@ mod tests {
     }
 
     #[test]
+    fn an_indexed_project_with_nobody_holding_watch_lock_is_missing_a_watcher() {
+        let p = Project::new();
+        match watcher_missing(p.root()) {
+            Some(DegradedMode::WatcherMissing { root }) => {
+                assert_eq!(root, p.root().display().to_string());
+            }
+            other => panic!("expected the watcher mode, got {other:?}"),
+        }
+        let notice = watcher_missing(p.root()).unwrap().notice();
+        assert!(
+            notice.message.starts_with("No file watcher running for "),
+            "{notice:?}"
+        );
+        assert!(notice.message.contains(&p.root().display().to_string()));
+    }
+
+    #[test]
+    fn a_held_watch_lock_means_a_watcher_is_running() {
+        use fs2::FileExt;
+        let p = Project::new();
+        p.write("watch.lock", b"");
+        let held = std::fs::File::options()
+            .write(true)
+            .open(p.root().join(".infigraph/watch.lock"))
+            .unwrap();
+        held.try_lock_exclusive().unwrap();
+        assert_eq!(watcher_missing(p.root()), None);
+        drop(held);
+        // Released: the file is still there and nobody holds it.
+        assert!(watcher_missing(p.root()).is_some());
+    }
+
+    #[test]
+    fn a_daemon_that_left_on_purpose_is_not_a_missing_watcher() {
+        let p = Project::new();
+        crate::daemon::idle_exit::record(p.root(), 1800);
+        assert_eq!(watcher_missing(p.root()), None);
+    }
+
+    #[test]
+    fn a_project_with_no_index_has_no_watcher_to_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".infigraph")).unwrap();
+        assert_eq!(watcher_missing(dir.path()), None);
+        // Probing created nothing.
+        assert!(!dir.path().join(".infigraph/watch.lock").exists());
+    }
+
+    /// A linked worktree whose store is gone shows `worktree-has-no-index`
+    /// and nothing about a watcher.
+    #[test]
+    fn a_linked_worktree_without_a_store_is_not_a_missing_watcher() {
+        let _p = Project::new();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".git"), "gitdir: /x/.git/worktrees/w\n").unwrap();
+        std::fs::create_dir_all(dir.path().join(".infigraph")).unwrap();
+        assert_eq!(watcher_missing(dir.path()), None);
+    }
+
+    #[test]
     fn a_missing_hnsw_index_is_reported_only_past_the_threshold() {
         let p = Project::new();
         p.embeddings(1_000);
@@ -1092,6 +1191,9 @@ mod tests {
             DegradedMode::GraphHeldByWriter {
                 pid: 4242,
                 summary: "scip-enrich (PID 4242), held 3s".to_string(),
+            },
+            DegradedMode::WatcherMissing {
+                root: "/p".to_string(),
             },
         ];
         let keys: std::collections::HashSet<_> = modes.iter().map(|m| m.key()).collect();

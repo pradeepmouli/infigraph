@@ -102,7 +102,6 @@ impl Default for HealthState {
 #[derive(Debug, Default)]
 pub struct Signals {
     pub worker_restarted: bool,
-    pub watcher_missing: bool,
     /// The degraded modes `infigraph_core::degraded` reports (#75): defined
     /// and worded there, only rendered here.
     pub degraded: Vec<infigraph_core::degraded::Notice>,
@@ -147,18 +146,23 @@ pub fn gather_signals(state: &HealthState, tool_name: &str, project: Option<&Pat
     let local_project = project.filter(|root| {
         !infigraph_core::daemon::lifecycle::is_remote_backend() && root.join(".infigraph").is_dir()
     });
-    if let Some(root) = local_project {
-        if !WATCHER_LIFECYCLE_TOOLS.contains(&tool_name) {
-            sig.watcher_missing = !crate::tools::watch::watcher_running(root);
-        }
-    }
     if !DEGRADED_REPORTING_TOOLS.contains(&tool_name) {
-        let in_effect = match local_project {
+        let mut in_effect = match local_project {
             // Cached: this runs after every tool call, and the daemon's part
             // is a socket round trip.
             Some(root) => degraded::gather_cached(root),
             None => degraded::process_notices(),
         };
+        // A missing watcher is a degraded mode like the rest, so it is worded
+        // in one place and shown once per repeat period, not after every call.
+        // This worker's own watcher counts, as does a deliberate stop.
+        if let Some(root) = local_project {
+            if !WATCHER_LIFECYCLE_TOOLS.contains(&tool_name)
+                && !crate::tools::watch::is_watching(&root.to_string_lossy().replace('\\', "/"))
+            {
+                in_effect.extend(degraded::watcher_missing(root).map(|mode| mode.notice()));
+            }
+        }
         sig.degraded = state.degraded_due(local_project, in_effect, Instant::now());
     }
     sig
@@ -171,13 +175,6 @@ pub fn compose_footer(sig: &Signals) -> Option<String> {
         lines.push(
             "⚠ worker restarted since your previous call — in-memory state \
              (watchers, session context) was reset"
-                .to_string(),
-        );
-    }
-    if sig.watcher_missing {
-        lines.push(
-            "⚠ No file watcher running — results may be stale. \
-             Run `infigraph watch` or re-index to refresh."
                 .to_string(),
         );
     }
