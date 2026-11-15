@@ -6,55 +6,28 @@
 //! so the implementation's id does not move (no ID_SCHEME bump).
 
 use std::collections::BTreeSet;
-use std::path::Path;
-use std::sync::Arc;
 
-use infigraph_core::extract::extract_file;
-use infigraph_core::graph::{names, GraphStore};
-use infigraph_core::scip::{definition_ids, import_scip_index, use_language_registry};
+mod common;
+use common::ts_fixture::{base, TsFixture, SCIP_FILES};
 
-const FIXTURE: &str = "tests/fixtures/scip_ts_method_signatures";
-const SCIP_FILES: [&str; 2] = ["scip.bin", "scip-tsrs.bin"];
-
-fn fixture() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE)
-}
-
-/// Tree-sitter's `(id, kind)` for one file of the fixture.
-fn extracted(file: &str) -> Vec<(String, String)> {
-    let source = std::fs::read(fixture().join(file)).unwrap();
-    let registry = infigraph_languages::bundled_registry().unwrap();
-    let ext = if file.ends_with(".tsx") {
-        ".tsx"
-    } else {
-        ".ts"
-    };
-    let pack = registry.for_extension(ext).unwrap();
-    extract_file(file, &source, pack)
-        .unwrap()
-        .symbols
-        .into_iter()
-        .map(|s| (s.id, format!("{:?}", s.kind)))
-        .collect()
+fn fx() -> TsFixture {
+    TsFixture::new("scip_ts_method_signatures")
 }
 
 fn ids(file: &str) -> BTreeSet<String> {
-    extracted(file).into_iter().map(|(id, _)| id).collect()
-}
-
-fn base(id: &str) -> &str {
-    match id.rsplit_once('#') {
-        Some((head, n)) if n.chars().all(|c| c.is_ascii_digit()) => head,
-        _ => id,
-    }
+    fx().ids(file)
 }
 
 fn kind_of(file: &str, id: &str) -> String {
-    extracted(file)
-        .into_iter()
-        .find(|(i, _)| i == id)
-        .map(|(_, k)| k)
-        .unwrap_or_else(|| panic!("no symbol {id}"))
+    fx().kind_of(file, id)
+}
+
+fn extracted(file: &str) -> Vec<(String, String)> {
+    fx().extracted(file)
+}
+
+fn graph_ids(scip: Option<&str>) -> Vec<(String, String)> {
+    fx().graph_rows("a.ts", scip)
 }
 
 #[test]
@@ -202,11 +175,7 @@ fn both_indexers_define_every_signature_tree_sitter_names() {
     .collect();
     let tree_sitter = ids("a.ts");
     for file in SCIP_FILES {
-        let bytes = std::fs::read(fixture().join(file)).unwrap();
-        let scip: BTreeSet<String> = definition_ids(&bytes, "a.ts")
-            .unwrap()
-            .into_iter()
-            .collect();
+        let scip = fx().scip_ids(file, "a.ts");
         for id in &signatures {
             assert!(scip.contains(*id), "{file}: no SCIP definition of {id}");
         }
@@ -220,30 +189,6 @@ fn both_indexers_define_every_signature_tree_sitter_names() {
             .collect();
         assert!(missing.is_empty(), "{file}: SCIP-only ids {missing:?}");
     }
-}
-
-/// The graph's ids for `a.ts`: tree-sitter's symbols, then after importing `scip`.
-fn graph_ids(scip: Option<&str>) -> Vec<(String, String)> {
-    use_language_registry(Arc::new(infigraph_languages::bundled_registry().unwrap()));
-    let source = std::fs::read(fixture().join("a.ts")).unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("a.ts"), &source).unwrap();
-    let registry = infigraph_languages::bundled_registry().unwrap();
-    let pack = registry.for_extension(".ts").unwrap();
-    let extracted = extract_file("a.ts", &source, pack).unwrap();
-    let store = GraphStore::open(&dir.path().join(names::STEM)).unwrap();
-    store.upsert_file(&extracted).unwrap();
-    if let Some(file) = scip {
-        import_scip_index(&fixture().join(file), &store, Some(dir.path())).unwrap();
-    }
-    let conn = store.connection().unwrap();
-    let mut rows: Vec<(String, String)> = conn
-        .query("MATCH (s:Symbol) WHERE s.file = 'a.ts' RETURN s.id, s.kind")
-        .unwrap()
-        .map(|row| (row[0].to_string(), row[1].to_string()))
-        .collect();
-    rows.sort();
-    rows
 }
 
 /// Enrichment leaves exactly one row per signature, under the id tree-sitter

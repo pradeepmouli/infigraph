@@ -8,6 +8,19 @@ use super::{
 use crate::analysis::cyclomatic_complexity;
 use crate::model::{Span, Symbol, SymbolKind};
 
+/// Whether the class body `body` has a `method_definition` named `name`: the
+/// implementation a `method_signature` of that name is an overload of.
+fn has_implementation(body: Node, name: &str, source: &[u8]) -> bool {
+    let mut cursor = body.walk();
+    let found = body.named_children(&mut cursor).any(|child| {
+        child.kind() == "method_definition"
+            && child
+                .child_by_field_name("name")
+                .is_some_and(|n| strip_string_delimiters(&node_text(n, source)) == name)
+    });
+    found
+}
+
 /// Extract symbols from a parsed AST using a Tree-sitter query.
 ///
 /// The query must use these capture names:
@@ -275,10 +288,15 @@ pub fn extract_entities(
         if let (Some(full_name), Some(node), Some(sym_kind)) = (name_text, def_node, kind) {
             // An overload signature in a class body stays folded into the
             // implementation under it: a row of its own would make the
-            // implementation's id `Class::m#N`, an id that moved.
+            // implementation's id `Class::m#N`, an id that moved. With no
+            // implementation of that name in the body (a `declare class`, a
+            // `.d.ts`), there is nothing to fold into: it is a symbol, as an
+            // interface's member is.
             if is_signature
                 && node.kind() == "method_signature"
-                && node.parent().is_some_and(|p| p.kind() == "class_body")
+                && node.parent().is_some_and(|body| {
+                    body.kind() == "class_body" && has_implementation(body, &full_name, source)
+                })
             {
                 continue;
             }

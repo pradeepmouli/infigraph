@@ -20,6 +20,8 @@ const FILES: &[&str] = &[
     "../../tests/fixtures/microservices/order-service/src/middleware.ts",
     "../../tests/fixtures/microservices/order-service/src/models.ts",
     "../../tests/fixtures/microservices/order-service/src/routes.ts",
+    "tests/fixtures/scip_ts_declare_class/a.ts",
+    "tests/fixtures/scip_ts_declare_class/lib.d.ts",
     "tests/fixtures/scip_ts_literal_keys/a.ts",
     "tests/fixtures/scip_ts_member_names/a.ts",
     "tests/fixtures/scip_ts_method_signatures/a.ts",

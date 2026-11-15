@@ -89,6 +89,17 @@ A heading that starts like a key but is not exactly one span (`` ### `a.py::f` -
 the first ``, say) links nothing; `doctor` counts those so a typo does not
 silently drop an entry.
 
+A level 2-4 heading whose whole text is one backtick span that names a path and has
+no `::` (`` ### `src/billing/invoice.py` ``) is no entry either, and no tool reads
+it. `doctor` lists those (`keyless headings`: file, line, heading) and says what to
+write: the heading's path plus `::module`, or, when the path is not a file of the
+project, that the section should be removed or its path corrected. It reads the
+Markdown files when it runs, not the index (`code_links::keyless_headings`, on the
+same scan as the key headings), so it needs no stored row and no rescan. The fix is
+a hand edit of the heading line (the edit guard only protects entries, and this is
+not one), then `infigraph index-docs`. A command, a flag or a single identifier in
+backticks is not a path and is left alone.
+
 ## Mentions
 
 A code span in text becomes a mention candidate when it is shaped like

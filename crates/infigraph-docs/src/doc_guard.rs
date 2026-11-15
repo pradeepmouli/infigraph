@@ -341,4 +341,18 @@ mod tests {
             "tool_input": {"file_path": root.join("docs/plain.md"), "content": "x"}});
         assert_eq!(decide(&input), Decision::Allow);
     }
+
+    /// A keyless heading is no entry, so the guard lets it be edited: the remedy
+    /// `doctor` prints is a hand edit of that line.
+    #[test]
+    fn a_keyless_path_heading_can_be_edited_by_hand() {
+        let (_dir, root) = project();
+        std::fs::write(root.join("docs/k.md"), "# K\n\n### `src/a.py`\n\nWhy.\n").unwrap();
+        let input = json!({
+            "tool_name": "Edit", "cwd": root,
+            "tool_input": {"file_path": root.join("docs/k.md"),
+                "old_string": "### `src/a.py`", "new_string": "### `src/a.py::module`"},
+        });
+        assert_eq!(decide(&input), Decision::Allow);
+    }
 }
