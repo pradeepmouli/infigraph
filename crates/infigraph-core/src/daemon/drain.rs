@@ -170,6 +170,28 @@ fn record_drain_run(root: &Path, run: crate::last_run::Run<'_>, result: &Result<
     );
 }
 
+/// The breakdown logged beside a slow drain's `drain took` line (same 5 s
+/// threshold, `phase_clock::is_slow`): which phase held `index.lock`, and
+/// whether the drain was a whole-project pass over many files or a few. A
+/// drain under the threshold has no line.
+fn phases_line(
+    stamp: &str,
+    whole_project: bool,
+    scanned: usize,
+    extracted: usize,
+    took: std::time::Duration,
+    report: &str,
+) -> Option<String> {
+    crate::phase_clock::is_slow(took).then(|| {
+        format!(
+            "[daemon] {stamp} drain phases: whole-project {}, scanned {scanned} file(s), \
+             extracted {extracted} file(s): {}",
+            if whole_project { "yes" } else { "no" },
+            report
+        )
+    })
+}
+
 /// One combined pass -- extract, upsert, remove, resolve -- over everything
 /// `drained` accumulated. Its waiters were taken out first, by
 /// `execute_drain`, which answers them.
@@ -182,6 +204,8 @@ fn run_drain(
         .backend()
         .ok_or_else(|| anyhow::anyhow!("graph not initialized"))?;
 
+    let mut clock = crate::phase_clock::PhaseClock::start();
+    let mut scanned = 0usize;
     let mut to_extract: Vec<String> = Vec::new();
     let mut pre_parsed: Vec<FileExtraction> = Vec::new();
     let mut resolve_only: Vec<FileExtraction> = Vec::new();
@@ -194,6 +218,7 @@ fn run_drain(
         }
     }
 
+    let drained_whole_project = drained.whole_project;
     let mut whole_project_stale: Vec<String> = Vec::new();
     if drained.whole_project {
         let scan = infigraph.scan_changed_files(backend)?;
@@ -203,6 +228,7 @@ fn run_drain(
             scan.extractions.len(),
             scan.stale_files.len()
         );
+        scanned = scan.extractions.len();
         for extraction in scan.extractions {
             // A whole-project scan finding a change for a path that ALSO
             // has an explicit pending item takes a back seat to that
@@ -220,11 +246,15 @@ fn run_drain(
         whole_project_stale = scan.stale_files;
     }
 
+    clock.lap("scan");
+
     let freshly_extracted: Vec<FileExtraction> = if to_extract.is_empty() {
         Vec::new()
     } else {
         infigraph.extract_paths(&to_extract)
     };
+    let extracted = freshly_extracted.len();
+    clock.lap("extract");
 
     let mut extractions = freshly_extracted;
     extractions.extend(pre_parsed);
@@ -250,10 +280,14 @@ fn run_drain(
         }
     }
 
+    clock.lap("removals");
+
     if !extractions.is_empty() {
         let existing_hashes_empty = backend.get_file_hashes().unwrap_or_default().is_empty();
         backend.upsert_files_bulk(&extractions, existing_hashes_empty)?;
     }
+
+    clock.lap("upsert");
 
     let learned = if use_learned {
         Some(crate::learned::LearnedStore::load(infigraph.root()))
@@ -281,6 +315,17 @@ fn run_drain(
             }
         });
     extractions.truncate(extractions_count);
+    clock.lap("resolve");
+    if let Some(line) = phases_line(
+        &crate::watch::log_stamp(),
+        drained_whole_project,
+        scanned,
+        extracted,
+        clock.elapsed(),
+        &clock.report(),
+    ) {
+        eprintln!("{line}");
+    }
 
     Ok(DrainOutcome {
         extractions,
@@ -449,6 +494,24 @@ mod tests {
             },
             removals: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_phase_breakdown_is_logged_for_a_slow_drain_and_not_for_a_fast_one() {
+        use std::time::Duration;
+        let report = "scan 0.1s, total 5.0s";
+        assert_eq!(
+            phases_line("T", true, 9, 0, Duration::from_millis(4_999), report),
+            None
+        );
+        let line = phases_line("T", true, 9, 2, Duration::from_secs(5), report).unwrap();
+        assert_eq!(
+            line,
+            "[daemon] T drain phases: whole-project yes, scanned 9 file(s), \
+             extracted 2 file(s): scan 0.1s, total 5.0s"
+        );
+        let one = phases_line("T", false, 0, 1, Duration::from_secs(9), report).unwrap();
+        assert!(one.contains("whole-project no, scanned 0 file(s), extracted 1 file(s)"));
     }
 
     #[test]

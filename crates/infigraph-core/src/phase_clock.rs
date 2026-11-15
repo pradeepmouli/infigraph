@@ -62,6 +62,11 @@ impl PhaseClock {
         self.laps.iter().any(|(lap, ..)| *lap == name)
     }
 
+    /// The sum of the laps so far: never more than [`Self::elapsed`].
+    pub fn laps_total(&self) -> Duration {
+        self.laps.iter().map(|(_, took, _)| *took).sum()
+    }
+
     /// Time since the clock started.
     pub fn elapsed(&self) -> Duration {
         self.started.elapsed()
@@ -92,6 +97,12 @@ impl PhaseClock {
 /// An operation slower than this leaves a line in the daemon's log.
 pub const SLOW_OP: Duration = Duration::from_secs(5);
 
+/// Whether an operation that took `took` is slow enough to be logged: the one
+/// threshold [`SlowOp`] and a phase breakdown beside it share.
+pub fn is_slow(took: Duration) -> bool {
+    took >= SLOW_OP
+}
+
 /// Logs `[daemon] <time> <op> took N.Ns` when it is dropped, if the operation
 /// it brackets took [`SLOW_OP`] or more. A daemon at 693% CPU for minutes had
 /// no line saying what it was doing; every read, drain and write that takes
@@ -113,14 +124,14 @@ impl<'a> SlowOp<'a> {
 
     /// The log line for `op` having taken `took`, if that is slow.
     fn line(op: &str, took: Duration, stamp: &str) -> Option<String> {
-        (took >= SLOW_OP).then(|| format!("[daemon] {stamp} {op} took {:.1}s", took.as_secs_f64()))
+        is_slow(took).then(|| format!("[daemon] {stamp} {op} took {:.1}s", took.as_secs_f64()))
     }
 }
 
 impl Drop for SlowOp<'_> {
     fn drop(&mut self) {
         let took = self.started.elapsed();
-        if took < SLOW_OP {
+        if !is_slow(took) {
             return;
         }
         if let Some(op) = self.op.take() {
@@ -144,6 +155,24 @@ mod tests {
         assert!(report.starts_with("preload 0."), "{report}");
         assert!(report.contains(", parse 0."), "{report}");
         assert!(report.contains(", total 0."), "{report}");
+    }
+
+    #[test]
+    fn the_laps_sum_to_no_more_than_the_total_and_the_report_names_them_in_order() {
+        let mut clock = PhaseClock::start();
+        for name in ["scan", "extract", "removals", "upsert", "resolve"] {
+            clock.lap(name);
+        }
+        assert!(clock.laps_total() <= clock.elapsed());
+        let report = clock.report();
+        let at = |n: &str| report.find(n).unwrap_or_else(|| panic!("{n} in {report}"));
+        assert!(at("scan") < at("extract") && at("upsert") < at("resolve"));
+    }
+
+    #[test]
+    fn slow_is_five_seconds_or_more() {
+        assert!(!is_slow(Duration::from_millis(4_999)));
+        assert!(is_slow(SLOW_OP));
     }
 
     #[cfg(unix)]
