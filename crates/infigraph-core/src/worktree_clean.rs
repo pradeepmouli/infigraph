@@ -292,34 +292,13 @@ fn is_contained(repo_dir: &Path, wt: &GitWorktree) -> Result<bool> {
         .any(|r| Some(r) != own && (upstream.is_empty() || r != upstream)))
 }
 
-/// Whether something has the lock file open exclusively. A file that cannot be
-/// opened is treated as held: skipping is the safe answer.
-fn lock_is_held(path: &Path) -> bool {
-    use fs2::FileExt;
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(e) => return e.kind() != std::io::ErrorKind::NotFound,
-    };
-    match file.try_lock_exclusive() {
-        Ok(()) => {
-            let _ = file.unlock();
-            false
-        }
-        Err(_) => true,
-    }
-}
-
 /// What, if anything, is using the worktree's infigraph state: a lock some
 /// process holds, or a live process the durable state ties to this path.
 fn holder(wt: &GitWorktree, procs: &[crate::ps::ProcessRow]) -> Option<String> {
     let infigraph_dir = wt.path.join(".infigraph");
     if let Some(lock) = crate::ps::PROJECT_LOCKS
         .iter()
-        .find(|lock| lock_is_held(&infigraph_dir.join(lock)))
+        .find(|lock| crate::lockfile::is_held(&infigraph_dir.join(lock)))
     {
         return Some(format!("{lock} is held by a running process"));
     }
@@ -347,7 +326,7 @@ fn cargo_build_running(target: &Path) -> bool {
 }
 
 fn lock_is_held_if_present(path: &Path) -> bool {
-    path.is_file() && lock_is_held(path)
+    path.is_file() && crate::lockfile::is_held(path)
 }
 
 fn is_git_ignored(worktree: &Path, relative: &str) -> bool {

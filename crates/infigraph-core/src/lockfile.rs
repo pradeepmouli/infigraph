@@ -379,3 +379,26 @@ pub fn acquire(path: &Path, role: &str, timeout: Duration) -> Result<LockFile> {
         delay = (delay * 2).min(Duration::from_millis(500));
     }
 }
+
+/// Whether something has the lock file open exclusively: a trial flock that
+/// is released at once, never creating the file (a missing one is not held).
+/// A file that cannot be opened is treated as held: skipping is the safe
+/// answer. The one probe of "is a process running" for a lock file that
+/// carries no identity worth reading.
+pub fn is_held(path: &Path) -> bool {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) => return e.kind() != std::io::ErrorKind::NotFound,
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(_) => true,
+    }
+}

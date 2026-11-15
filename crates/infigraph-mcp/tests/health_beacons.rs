@@ -10,8 +10,11 @@ fn healthy_signals_produce_no_footer() {
 fn each_condition_renders_one_warning_line() {
     let sig = Signals {
         worker_restarted: true,
-        watcher_missing: true,
         degraded: vec![
+            DegradedMode::WatcherMissing {
+                root: "/p".to_string(),
+            }
+            .notice(),
             DegradedMode::TrigramEmbedder.notice(),
             DegradedMode::HnswMissing.notice(),
         ],
@@ -22,7 +25,7 @@ fn each_condition_renders_one_warning_line() {
     assert_eq!(lines.len(), 5, "one line per degraded condition: {footer}");
     assert!(lines.iter().all(|l| l.starts_with('⚠')), "{footer}");
     assert!(footer.contains("worker restarted since your previous call"));
-    assert!(footer.contains("No file watcher running — results may be stale"));
+    assert!(footer.contains("No file watcher running for /p"));
     assert!(footer.contains("trigram fallback"));
     assert!(footer.contains("HNSW index missing"));
     assert!(footer.contains(&format!(
@@ -48,16 +51,39 @@ fn initialized_worker_never_fires_restart_beacon() {
     assert!(!gather_signals(&state, "search", None).worker_restarted);
 }
 
+fn watcher_beacon(sig: &Signals) -> bool {
+    sig.degraded
+        .iter()
+        .any(|n| n.key == infigraph_core::degraded::WATCHER_MISSING)
+}
+
+/// An indexed project: `.infigraph/` with a store file in it.
+fn indexed_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let tg = dir.path().join(".infigraph");
+    std::fs::create_dir_all(&tg).unwrap();
+    std::fs::write(tg.join(infigraph_core::graph::names::STEM), b"graph").unwrap();
+    dir
+}
+
 #[test]
 fn watcher_beacon_from_durable_state() {
     let state = HealthState::new();
     state.mark_initialized();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = indexed_project();
     let tg = dir.path().join(".infigraph");
-    std::fs::create_dir_all(&tg).unwrap();
 
-    // No watcher anywhere: beacon fires.
-    assert!(gather_signals(&state, "search", Some(dir.path())).watcher_missing);
+    // No watcher anywhere: beacon fires, and names the project.
+    let sig = gather_signals(&state, "search", Some(dir.path()));
+    assert!(watcher_beacon(&sig), "{:?}", sig.degraded);
+    let footer = compose_footer(&sig).unwrap();
+    assert!(
+        footer.contains(&format!(
+            "No file watcher running for {}",
+            dir.path().display()
+        )),
+        "{footer}"
+    );
 
     // Another process (simulated: separate fd) holds watch.lock: healthy.
     use fs2::FileExt;
@@ -68,17 +94,55 @@ fn watcher_beacon_from_durable_state() {
         .open(tg.join("watch.lock"))
         .unwrap();
     lock.lock_exclusive().unwrap();
-    assert!(!gather_signals(&state, "search", Some(dir.path())).watcher_missing);
+    let state = HealthState::new();
+    state.mark_initialized();
+    assert!(!watcher_beacon(&gather_signals(
+        &state,
+        "search",
+        Some(dir.path())
+    )));
+}
+
+/// A daemon that exited after sitting idle left on purpose, and the next use
+/// starts one: that is not a warning on every tool call that never needed it.
+#[test]
+fn a_daemon_that_went_idle_is_not_reported_as_a_missing_watcher() {
+    let state = HealthState::new();
+    state.mark_initialized();
+    let dir = indexed_project();
+    infigraph_core::daemon::idle_exit::record(dir.path(), 1800);
+    assert!(!watcher_beacon(&gather_signals(
+        &state,
+        "save_session",
+        Some(dir.path())
+    )));
+}
+
+/// Said once, then again only after the repeat period, like every other mode.
+#[test]
+fn the_watcher_beacon_is_not_repeated_on_every_call() {
+    let state = HealthState::new();
+    state.mark_initialized();
+    let dir = indexed_project();
+    assert!(watcher_beacon(&gather_signals(
+        &state,
+        "search",
+        Some(dir.path())
+    )));
+    assert!(!watcher_beacon(&gather_signals(
+        &state,
+        "search",
+        Some(dir.path())
+    )));
 }
 
 #[test]
 fn watcher_lifecycle_tools_are_exempt() {
     let state = HealthState::new();
     state.mark_initialized();
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(dir.path().join(".infigraph")).unwrap();
+    let dir = indexed_project();
     assert!(
-        !gather_signals(&state, "stop_watch", Some(dir.path())).watcher_missing,
+        !watcher_beacon(&gather_signals(&state, "stop_watch", Some(dir.path()))),
         "a 'no watcher' beacon right after a deliberate stop_watch is noise"
     );
 }
@@ -88,7 +152,7 @@ fn no_project_means_no_project_scoped_beacons() {
     let state = HealthState::new();
     state.mark_initialized();
     let sig = gather_signals(&state, "compress", None);
-    assert!(!sig.watcher_missing);
+    assert!(!watcher_beacon(&sig));
     // Only what this process knows about itself, never a project's modes.
     assert!(
         sig.degraded

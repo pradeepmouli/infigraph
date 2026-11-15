@@ -96,18 +96,7 @@ pub fn watcher_running(root: &std::path::Path) -> bool {
     if is_watching(&root_str) {
         return true;
     }
-    use fs2::FileExt;
-    let lock_path = root.join(".infigraph").join("watch.lock");
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&lock_path)
-        .ok()
-        .map(|f| {
-            let locked = f.try_lock_exclusive().is_err();
-            let _ = fs2::FileExt::unlock(&f);
-            locked
-        })
-        .unwrap_or(false)
+    infigraph_core::lockfile::is_held(&root.join(".infigraph").join("watch.lock"))
 }
 
 /// This worker's veto over releasing an idle daemon lease
