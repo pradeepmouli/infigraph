@@ -1197,10 +1197,11 @@ fn check_one_sidecar(project_path: &Path, sidecar_name: &str) -> Option<CheckRes
 /// when either file is missing or the sidecar is the newer one. The one
 /// derivation of sidecar staleness, shared with `degraded::gather`.
 ///
-/// `embeddings.bin` is confirmed against the graph by every successful
-/// reconcile, including one that finds nothing to embed and so leaves the
-/// file alone; each of those rewrites its generation marker. The sidecar is
-/// as fresh as the newer of the two, so a body-only edit stream does not
+/// An embeddings sidecar (`embeddings.bin`, `docs_embeddings.bin`) is
+/// confirmed against its store by every successful run, including one that
+/// finds nothing to embed and so leaves the file alone; each of those
+/// rewrites its generation marker. A sidecar with no marker has only its own
+/// time. The sidecar is as fresh as the newer of the two, so a body-only edit stream does not
 /// age it into a warning that no `index` run could clear. A failed update
 /// moves neither file, and still warns. With no marker the file's own time
 /// is all there is.
@@ -1211,10 +1212,8 @@ pub(crate) fn sidecar_lag(project_path: &Path, sidecar_name: &str) -> Option<std
     let anchor_mtime = mtime(&infigraph_dir.join(anchor_name))?;
     let sidecar_path = infigraph_dir.join(sidecar_name);
     let mut confirmed = mtime(&sidecar_path)?;
-    if sidecar_name == "embeddings.bin" {
-        if let Some(marker) = mtime(&crate::embed::generation_marker_path(&sidecar_path)) {
-            confirmed = confirmed.max(marker);
-        }
+    if let Some(marker) = mtime(&crate::embed::generation_marker_path(&sidecar_path)) {
+        confirmed = confirmed.max(marker);
     }
     anchor_mtime.duration_since(confirmed).ok()
 }
@@ -2381,6 +2380,32 @@ mod sidecar_anchor_tests {
             result.message
         );
         assert!(result.message.contains("docs.kuzu"), "{}", result.message);
+    }
+
+    /// A docs run that found nothing to embed leaves `docs_embeddings.bin`
+    /// alone and moves its generation marker: the same confirmation, by the
+    /// same rule, as for the code sidecar.
+    #[test]
+    fn a_docs_sidecar_confirmed_by_its_marker_is_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let ig = dir.path().join(".infigraph");
+        std::fs::create_dir_all(&ig).unwrap();
+        touch(&ig.join("docs.kuzu"), Duration::ZERO);
+        touch(
+            &ig.join("docs_embeddings.bin"),
+            Duration::from_secs(2 * HOURS),
+        );
+        crate::embed::write_generation_marker(&ig.join("docs_embeddings.bin"), 7).unwrap();
+        // The marker was written just now, after docs.kuzu was touched.
+        let result = check_one_sidecar(dir.path(), "docs_embeddings.bin").unwrap();
+        assert_eq!(result.status, CheckStatus::Pass, "{}", result.message);
+        // An old marker confirms nothing.
+        touch(
+            &ig.join("docs_embeddings.bin.generation"),
+            Duration::from_secs(2 * HOURS),
+        );
+        let result = check_one_sidecar(dir.path(), "docs_embeddings.bin").unwrap();
+        assert_eq!(result.status, CheckStatus::Warn, "{}", result.message);
     }
 
     #[test]

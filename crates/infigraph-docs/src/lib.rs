@@ -384,7 +384,7 @@ impl DocIndex {
 
         let pipeline_warnings = pipelines.map(|run| run.finish(store)).unwrap_or_default();
 
-        self.note_embedding_health(store);
+        self.settle_embeddings(store);
 
         Ok(DocIndexResult {
             total_files: total,
@@ -398,12 +398,16 @@ impl DocIndex {
         })
     }
 
-    /// #75: with chunks in the store and no embeddings beside it, document
-    /// search ranks by keywords only. Only this side knows the count; an
-    /// empty index has no embeddings file and is healthy. A run that was
-    /// told to skip embeddings does not judge.
-    fn note_embedding_health(&self, store: &dyn DocBackend) {
+    /// The end of a run that did not fail, called from every kind of run (full,
+    /// by paths, by deletion) after its last write: it confirms the embeddings
+    /// file against the store (`embed::confirm_doc_embeddings`) and reports the
+    /// chunk count. #75: with chunks in the store and no embeddings beside it,
+    /// document search ranks by keywords only. Only this side knows the count;
+    /// an empty index has no embeddings file and is healthy. A run that was
+    /// told to skip embeddings does neither.
+    fn settle_embeddings(&self, store: &dyn DocBackend) {
         if !self.skip_file_embeddings && !infigraph_core::daemon::lifecycle::is_remote_backend() {
+            embed::confirm_doc_embeddings(&self.root);
             if let Ok(stats) = store.stats() {
                 infigraph_core::degraded::live::note_doc_embeddings(&self.root, stats.chunk_count);
             }

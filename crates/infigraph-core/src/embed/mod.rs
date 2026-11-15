@@ -80,7 +80,7 @@ pub fn write_generation_marker(sidecar_path: &Path, generation: i64) -> Result<(
 /// next real edit captures a prior stamp the sidecar never recorded and the
 /// patch declines into a full rebuild (the 45-60s one-file updates in the
 /// daemon log). A sidecar that did not reflect the bytes is left alone.
-fn record_unchanged_generation(emb_path: &Path, index_path: &Path, generation: i64) {
+pub fn record_unchanged_generation(emb_path: &Path, index_path: &Path, generation: i64) {
     let before = EmbStamp::of(emb_path);
     let _ = write_generation_marker(emb_path, generation);
     let after = EmbStamp::of(emb_path);
