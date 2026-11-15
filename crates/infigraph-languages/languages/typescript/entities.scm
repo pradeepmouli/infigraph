@@ -31,6 +31,19 @@
 (public_field_definition
   name: [(property_identifier) (string)] @field.name) @field.def
 
+; Method signatures: an interface's or type literal's `m(x: T): U;`, and a
+; class's `abstract m(): U;`. Owned like a property (extract::ts_member_owner;
+; none, as in a parameter's inline type, is no symbol), and a Method, as
+; scip-typescript and scip-tsrs define it. A `method_signature` directly in a
+; class body is an overload signature above its implementation: extract_entities
+; leaves it folded into the implementation, whose id must not move. A call,
+; construct or index signature has no name and is no symbol.
+(method_signature
+  name: [(property_identifier) (string)] @signature.name) @signature.def
+
+(abstract_method_signature
+  name: [(property_identifier) (string)] @signature.name) @signature.def
+
 ; Namespaces: `namespace N {}`, `module N {}` and `declare namespace N {}` are
 ; all `internal_module`. The name is `N`, or `A.B` for a dotted name; the
 ; namespace's own id comes from extract::entities, which also decides whether

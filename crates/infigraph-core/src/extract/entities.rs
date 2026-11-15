@@ -70,6 +70,8 @@ pub fn extract_entities(
         let mut parent_capture: Option<Node> = None;
         // `@field.def`: a symbol only when something owns it.
         let mut owned_only = false;
+        // `@signature.def`: a method signature, owned like a TypeScript property.
+        let mut is_signature = false;
         let mut method_name_at: Option<(u32, u32)> = None;
         let mut is_namespace = false;
         members.add(m.captures, capture_names, source);
@@ -215,6 +217,18 @@ pub fn extract_entities(
                         kind = Some(SymbolKind::Variable);
                     }
                 }
+                "signature.name" => {
+                    name_text = Some(strip_string_delimiters(&node_text(node, source)));
+                    kind = Some(SymbolKind::Method);
+                }
+                "signature.def" => {
+                    def_node = Some(node);
+                    owned_only = true;
+                    is_signature = true;
+                    if kind.is_none() {
+                        kind = Some(SymbolKind::Method);
+                    }
+                }
                 "section.name" => {
                     name_text = Some(node_text(node, source));
                     if kind.is_none() {
@@ -259,6 +273,15 @@ pub fn extract_entities(
         }
 
         if let (Some(full_name), Some(node), Some(sym_kind)) = (name_text, def_node, kind) {
+            // An overload signature in a class body stays folded into the
+            // implementation under it: a row of its own would make the
+            // implementation's id `Class::m#N`, an id that moved.
+            if is_signature
+                && node.kind() == "method_signature"
+                && node.parent().is_some_and(|p| p.kind() == "class_body")
+            {
+                continue;
+            }
             // `A.B` in `namespace A.B {}` is the symbol `B`, under the path `A`;
             // `A` is a namespace of its own too (pushed with `B`, below).
             let (name, dotted_segments) = if is_namespace {
@@ -294,8 +317,9 @@ pub fn extract_entities(
                     .map(|n| resolve_compound_node_text(n, source, decompose_query))
                     .or_else(|| {
                         if in_typescript
-                            && matches!(sym_kind, SymbolKind::Variable)
-                            && !ts_binds_function(node, &name, source)
+                            && (is_signature
+                                || (matches!(sym_kind, SymbolKind::Variable)
+                                    && !ts_binds_function(node, &name, source)))
                         {
                             ts_member_owner(node, source)
                         } else {
