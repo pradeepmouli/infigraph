@@ -327,3 +327,54 @@ fn the_second_tool_call_does_not_repeat_a_projects_degraded_mode() {
     gather_signals(&state, "get_stats", Some(dir.path()));
     assert!(!keys(&gather_signals(&state, "search", Some(dir.path()))).contains(&key));
 }
+
+fn installed_is_newer() -> Option<String> {
+    Some("ffffffffffff-newer".to_string())
+}
+
+fn installed_unknown() -> Option<String> {
+    None
+}
+
+fn stale_notice(sig: &Signals) -> Option<&infigraph_core::degraded::Notice> {
+    sig.degraded
+        .iter()
+        .find(|n| n.key == infigraph_core::degraded::STALE_BUILD)
+}
+
+/// An older build than the installed one is said once, with or without a
+/// project, naming both builds; an installed build that cannot be read says
+/// nothing; a state that is not asked says nothing.
+#[test]
+fn a_worker_older_than_the_installed_build_says_so_once() {
+    let state = HealthState::checking_installed_build(installed_is_newer);
+    state.mark_initialized();
+    let sig = gather_signals(&state, "search", None);
+    let notice = stale_notice(&sig).expect("stale-build notice");
+    assert!(
+        notice.message.contains("build ffffffffffff is installed"),
+        "{notice:?}"
+    );
+    assert!(notice.remedy.contains("reconnect"), "{notice:?}");
+    assert!(
+        stale_notice(&gather_signals(&state, "search", None)).is_none(),
+        "once per repeat period, not after every call"
+    );
+
+    let unknown = HealthState::checking_installed_build(installed_unknown);
+    unknown.mark_initialized();
+    assert!(stale_notice(&gather_signals(&unknown, "search", None)).is_none());
+
+    let unasked = HealthState::new();
+    unasked.mark_initialized();
+    assert!(stale_notice(&gather_signals(&unasked, "search", None)).is_none());
+}
+
+#[test]
+fn the_stale_build_notice_reaches_the_footer() {
+    let state = HealthState::checking_installed_build(installed_is_newer);
+    state.mark_initialized();
+    let dir = tempfile::tempdir().unwrap();
+    let footer = compose_footer(&gather_signals(&state, "search", Some(dir.path()))).unwrap();
+    assert!(footer.contains("is installed; reconnect it"), "{footer}");
+}

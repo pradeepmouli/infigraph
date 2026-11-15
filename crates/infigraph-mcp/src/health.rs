@@ -27,13 +27,18 @@ pub struct HealthState {
     /// When each degraded mode was last shown in a footer, per project
     /// (`None`: no project, the process's own modes).
     degraded_shown: Mutex<BTreeMap<(Option<PathBuf>, String), Instant>>,
+    /// How this worker learns which build is installed, to say when it is not
+    /// that one (`degraded::stale_build`). `None`: not asked, which is what a
+    /// test's state does, since a test binary has no installed build of its own.
+    installed_build: Option<fn() -> Option<String>>,
 }
 
 /// How long a degraded mode that is still in effect stays out of the footer
 /// after it was shown. `doctor` and `get_stats` list every mode every time.
 pub const FOOTER_REPEAT_AFTER: Duration = Duration::from_secs(600);
 
-pub static HEALTH: HealthState = HealthState::new();
+pub static HEALTH: HealthState =
+    HealthState::checking_installed_build(infigraph_core::daemon::installed_build_hash);
 
 impl HealthState {
     pub const fn new() -> Self {
@@ -41,6 +46,17 @@ impl HealthState {
             initialized: AtomicBool::new(false),
             restart_emitted: AtomicBool::new(false),
             degraded_shown: Mutex::new(BTreeMap::new()),
+            installed_build: None,
+        }
+    }
+
+    /// A state that also compares this worker's build with `installed`'s answer.
+    pub const fn checking_installed_build(installed: fn() -> Option<String>) -> Self {
+        Self {
+            initialized: AtomicBool::new(false),
+            restart_emitted: AtomicBool::new(false),
+            degraded_shown: Mutex::new(BTreeMap::new()),
+            installed_build: Some(installed),
         }
     }
 
@@ -153,6 +169,14 @@ pub fn gather_signals(state: &HealthState, tool_name: &str, project: Option<&Pat
             Some(root) => degraded::gather_cached(root),
             None => degraded::process_notices(),
         };
+        // The build this worker runs against the one installed: about the
+        // process, so with or without a project.
+        if let Some(installed) = state.installed_build {
+            in_effect.extend(
+                degraded::stale_build(infigraph_core::build_hash(), installed().as_deref())
+                    .map(|mode| mode.notice()),
+            );
+        }
         // A missing watcher is a degraded mode like the rest, so it is worded
         // in one place and shown once per repeat period, not after every call.
         // This worker's own watcher counts, as does a deliberate stop.

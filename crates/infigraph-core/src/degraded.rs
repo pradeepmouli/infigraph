@@ -40,6 +40,7 @@ pub const SESSIONS_UNREADABLE: &str = "sessions-unreadable";
 pub const SCIP_UNKNOWN_LANGUAGE: &str = "scip-unknown-language";
 pub const KEYLESS_DUPLICATE_EDGES: &str = "keyless-duplicate-edges";
 pub const WATCHER_MISSING: &str = "watcher-missing";
+pub const STALE_BUILD: &str = "stale-build";
 
 /// One way infigraph is running degraded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +148,25 @@ pub enum DegradedMode {
     /// its own (it passes a project whose daemon went idle) and only a
     /// footer, after a call that never needed the daemon, has reason to say so.
     WatcherMissing { root: String },
+    /// This process is an older build than the one installed: a long-lived
+    /// MCP server keeps running what it was started from until its client
+    /// reconnects it (measured: 18 of 19 servers on one machine, up to three
+    /// days behind, with nothing saying so). `running` and `installed` are
+    /// build hashes; see [`stale_build`].
+    ///
+    /// Why the server does not restart itself into the new build, which a
+    /// supervisor could do (its worker respawns from the binary on disk): (1)
+    /// the respawn runs whatever file is on disk, and during an install that
+    /// can be half-written or unsigned, killed at start, until the crash-loop
+    /// breaker ends the session's server; (2) every server on the machine
+    /// would restart at once after each install, each with a daemon lease and
+    /// start; (3) the client keeps the tool list it read at connect, so the
+    /// model still sees the old parameters and descriptions and a reconnect
+    /// is needed for the interface anyway; (4) the supervisor, the proxy
+    /// between client and worker, stays the old binary; (5) the worker's
+    /// in-memory state (watchers, session context) would be lost
+    /// mid-session, the surprise an eager takeover caused before (#61).
+    StaleBuild { running: String, installed: String },
 }
 
 impl DegradedMode {
@@ -183,6 +203,7 @@ impl DegradedMode {
             DegradedMode::KeylessDuplicateEdges { .. } => KEYLESS_DUPLICATE_EDGES,
             DegradedMode::GraphHeldByWriter { .. } => GRAPH_HELD_BY_WRITER,
             DegradedMode::WatcherMissing { .. } => WATCHER_MISSING,
+            DegradedMode::StaleBuild { .. } => STALE_BUILD,
         }
     }
 
@@ -322,6 +343,11 @@ impl DegradedMode {
             DegradedMode::WatcherMissing { root } => format!(
                 "No file watcher running for {root}: edits made now are not seen until one starts"
             ),
+            DegradedMode::StaleBuild { running, installed } => format!(
+                "This server is build {}; build {} is installed",
+                short_build(running),
+                short_build(installed)
+            ),
         }
     }
 
@@ -400,6 +426,10 @@ impl DegradedMode {
             }
             DegradedMode::WatcherMissing { .. } => {
                 "the next search or index starts one, or run `infigraph watch`"
+            }
+            DegradedMode::StaleBuild { .. } => {
+                "reconnect it (`/mcp` in Claude Code) or restart the client: it keeps the old \
+                 behaviour and tool list until then"
             }
         }
     }
@@ -766,6 +796,23 @@ pub fn embedder_modes(root: &Path, process_embedder: Option<&str>) -> Vec<Degrad
     modes
 }
 
+/// How a build hash is shown: its first twelve characters.
+fn short_build(hash: &str) -> String {
+    hash.chars().take(12).collect()
+}
+
+/// [`DegradedMode::StaleBuild`] when `own` is not the `installed` build. An
+/// `installed` that could not be determined (`daemon::installed_build_hash`)
+/// is `None` and never a mismatch. The one rule, for the footer and for
+/// `infigraph ps`.
+pub fn stale_build(own: &str, installed: Option<&str>) -> Option<DegradedMode> {
+    let installed = installed.filter(|h| !h.is_empty())?;
+    (own != installed).then(|| DegradedMode::StaleBuild {
+        running: own.to_string(),
+        installed: installed.to_string(),
+    })
+}
+
 /// [`DegradedMode::WatcherMissing`] for `root`, or `None`. A project is
 /// watched when a live process holds `watch.lock` (the daemon, a CLI watch or
 /// an MCP worker's own); one whose daemon left after sitting idle left on
@@ -1088,6 +1135,21 @@ mod tests {
     }
 
     #[test]
+    fn a_build_that_is_not_the_installed_one_is_stale() {
+        let mode = stale_build("8849a37256a9ffff", Some("1832f837227cffff")).unwrap();
+        let notice = mode.notice();
+        assert_eq!(notice.key, "stale-build");
+        // Both hashes, twelve characters each, and the remedy in the client's terms.
+        assert!(notice.message.contains("build 8849a37256a9;"), "{notice:?}");
+        assert!(notice.message.contains("build 1832f837227c is installed"));
+        assert!(notice.remedy.contains("/mcp"), "{notice:?}");
+        assert_eq!(stale_build("same", Some("same")), None);
+        // Could not check: never a mismatch.
+        assert_eq!(stale_build("a", None), None);
+        assert_eq!(stale_build("a", Some("")), None);
+    }
+
+    #[test]
     fn a_missing_hnsw_index_is_reported_only_past_the_threshold() {
         let p = Project::new();
         p.embeddings(1_000);
@@ -1194,6 +1256,10 @@ mod tests {
             },
             DegradedMode::WatcherMissing {
                 root: "/p".to_string(),
+            },
+            DegradedMode::StaleBuild {
+                running: "aaaaaaaaaaaa".to_string(),
+                installed: "bbbbbbbbbbbb".to_string(),
             },
         ];
         let keys: std::collections::HashSet<_> = modes.iter().map(|m| m.key()).collect();
