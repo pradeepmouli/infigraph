@@ -1085,17 +1085,24 @@ pub fn resolve_cli_binary_sibling_of(current_exe: &Path) -> Result<std::path::Pa
     if candidate.exists() {
         return Ok(candidate);
     }
-    // `cargo test` integration-test binaries live one level below the real
-    // build output directory (target/debug/deps/<test>-<hash> vs
-    // target/debug/), so the sibling check above never finds the CLI binary
-    // there even though it genuinely exists one directory up. This fallback
-    // only matters under that layout: production installs always place
-    // `infigraph` and `infigraph-mcp` as true siblings, so the check above
-    // already succeeds for them and this branch is never reached.
-    if let Some(grandparent) = dir.parent() {
-        let grandparent_candidate = grandparent.join(name);
-        if grandparent_candidate.exists() {
-            return Ok(grandparent_candidate);
+    // A `cargo test` executable is not a sibling of the CLI: it sits below
+    // the profile directory that holds `infigraph`, and how far below depends
+    // on cargo's layout -- `<profile>/deps/<test>-<hash>` (old) or
+    // `<profile>/build/<pkg>/<hash>/out/<test>` (observed with cargo 1.100.0,
+    // no config key of ours selecting it). So walk up to the nearest ancestor
+    // that is a profile directory (it has a `deps` or `build` directory) and
+    // take its CLI; never a fixed depth. The walk ends at a directory holding
+    // `Cargo.toml` or `.git` (a test run from an odd location must not climb
+    // into an unrelated tree). Production installs place `infigraph` and
+    // `infigraph-mcp` as true siblings, so the check above already succeeds
+    // for them and this walk is never reached.
+    for ancestor in dir.ancestors().skip(1) {
+        let is_profile_dir = ancestor.join("deps").is_dir() || ancestor.join("build").is_dir();
+        if is_profile_dir && ancestor.join(name).exists() {
+            return Ok(ancestor.join(name));
+        }
+        if ancestor.join("Cargo.toml").exists() || ancestor.join(".git").exists() {
+            break;
         }
     }
     Err(anyhow::anyhow!(
@@ -1111,6 +1118,60 @@ mod tests {
     #[cfg(unix)]
     use super::{confirm_daemon_exited, wait_for_pid_exit};
     use crate::lockfile::LockInfo;
+
+    /// A profile directory under `root` holding a fake CLI, with `layout`'s
+    /// test executable directory made; returns (the exe path, the CLI path).
+    fn profile_with_cli(
+        root: &std::path::Path,
+        exe_dir: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let profile = root.join("target").join("release");
+        std::fs::create_dir_all(profile.join("deps")).unwrap();
+        std::fs::create_dir_all(profile.join("build")).unwrap();
+        let cli = profile.join("infigraph");
+        std::fs::write(&cli, "").unwrap();
+        let dir = profile.join(exe_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        (dir.join("some_test-1234"), cli)
+    }
+
+    #[test]
+    fn a_test_executable_in_the_old_layout_finds_the_profiles_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (exe, cli) = profile_with_cli(tmp.path(), "deps");
+        assert_eq!(super::resolve_cli_binary_sibling_of(&exe).unwrap(), cli);
+    }
+
+    #[test]
+    fn a_test_executable_in_the_per_hash_layout_finds_the_profiles_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (exe, cli) = profile_with_cli(tmp.path(), "build/infigraph-core/0123456789abcdef/out");
+        assert_eq!(super::resolve_cli_binary_sibling_of(&exe).unwrap(), cli);
+    }
+
+    #[test]
+    fn a_profile_without_the_cli_is_an_error_and_never_borrows_one_from_above() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (exe, cli) = profile_with_cli(tmp.path(), "build/infigraph-core/0123/out");
+        std::fs::remove_file(&cli).unwrap();
+        // A binary of the same name above the profile belongs to something else.
+        std::fs::write(tmp.path().join("target").join("infigraph"), "").unwrap();
+        std::fs::write(tmp.path().join("infigraph"), "").unwrap();
+        assert!(super::resolve_cli_binary_sibling_of(&exe).is_err());
+    }
+
+    #[test]
+    fn the_walk_stops_at_a_project_root_before_reaching_a_profile_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A profile with a CLI exists, but the executable lives in a project
+        // (Cargo.toml) that is not inside it.
+        let (_, _cli) = profile_with_cli(tmp.path(), "deps");
+        let project = tmp.path().join("target").join("release").join("other");
+        let nested = project.join("x").join("y");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(project.join("Cargo.toml"), "").unwrap();
+        assert!(super::resolve_cli_binary_sibling_of(&nested.join("t")).is_err());
+    }
 
     fn write_lock_info(path: &std::path::Path, info: &LockInfo) {
         std::fs::write(path, serde_json::to_string(info).unwrap()).unwrap();
