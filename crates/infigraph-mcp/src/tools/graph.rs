@@ -71,11 +71,26 @@ pub fn tool_get_stats(args: &Value) -> Result<String> {
         &prism.root().join(".infigraph"),
         infigraph_core::last_run::now_secs(),
     );
-    if last_runs.is_empty() {
-        Ok(format!("{stats}\n{degraded}"))
+    let body = if last_runs.is_empty() {
+        format!("{stats}\n{degraded}")
     } else {
-        Ok(format!("{stats}\n{degraded}\n{last_runs}"))
-    }
+        format!("{stats}\n{degraded}\n{last_runs}")
+    };
+    // Asked directly, so the project that answered is always named, with the
+    // linked worktrees it has (each a separate project reached with `path`).
+    let linked = infigraph_core::worktree::linked_worktrees(prism.root()).unwrap_or_default();
+    let worktrees = if linked.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "linked worktrees: {} (each a separate project, reached with `path`)\n",
+            linked.len()
+        )
+    };
+    Ok(infigraph_docs::doc_entry::with_root_line(
+        prism.root(),
+        &format!("{worktrees}{body}"),
+    ))
 }
 
 pub fn tool_get_code_snippet(args: &Value) -> Result<String> {

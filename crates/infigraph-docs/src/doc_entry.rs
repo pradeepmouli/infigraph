@@ -155,12 +155,14 @@ pub fn refuse_unnamed_write(root: &Path, named: bool, apply: bool) -> Result<()>
     if named || !apply {
         return Ok(());
     }
-    match infigraph_core::worktree::list_worktree_paths(root) {
-        Ok(all) if all.len() > 1 => bail!(
+    // The same cached answer the footer's root notice reads: one place says
+    // whether a project has linked worktrees.
+    match infigraph_core::worktree::linked_worktrees(root) {
+        Some(linked) if !linked.is_empty() => bail!(
             "no `path` was given, so this would change the glossary of {}, which has {} linked \
              worktree(s): pass `path` naming the checkout you mean",
             root.display(),
-            all.len() - 1
+            linked.len()
         ),
         _ => Ok(()),
     }

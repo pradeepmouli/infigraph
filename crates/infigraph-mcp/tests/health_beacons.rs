@@ -19,6 +19,7 @@ fn each_condition_renders_one_warning_line() {
             DegradedMode::HnswMissing.notice(),
         ],
         slow_waits: vec![(infigraph_core::graph::names::LOCK.to_string(), 5)],
+        ..Default::default()
     };
     let footer = compose_footer(&sig).unwrap();
     let lines: Vec<&str> = footer.lines().collect();
