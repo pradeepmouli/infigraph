@@ -6,3 +6,4 @@ pub mod cli;
 pub mod daemon;
 pub mod registry;
 pub mod stdio;
+pub mod ts_fixture;
