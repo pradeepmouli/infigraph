@@ -5,12 +5,38 @@ use anyhow::Result;
 use rayon::prelude::*;
 
 use infigraph_core::embed::{
-    doc_embedder, invalidate_embeddings_cache, load_embeddings, save_embeddings,
-    sync_hnsw_index_delta, EmbStamp, HnswDelta, HnswSync,
+    doc_embedder, invalidate_embeddings_cache, load_embeddings, record_unchanged_generation,
+    save_embeddings, sync_hnsw_index_delta, EmbStamp, HnswDelta, HnswSync,
 };
 
 use crate::backend::DocBackend;
 use crate::chunk::Chunk;
+
+/// The document vectors' HNSW index, beside `docs_embeddings.bin`.
+const DOCS_HNSW_FILE: &str = "docs_hnsw_index.usearch";
+
+/// A document index run reached its end without an error: the store holds what
+/// it was just told to, so `docs_embeddings.bin` is confirmed against it, even
+/// when nothing needed embedding and the file kept its bytes (a run that only
+/// moves links, acknowledgements or scan rows still moves `docs.kuzu`, and
+/// without this the sidecar read as older than its store for good). Moves the
+/// generation marker through the helper the code side uses for the same case,
+/// which also re-stamps the HNSW index that reflects the file. Documents have
+/// no generation counter, so the marker's value is the time of the run; the
+/// only reader (`doctor::sidecar_lag`) uses the file's time. A project with no
+/// `docs_embeddings.bin` gets none.
+pub fn confirm_doc_embeddings(root: &Path) {
+    let tg_dir = root.join(".infigraph");
+    let emb_path = tg_dir.join("docs_embeddings.bin");
+    if !emb_path.exists() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    record_unchanged_generation(&emb_path, &tg_dir.join(DOCS_HNSW_FILE), now);
+}
 
 pub fn update_doc_embeddings(
     store: &dyn DocBackend,
@@ -115,7 +141,7 @@ pub(crate) fn update_doc_embeddings_synced(
 
     // Build HNSW if above threshold or existing index
     const HNSW_THRESHOLD: usize = 200_000;
-    let hnsw_path = tg_dir.join("docs_hnsw_index.usearch");
+    let hnsw_path = tg_dir.join(DOCS_HNSW_FILE);
     let synced = if count >= HNSW_THRESHOLD || hnsw_path.exists() {
         // One edited document patches the index in place, as the code side
         // does; a large change, or an index that missed a write, rebuilds it.
@@ -393,5 +419,50 @@ mod hnsw_patch_tests {
         .unwrap();
 
         assert_eq!(synced, None);
+    }
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn age(path: &Path, by: Duration) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - by)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_confirmed_sidecar_keeps_its_bytes_and_gets_a_new_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let ig = dir.path().join(".infigraph");
+        std::fs::create_dir_all(&ig).unwrap();
+        let bin = ig.join("docs_embeddings.bin");
+        std::fs::write(&bin, b"vectors").unwrap();
+        age(&bin, Duration::from_secs(3 * 3600));
+
+        confirm_doc_embeddings(dir.path());
+
+        assert_eq!(std::fs::read(&bin).unwrap(), b"vectors", "bytes untouched");
+        assert!(infigraph_core::embed::read_generation_marker(&bin).is_some_and(|g| g > 0));
+        let marker = ig.join("docs_embeddings.bin.generation");
+        let bin_age = bin.metadata().unwrap().modified().unwrap();
+        assert!(marker.metadata().unwrap().modified().unwrap() > bin_age);
+    }
+
+    #[test]
+    fn a_project_with_no_docs_embeddings_gets_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".infigraph")).unwrap();
+        confirm_doc_embeddings(dir.path());
+        assert!(!dir
+            .path()
+            .join(".infigraph/docs_embeddings.bin.generation")
+            .exists());
+        assert!(!dir.path().join(".infigraph/docs_embeddings.bin").exists());
     }
 }

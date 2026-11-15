@@ -115,7 +115,7 @@ impl PathIndexer for DocIndex {
         for warning in pipelines.map(|run| run.finish(store)).unwrap_or_default() {
             eprintln!("[docs] pipeline warning: {warning}");
         }
-        self.note_embedding_health(store);
+        self.settle_embeddings(store);
         Ok(PathOutcome {
             files: removed + indexed,
         })
@@ -129,7 +129,7 @@ impl PathIndexer for DocIndex {
         let files = self.delete_targets(&targets)?;
         if files > 0 {
             if let Some(store) = self.store.as_deref() {
-                self.note_embedding_health(store);
+                self.settle_embeddings(store);
             }
         }
         Ok(PathOutcome { files })
