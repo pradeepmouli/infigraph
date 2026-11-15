@@ -117,6 +117,17 @@ pub(crate) fn cmd_worktree_clean(
     let cwd = std::env::current_dir()?;
     let scope = if global { None } else { Some(cwd.as_path()) };
     let plan = plan(&registry, scope, &cwd, &options);
+    // A named path that is in no worktree is a mistake, and nothing is done
+    // about the others: a typo must not change what a command deletes.
+    anyhow::ensure!(
+        plan.unmatched.is_empty(),
+        "not inside any worktree: {}",
+        plan.unmatched
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     if !apply {
         print!("{}", render(&plan, None));
         return Ok(());
