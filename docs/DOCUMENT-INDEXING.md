@@ -546,6 +546,8 @@ Embedding logic is in `embed.rs`.
 4. Prune embeddings whose chunk ID no longer exists in the store
 5. Rebuild HNSW index only if chunk count ≥ 200,000 or an HNSW index already exists on disk
 
+The embedding loop is `infigraph_core::embed::embed_in_batches`, shared with the code side. A batch the embedder fails costs its chunks their vectors, not the run, and the run says so: it returns `DocEmbedOutcome { stored, not_embedded }`, where `not_embedded` is state-based (every chunk the store holds that has no vector after the run, including ones an earlier run left out), writes it beside the file as `docs_embeddings.bin.unembedded` (the count only; absent means zero; removed by the run that brings it to zero), and logs one `[docs-embeddings] N chunk(s) not embedded: <reason>` line. Each run, including one with nothing new to index (`retry_unembedded`), tries the missing chunks once more from the store's own text, so a permanently failing embedder costs one empty batch call and one log line per run, not one per chunk. While the marker exists `confirm_doc_embeddings` does not move the generation marker, and `degraded::derived_from_disk` reports `doc-embeddings-partial` in every process.
+
 ### Storage
 
 - Embeddings: `.infigraph/docs_embeddings.bin`

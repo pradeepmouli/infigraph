@@ -50,12 +50,18 @@ pub fn atomic_write(path: &Path, buf: &[u8]) -> Result<()> {
 /// their own to extend at all.
 const GENERATION_MARKER_SUFFIX: &str = ".generation";
 
-pub(crate) fn generation_marker_path(sidecar_path: &Path) -> PathBuf {
+/// The companion file of `sidecar_path` with `suffix` appended to its name:
+/// the one place a marker's path is spelled.
+fn marker_sibling(sidecar_path: &Path, suffix: &str) -> PathBuf {
     let name = sidecar_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("sidecar");
-    sidecar_path.with_file_name(format!("{name}{GENERATION_MARKER_SUFFIX}"))
+    sidecar_path.with_file_name(format!("{name}{suffix}"))
+}
+
+pub(crate) fn generation_marker_path(sidecar_path: &Path) -> PathBuf {
+    marker_sibling(sidecar_path, GENERATION_MARKER_SUFFIX)
 }
 
 /// Record which graph generation `sidecar_path` was just built from.
@@ -121,11 +127,103 @@ const EMBEDDER_MARKER_SUFFIX: &str = ".embedder";
 pub const MIXED_EMBEDDERS: &str = "mixed";
 
 fn embedder_marker_path(sidecar_path: &Path) -> PathBuf {
-    let name = sidecar_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("sidecar");
-    sidecar_path.with_file_name(format!("{name}{EMBEDDER_MARKER_SUFFIX}"))
+    marker_sibling(sidecar_path, EMBEDDER_MARKER_SUFFIX)
+}
+
+/// Sibling marker recording how many inputs the last update of `sidecar_path`
+/// could not embed (the embedder failed, or returned too few vectors). Only
+/// the count, and absent means zero: a sidecar that holds a vector for every
+/// input has no marker, so a file that was never written by this build reads
+/// as complete, which is what it was before.
+const UNEMBEDDED_MARKER_SUFFIX: &str = ".unembedded";
+
+fn unembedded_marker_path(sidecar_path: &Path) -> PathBuf {
+    marker_sibling(sidecar_path, UNEMBEDDED_MARKER_SUFFIX)
+}
+
+/// Record that `count` inputs have no vector in `sidecar_path`; `0` removes
+/// the marker. Atomic like the others, so a reader sees the old count or the
+/// new one.
+pub fn write_unembedded_count(sidecar_path: &Path, count: usize) -> Result<()> {
+    let path = unembedded_marker_path(sidecar_path);
+    if count == 0 {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        };
+    }
+    atomic_write(&path, count.to_string().as_bytes())
+}
+
+/// How many inputs `sidecar_path` is known to lack a vector for (0 when no
+/// marker, or one that does not parse: an unreadable count must not claim a
+/// shortfall nobody measured).
+pub fn read_unembedded_count(sidecar_path: &Path) -> usize {
+    std::fs::read_to_string(unembedded_marker_path(sidecar_path))
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// What [`embed_in_batches`] got.
+pub struct BatchedVectors {
+    /// `(position in the input, vector)` for every input that got a vector.
+    pub vectors: Vec<(usize, Vec<f32>)>,
+    /// Why some input has none: the first error the embedder reported, or the
+    /// note that it returned fewer vectors than it was asked for. `None` when
+    /// every input got one.
+    pub failure: Option<String>,
+}
+
+impl BatchedVectors {
+    /// How many of `asked` inputs came back without a vector.
+    pub fn shortfall(&self, asked: usize) -> usize {
+        asked.saturating_sub(self.vectors.len())
+    }
+}
+
+/// Embed `texts` in batches across the global pool, the one loop every
+/// embedding writer uses (code and documents, local and remote). A batch the
+/// embedder fails costs its inputs their vectors, never the run, but the
+/// failure is returned, not dropped: a caller that ignores it is writing a
+/// file it cannot call complete.
+pub fn embed_in_batches(embedder: &dyn EmbedProvider, texts: &[&str]) -> BatchedVectors {
+    use rayon::prelude::*;
+    const BATCH: usize = 256;
+    let first_error: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let note = |reason: String| {
+        if let Ok(mut first) = first_error.lock() {
+            first.get_or_insert(reason);
+        }
+    };
+    let batches: Vec<Vec<(usize, Vec<f32>)>> = texts
+        .par_chunks(BATCH)
+        .enumerate()
+        .map(|(n, chunk)| {
+            let vecs = embedder.embed_batch(chunk).unwrap_or_else(|e| {
+                note(format!("{e:#}"));
+                Vec::new()
+            });
+            if !vecs.is_empty() && vecs.len() < chunk.len() {
+                note(format!(
+                    "the embedder returned {} vectors for {} texts",
+                    vecs.len(),
+                    chunk.len()
+                ));
+            }
+            vecs.into_iter()
+                .take(chunk.len())
+                .enumerate()
+                .map(|(i, v)| (n * BATCH + i, v))
+                .collect()
+        })
+        .collect();
+    let vectors: Vec<(usize, Vec<f32>)> = batches.into_iter().flatten().collect();
+    let mut failure = first_error.into_inner().ok().flatten();
+    if failure.is_none() && vectors.len() < texts.len() {
+        failure = Some("the embedder returned fewer vectors than asked".to_string());
+    }
+    BatchedVectors { vectors, failure }
 }
 
 /// Record which embedder built `sidecar_path` ([`EmbedProvider::name`], or
@@ -947,7 +1045,6 @@ fn update_embeddings_inner(
     make_embedder: &dyn Fn() -> Box<dyn EmbedProvider>,
     clock: &mut crate::phase_clock::PhaseClock,
 ) -> Result<usize> {
-    use rayon::prelude::*;
     use std::sync::Arc;
 
     // Read before the symbols, never after: a write that lands in between
@@ -1004,40 +1101,18 @@ fn update_embeddings_inner(
     if !to_embed.is_empty() {
         let embedder: Arc<Box<dyn EmbedProvider>> = Arc::new(make_embedder());
         embedder_name = Some(embedder.name());
-        const BATCH: usize = 256;
-        // The first failure the embedder reports, for the record: a failed
-        // batch used to cost its symbols their vectors without a word.
-        let first_error: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-        let results: Vec<Vec<(String, Vec<f32>, u64)>> = to_embed
-            .par_chunks(BATCH)
-            .map(|chunk| {
-                let emb = Arc::clone(&embedder);
-                let texts: Vec<&str> = chunk.iter().map(|(_, t, _)| t.as_str()).collect();
-                let vecs = emb.embed_batch(&texts).unwrap_or_else(|e| {
-                    if let Ok(mut first) = first_error.lock() {
-                        first.get_or_insert_with(|| format!("{e:#}"));
-                    }
-                    Vec::new()
-                });
-                chunk
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, (id, _, h))| vecs.get(i).map(|v| (id.clone(), v.clone(), *h)))
-                    .collect()
-            })
-            .collect();
-        for batch in results {
-            for (id, v, h) in batch {
-                upserted.push((id.clone(), v.clone()));
-                existing.insert(id, (v, h));
-                embedded += 1;
-            }
+        let texts: Vec<&str> = to_embed.iter().map(|(_, t, _)| t.as_str()).collect();
+        let batched = embed_in_batches(&**embedder, &texts);
+        for (i, v) in batched.vectors {
+            let (id, _, h) = &to_embed[i];
+            upserted.push((id.clone(), v.clone()));
+            existing.insert(id.clone(), (v, *h));
+            embedded += 1;
         }
         if embedded < to_embed.len() {
-            let reason =
-                first_error.into_inner().ok().flatten().unwrap_or_else(|| {
-                    "the embedder returned fewer vectors than asked".to_string()
-                });
+            let reason = batched
+                .failure
+                .unwrap_or_else(|| "the embedder returned fewer vectors than asked".to_string());
             crate::last_run::note(
                 "symbols not embedded",
                 (to_embed.len() - embedded) as u64,
@@ -1135,7 +1210,6 @@ pub fn update_embeddings_remote(
     pg: &crate::meta::PostgresMetaStore,
     changed_files: &[&str],
 ) -> Result<usize> {
-    use rayon::prelude::*;
     use std::sync::Arc;
 
     let existing_ids: std::collections::HashSet<String> = pg
@@ -1194,22 +1268,22 @@ pub fn update_embeddings_remote(
     }
 
     let embedder: Arc<Box<dyn EmbedProvider>> = Arc::new(best_embedder());
-    const BATCH: usize = 256;
-    let results: Vec<Vec<(String, Vec<f32>)>> = to_embed
-        .par_chunks(BATCH)
-        .map(|chunk| {
-            let emb = Arc::clone(&embedder);
-            let texts: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
-            let vecs = emb.embed_batch(&texts).unwrap_or_default();
-            chunk
-                .iter()
-                .enumerate()
-                .filter_map(|(i, (id, _))| vecs.get(i).map(|v| (id.clone(), v.clone())))
-                .collect()
-        })
+    let texts: Vec<&str> = to_embed.iter().map(|(_, t)| t.as_str()).collect();
+    let batched = embed_in_batches(&**embedder, &texts);
+    // A symbol with no vector here is picked up again by the next update (it is
+    // asked for again while pgvector lacks it), so the shortfall is reported and
+    // not recorded: remote storage has no generation marker to hold back.
+    let shortfall = batched.shortfall(to_embed.len());
+    if shortfall > 0 {
+        let reason = batched.failure.clone().unwrap_or_default();
+        eprintln!("[embeddings] {shortfall} symbol(s) not embedded: {reason}");
+        crate::last_run::note("symbols not embedded", shortfall as u64, &reason);
+    }
+    let all: Vec<(String, Vec<f32>)> = batched
+        .vectors
+        .into_iter()
+        .map(|(i, v)| (to_embed[i].0.clone(), v))
         .collect();
-
-    let all: Vec<(String, Vec<f32>)> = results.into_iter().flatten().collect();
     let count = all.len();
     pg.upsert_embeddings_bulk(&all, "symbol")?;
 
