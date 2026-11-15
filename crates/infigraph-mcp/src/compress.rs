@@ -122,18 +122,7 @@ fn should_bypass(tool_name: &str, args: &Value, raw: &str) -> bool {
     if BYPASS_TOOLS.contains(&tool_name) {
         return true;
     }
-    if args
-        .get("detail")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        return true;
-    }
-    if args
-        .get("for_edit")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
+    if crate::session_context::wants_full_output(args) {
         return true;
     }
     if crate::session_context::is_in_focus(args) {
