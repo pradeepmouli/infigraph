@@ -950,7 +950,7 @@ Query pipelines by compliance scope (e.g. 'IRS 7216', 'PII', 'SOX').
 
 ### `get_latest_session`
 
-Retrieve recent session context from graph DB. Call at START of every new session to resume where you left off. Default: all sessions updated within 72h of the newest save (compact index). Use name to recall a named session in full. Use detail=true for full fields when multiple sessions match. Use limit for raw recent-N history.
+Retrieve recent session context from graph DB. Call at START of every new session to resume where you left off. Default: all sessions updated within 72h of the newest save (compact index). Use name to recall a named session in full. Use detail=true for full fields when multiple sessions match. Use limit for raw recent-N history. Pass session (your session id) to see your own records first.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
@@ -958,10 +958,11 @@ Retrieve recent session context from graph DB. Call at START of every new sessio
 | `limit` | integer |  |  | Return N most recent sessions by update time (skips 72h window clustering) |
 | `name` | string |  |  | Recall a named session by its label (e.g. 'perf-optimization'). Returns full detail for that session. |
 | `path` | string |  |  | see Common parameters |
+| `session` | string |  |  | Your session id: your records come first, others are marked not yours. |
 
 ### `save_session`
 
-Save compact session context for continuity. Summary/pending_tasks/constraints/assumptions/blockers replace prior values; omitted snapshot fields clear, so retain brief active constraints and unresolved work. Decisions append: send only new decisions. Files_touched unions. Narrative is optional, brief new reasoning only; never repeat saved history. Aim for 100-250 tokens unless essential recovery details need more. Use name for a recallable named session.
+Save compact session context for continuity. Summary/pending_tasks/constraints/assumptions/blockers replace prior values; omitted snapshot fields clear, so retain brief active constraints and unresolved work. Decisions append: send only new decisions. Files_touched unions. Narrative is optional, brief new reasoning only; never repeat saved history. Aim for 100-250 tokens unless essential recovery details need more. Use name for a recallable named session. Pass session (your session id) so the record is yours.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
@@ -975,6 +976,7 @@ Save compact session context for continuity. Summary/pending_tasks/constraints/a
 | `narrative` | string |  |  | Optional new reasoning or recovery context not captured by structured fields, at most 100 words. Appended to the session narrative log. Omit for routine checkpoints; do not repeat the full session story. |
 | `path` | string |  |  | see Common parameters |
 | `pending_tasks` | string |  |  | Tasks remaining / next steps |
+| `session` | string |  |  | Your session id. Keeps this record apart from other sessions' on the same day. |
 
 ### `search_sessions`
 

@@ -28,7 +28,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/infigraph-session-lib.sh"
 
 case "$source_type" in
   compact)
-    backup=$(ls -t "$cwd"/.infigraph/sessions/unsaved-transcript-*.md 2>/dev/null | head -1)
+    # Compaction keeps the session id, so its backup is the one named by it.
+    backup=$(own_backup)
     session_ctx=$(inject_session_summary)
     [ -z "$session_ctx" ] && session_ctx="No prior sessions found."
     fallback=$(save_fallback_recipe)
@@ -65,7 +66,9 @@ ENDJSON
     # Reset test-context sentinel on clear
     rm -f "$cwd/.infigraph/.test-context-called" 2>/dev/null
     rm -f "$cwd/.infigraph/.search-fallback-allowed" 2>/dev/null
-    backup=$(ls -t "$cwd"/.infigraph/sessions/unsaved-transcript-*.md 2>/dev/null | head -1)
+    # /clear starts under another session id, so the cleared session's backup
+    # is the newest one just written (never an older one, which is another's).
+    backup=$(recent_backup 10)
     session_ctx=$(inject_session_summary)
     if [ -n "$backup" ]; then
       fallback=$(save_fallback_recipe)

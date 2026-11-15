@@ -1300,7 +1300,8 @@ resolver = ["./resolve-zed-path.sh"]
         );
         assert!(startup.contains("Pending: walk the backlog."), "{startup}");
 
-        let backup = sessions.join("unsaved-transcript-clear.md");
+        // This session's key is "restore": a compaction reads only its own backup.
+        let backup = sessions.join("unsaved-transcript-clear-restore.md");
         std::fs::write(&backup, "# Unsaved session context\n").unwrap();
         for source in ["clear", "compact"] {
             let context = hook_additional_context(&run(source));
@@ -1317,6 +1318,105 @@ resolver = ["./resolve-zed-path.sh"]
                 "{source}: {context}"
             );
         }
+    }
+
+    /// Two sessions in one project keep their records and backups apart: a
+    /// session restores its own record first and is told when it is shown
+    /// another's, the save recipe carries its key, an ending session names its
+    /// backup by it, and `/clear` takes only a backup written just now.
+    #[cfg(unix)]
+    #[test]
+    fn session_hooks_keep_two_sessions_apart() {
+        if tools_missing(&["jq", "python3"]) {
+            return;
+        }
+        let (_home, hooks) = install_bundled_claude_hooks(&[
+            "infigraph-session-start.sh",
+            "infigraph-session-end-save.sh",
+            "infigraph-session-lib.sh",
+        ]);
+        let project = tempfile::tempdir().unwrap();
+        let sessions = project.path().join(".infigraph/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("session_2026-11-14_aaaa1111.json"),
+            r#"{"summary":"work of A"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            sessions.join("session_2026-11-14_bbbb2222.json"),
+            r#"{"summary":"work of B"}"#,
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let start = |session: &str, source: &str| {
+            let input = serde_json::json!({
+                "session_id": session,
+                "cwd": project.path(),
+                "source": source,
+            })
+            .to_string();
+            hook_additional_context(&run_hook(&hooks[0], tmp.path(), &input))
+        };
+
+        let a = start("AAAA1111-0000-4000-8000-000000000000", "startup");
+        assert!(a.contains("Summary: work of A."), "{a}");
+        assert!(!a.contains("NOT this session's"), "{a}");
+
+        let c = start("cccc3333-0000", "startup");
+        assert!(c.contains("NOT this session's record"), "{c}");
+
+        let recipe = start("AAAA1111-0000-4000-8000-000000000000", "compact");
+        assert!(
+            recipe.contains("session_<UTC YYYY-MM-DD>_aaaa1111.json"),
+            "{recipe}"
+        );
+        assert!(
+            recipe.contains("Pass session=AAAA1111-0000-4000-8000-000000000000 to save_session"),
+            "{recipe}"
+        );
+
+        // An ending session names its backup by its key; another session's
+        // compaction does not see it, and /clear sees only a recent one.
+        let transcript = project.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"user","message":{"content":"hello"}}"#,
+        )
+        .unwrap();
+        let end = serde_json::json!({
+            "session_id": "AAAA1111-0000-4000-8000-000000000000",
+            "cwd": project.path(),
+            "transcript_path": transcript,
+            "reason": "clear",
+        })
+        .to_string();
+        let out = run_hook(&hooks[1], tmp.path(), &end);
+        assert!(out.status.success(), "{out:?}");
+        let backup = sessions.join("unsaved-transcript-clear-aaaa1111.md");
+        assert!(
+            backup.exists(),
+            "{:?}",
+            std::fs::read_dir(&sessions).unwrap().collect::<Vec<_>>()
+        );
+
+        assert!(start("AAAA1111-0000-4000-8000-000000000000", "compact")
+            .contains(backup.to_str().unwrap()));
+        assert!(
+            !start("bbbb2222-0000", "compact").contains("unsaved-transcript"),
+            "another session's compaction must not take this backup"
+        );
+        assert!(start("dddd4444-0000", "clear").contains(backup.to_str().unwrap()));
+
+        // Aged past the window, it is nobody's to recover on /clear.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&backup)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(!start("dddd4444-0000", "clear").contains("unsaved-transcript"));
     }
 
     /// An install made before the cleanup holds the old "MANDATORY" block

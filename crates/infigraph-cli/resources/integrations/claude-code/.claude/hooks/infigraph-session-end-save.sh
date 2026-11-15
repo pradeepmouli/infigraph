@@ -24,7 +24,11 @@ fi
 sessions_dir="$cwd/.infigraph/sessions"
 mkdir -p "$sessions_dir"
 
-backup="$sessions_dir/unsaved-transcript-${reason:-unknown}.md"
+# One backup per session: two sessions ending in one project must not
+# overwrite each other's. The key is the one the server names records by.
+source "$(dirname "${BASH_SOURCE[0]}")/infigraph-session-lib.sh"
+key=$(session_key "$session_id")
+backup="$sessions_dir/unsaved-transcript-${reason:-unknown}${key:+-$key}.md"
 
 python3 -c "
 import json, sys

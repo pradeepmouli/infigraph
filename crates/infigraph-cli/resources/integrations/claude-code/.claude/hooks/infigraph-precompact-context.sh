@@ -10,6 +10,7 @@
 
 input=$(cat)
 cwd=$(echo "$input" | jq -r '.cwd // empty')
+session_id=$(echo "$input" | jq -r '.session_id // empty')
 
 # Only enforce in Infigraph-indexed projects
 [ -d "$cwd/.infigraph" ] || exit 0
