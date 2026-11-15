@@ -463,6 +463,10 @@ pub fn apply_seen_dedup(compressed: &str, tool_name: &str, args: &Value) -> Stri
     if is_in_focus(args) {
         return compressed.to_string();
     }
+    // The placeholder says "use detail=true to force full output", so a call
+    // that does must never be answered with it. It still refreshes the seen
+    // entry below: the text it sends is what the caller now has.
+    let full = wants_full_output(args);
 
     let env_dedup = session_cli().session_dedup.map(|t| t.0);
     let config_dedup = {
@@ -506,7 +510,7 @@ pub fn apply_seen_dedup(compressed: &str, tool_name: &str, args: &Value) -> Stri
 
     if let Some(entry) = ctx.seen.get(&key) {
         let age = current_call - entry.call_seen;
-        if entry.content_hash == hash && age <= effective_window {
+        if entry.content_hash == hash && age <= effective_window && !full {
             // Same content, still fresh — return compact placeholder
             let placeholder = format!(
                 "(seen {} call{} ago: {key}, {} tokens — use detail=true to force full output)",
@@ -531,7 +535,7 @@ pub fn apply_seen_dedup(compressed: &str, tool_name: &str, args: &Value) -> Stri
 
     // Check prior session hashes (content-verified dedup)
     if let Some(&prior_hash) = ctx.prior_hashes.get(&key) {
-        if prior_hash == hash {
+        if prior_hash == hash && !full {
             // Content unchanged since prior session — dedup
             ctx.seen.insert(
                 key.clone(),
@@ -630,6 +634,15 @@ pub fn record_focus(tool_name: &str, args: &Value) {
     for key in keys {
         ctx.focus.insert(key, FocusEntry { call_seen: call });
     }
+}
+
+/// Whether a call asks for the full text: `detail` or `for_edit`. The one
+/// answer for compression (`compress::should_bypass`) and for the seen-dedup
+/// placeholder, so the two cannot disagree about what "full" means.
+pub fn wants_full_output(args: &Value) -> bool {
+    ["detail", "for_edit"]
+        .iter()
+        .any(|key| args.get(key).and_then(|v| v.as_bool()).unwrap_or(false))
 }
 
 /// True if args refer to a recently focused symbol/file (within staleness window).
