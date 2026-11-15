@@ -15,6 +15,10 @@
 #                     2026-10-08 they were 76-78 GiB of a ~90 GiB target
 #                     directory, and deleting them forced no rebuild. They regrow
 #                     within hours, so this is meant to be cheap to run by hand.
+#   <profile>/build/<crate>/<hash>/
+#                     Per-hash build unit directories (test executables
+#                     included, cargo's current layout) of a workspace crate that
+#                     a newer build of the same unit replaced. The dry run says how many per crate.
 #   incremental/      The incremental-compilation cache -- removed only when
 #                     CARGO_INCREMENTAL=0 is set in this shell, or with
 #                     --include-incremental. Deleting it from a setup that uses
@@ -184,12 +188,13 @@ if [ "$include_incremental" = 1 ] || [ "${CARGO_INCREMENTAL:-}" = "0" ]; then
   prune_incremental=1
 fi
 
-python3 - "$target_dir" "$apply" "$prune_incremental" <<'PY'
+python3 - "$target_dir" "$apply" "$prune_incremental" "$owner" <<'PY'
 import os
 import shutil
 import sys
 
 target, apply, prune_incremental = sys.argv[1], sys.argv[2] == "1", sys.argv[3] == "1"
+owner = sys.argv[4]
 GIB = 1024 ** 3
 
 
@@ -203,6 +208,66 @@ def tree_bytes(path):
                 pass
     return total
 
+
+def workspace_packages():
+    crates = os.path.join(owner, "crates")
+    try:
+        return {n for n in os.listdir(crates) if os.path.isfile(os.path.join(crates, n, "Cargo.toml"))}
+    except OSError:
+        return set()
+
+
+def unit_name(unit_dir):
+    """The build unit a per-hash directory holds, from its `fingerprint/`: the one
+    entry that is not a `dep-`/`output-` file or the timestamp (`test-...`,
+    `bin-infigraph`). None when it cannot be read."""
+    try:
+        names = [
+            n.removesuffix(".json")
+            for n in os.listdir(os.path.join(unit_dir, "fingerprint"))
+            if not n.startswith(("dep-", "output-")) and n != "invoked.timestamp"
+        ]
+    except OSError:
+        return None
+    return sorted(set(names))[0] if names else None
+
+
+def unit_time(unit_dir):
+    try:
+        return os.stat(os.path.join(unit_dir, "fingerprint", "invoked.timestamp")).st_mtime
+    except OSError:
+        return None
+
+
+# Per-hash build unit directories (cargo's layout: <profile>/build/<pkg>/<hash>/
+# {fingerprint,out}, test executables included) that a later build of the same
+# unit replaced. Cargo never removes the old hash when a source change makes a
+# new one, so they accumulate: 259 of them under infigraph-core were 8 GiB.
+# A directory is stale when another directory of the same package holds the
+# same unit with a newer `invoked.timestamp`. One whose unit or timestamp cannot
+# be read is kept, and only workspace packages (a directory under crates/) are
+# looked at: a dependency's directories are cargo's, not ours.
+stale_units = {}  # package -> [(path, bytes)]
+packages = workspace_packages()
+for profile in sorted(os.listdir(target)):
+    build = os.path.join(target, profile, "build")
+    if not os.path.isdir(build) or os.path.islink(build):
+        continue
+    for package in sorted(packages & set(os.listdir(build))):
+        package_dir = os.path.join(build, package)
+        by_unit = {}
+        for hash_name in sorted(os.listdir(package_dir)):
+            unit_dir = os.path.join(package_dir, hash_name)
+            if not os.path.isdir(unit_dir) or os.path.islink(unit_dir):
+                continue
+            name, stamp = unit_name(unit_dir), unit_time(unit_dir)
+            if name is None or stamp is None:
+                continue
+            by_unit.setdefault(name, []).append((stamp, unit_dir))
+        for units in by_unit.values():
+            units.sort()
+            for _stamp, unit_dir in units[:-1]:
+                stale_units.setdefault(package, []).append((unit_dir, tree_bytes(unit_dir)))
 
 orphans = 0
 orphan_bytes = 0
@@ -234,6 +299,14 @@ for profile in sorted(os.listdir(target)):
 
 verb = "removed" if apply else "would remove"
 print(f"{verb} {orphans} orphan .o files ({orphan_bytes / GIB:.2f} GiB)")
+for package, units in sorted(stale_units.items()):
+    print(
+        f"{verb} {len(units)} stale per-hash build directories of {package} "
+        f"({sum(b for _p, b in units) / GIB:.2f} GiB)"
+    )
+    if apply:
+        for unit_dir, _bytes in units:
+            shutil.rmtree(unit_dir, ignore_errors=True)
 if prune_incremental:
     print(f"{verb} incremental/ ({incremental_bytes / GIB:.2f} GiB)")
 elif incremental_skipped:
