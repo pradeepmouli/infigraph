@@ -37,6 +37,9 @@ pub struct ProcessRow {
     /// unrelated process -- the row reports dead, not the impostor's
     /// uptime/RSS.
     pub recorded_started_at: u64,
+    /// The build this process recorded when it registered (an MCP server's
+    /// `instances/<pid>.json`); `None` for a row only a lock file names.
+    pub build_hash: Option<String>,
 }
 
 /// Lock files whose holder payload identifies a long-lived or in-flight
@@ -65,7 +68,12 @@ pub fn list_infigraph_processes(projects: &[&Path]) -> Vec<ProcessRow> {
     // (pid -> accumulating row), BTreeMap for stable pid ordering.
     let mut rows: BTreeMap<u32, ProcessRow> = BTreeMap::new();
 
-    let mut add = |pid: u32, role: String, project: String, evidence: String, started_at: u64| {
+    let mut add = |pid: u32,
+                   role: String,
+                   project: String,
+                   evidence: String,
+                   started_at: u64,
+                   build: Option<String>| {
         let row = rows.entry(pid).or_insert_with(|| ProcessRow {
             pid,
             roles: vec![],
@@ -75,9 +83,13 @@ pub fn list_infigraph_processes(projects: &[&Path]) -> Vec<ProcessRow> {
             uptime_secs: None,
             rss_bytes: None,
             recorded_started_at: 0,
+            build_hash: None,
         });
         if row.recorded_started_at == 0 {
             row.recorded_started_at = started_at;
+        }
+        if row.build_hash.is_none() {
+            row.build_hash = build;
         }
         if !row.roles.contains(&role) {
             row.roles.push(role);
@@ -101,6 +113,7 @@ pub fn list_infigraph_processes(projects: &[&Path]) -> Vec<ProcessRow> {
             info.project_path.clone(),
             evidence,
             info.started_at,
+            Some(info.build_hash.clone()),
         );
     }
 
@@ -115,6 +128,7 @@ pub fn list_infigraph_processes(projects: &[&Path]) -> Vec<ProcessRow> {
                     project.display().to_string(),
                     (*lock_name).to_string(),
                     holder.holder_started_at,
+                    None,
                 );
             }
         }
@@ -144,6 +158,28 @@ pub fn list_infigraph_processes(projects: &[&Path]) -> Vec<ProcessRow> {
     }
 
     rows.into_values().collect()
+}
+
+/// Whether a row is an MCP server running a build other than `installed`.
+/// The rule is `degraded::stale_build`'s, so `ps` and the footer agree.
+pub fn runs_older_build(row: &ProcessRow, installed: Option<&str>) -> bool {
+    row.alive
+        && row.roles.iter().any(|role| role.starts_with("mcp ("))
+        && row
+            .build_hash
+            .as_deref()
+            .is_some_and(|own| crate::degraded::stale_build(own, installed).is_some())
+}
+
+/// `(older, total)` over the live MCP servers among `rows`.
+pub fn older_build_servers(rows: &[ProcessRow], installed: Option<&str>) -> (usize, usize) {
+    let live = |r: &&ProcessRow| r.alive && r.roles.iter().any(|role| role.starts_with("mcp ("));
+    (
+        rows.iter()
+            .filter(|r| runs_older_build(r, installed))
+            .count(),
+        rows.iter().filter(live).count(),
+    )
 }
 
 /// Rows for processes *other than this one* holding a project's
@@ -517,5 +553,59 @@ mod pid_reuse_tests {
             "a recycled pid must report the recorded holder as dead: {rows:?}"
         );
         assert!(rows[0].rss_bytes.is_none(), "no impostor stats: {rows:?}");
+    }
+
+    fn mcp_row(pid: u32, alive: bool, build: Option<&str>) -> ProcessRow {
+        ProcessRow {
+            pid,
+            roles: vec!["mcp (stdio)".to_string()],
+            projects: vec![],
+            evidence: vec![],
+            alive,
+            uptime_secs: None,
+            rss_bytes: None,
+            recorded_started_at: 0,
+            build_hash: build.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_live_mcp_server_on_another_build_runs_an_older_one() {
+        let installed = Some("bbbbbbbbbbbb");
+        assert!(runs_older_build(
+            &mcp_row(1, true, Some("aaaaaaaaaaaa")),
+            installed
+        ));
+        assert!(!runs_older_build(
+            &mcp_row(2, true, Some("bbbbbbbbbbbb")),
+            installed
+        ));
+        // Dead, unregistered build, or an installed build nobody could read:
+        // nothing to say.
+        assert!(!runs_older_build(
+            &mcp_row(3, false, Some("aaaaaaaaaaaa")),
+            installed
+        ));
+        assert!(!runs_older_build(&mcp_row(4, true, None), installed));
+        assert!(!runs_older_build(
+            &mcp_row(5, true, Some("aaaaaaaaaaaa")),
+            None
+        ));
+        // A daemon row is not an MCP server.
+        let mut daemon = mcp_row(6, true, Some("aaaaaaaaaaaa"));
+        daemon.roles = vec!["infigraph daemon".to_string()];
+        assert!(!runs_older_build(&daemon, installed));
+    }
+
+    #[test]
+    fn the_summary_counts_live_mcp_servers_only() {
+        let rows = vec![
+            mcp_row(1, true, Some("aaaaaaaaaaaa")),
+            mcp_row(2, true, Some("aaaaaaaaaaaa")),
+            mcp_row(3, true, Some("bbbbbbbbbbbb")),
+            mcp_row(4, false, Some("aaaaaaaaaaaa")),
+        ];
+        assert_eq!(older_build_servers(&rows, Some("bbbbbbbbbbbb")), (2, 3));
+        assert_eq!(older_build_servers(&rows, None), (0, 3));
     }
 }

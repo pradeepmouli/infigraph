@@ -444,6 +444,48 @@ pub fn installed_build_hash_of(binary: &std::path::Path) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// What one probe of the installed binary found, with the stamp of the file it
+/// was taken from.
+type ProbedBuild = (std::path::PathBuf, std::time::SystemTime, u64, String);
+
+/// `probe(cli)`, remembered while `cli`'s (mtime, length) stays as it was. A
+/// probe that fails -- the file mid-install, an unsigned binary killed at
+/// start -- is `None` and is not remembered, so the next call asks again.
+fn probe_if_changed(
+    cache: &std::sync::Mutex<Option<ProbedBuild>>,
+    cli: &std::path::Path,
+    probe: &dyn Fn(&std::path::Path) -> Option<String>,
+) -> Option<String> {
+    let meta = std::fs::metadata(cli).ok()?;
+    let (mtime, len) = (meta.modified().ok()?, meta.len());
+    if let Some((path, at, size, hash)) = cache.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if path == cli && *at == mtime && *size == len {
+            return Some(hash.clone());
+        }
+    }
+    let hash = probe(cli).filter(|h| !h.is_empty())?;
+    *cache.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((cli.to_path_buf(), mtime, len, hash.clone()));
+    Some(hash)
+}
+
+/// Build hash of the infigraph install this process's binary sits in: the
+/// `infigraph` CLI beside `current_exe()` (`resolve_cli_binary_sibling_of`,
+/// the only supported way to ask for the sibling; `infigraph` and
+/// `infigraph-mcp` are installed together, so the CLI's hash stands for both).
+/// A stat per call; the subprocess runs on first use and after the file
+/// changes. `None`: could not check, never "stale". With
+/// `INFIGRAPH_TEST_BUILD_HASH_OVERRIDE_FILE` set nothing is remembered, so a
+/// test can change the answer.
+pub fn installed_build_hash() -> Option<String> {
+    static CACHE: std::sync::Mutex<Option<ProbedBuild>> = std::sync::Mutex::new(None);
+    let cli = lifecycle::resolve_cli_binary_sibling_of(&std::env::current_exe().ok()?).ok()?;
+    if std::env::var_os("INFIGRAPH_TEST_BUILD_HASH_OVERRIDE_FILE").is_some() {
+        return installed_build_hash_of(&cli);
+    }
+    probe_if_changed(&CACHE, &cli, &installed_build_hash_of)
+}
+
 /// Warn, once per binary path per process, when the `infigraph` CLI this
 /// process is about to spawn reports a different build than this process
 /// itself (#141). Mixed builds are how a graph gets written on one lbug
@@ -6152,5 +6194,70 @@ mod extensioned_swap_lock_tests {
             "a held lock must leave the rollback undecided, got {outcome:?}"
         );
         assert!(live.exists(), "nothing was quarantined under a live writer");
+    }
+}
+
+#[cfg(test)]
+mod installed_build_probe_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn a_probe_is_remembered_until_the_binary_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("infigraph");
+        std::fs::write(&cli, b"one").unwrap();
+        let cache = std::sync::Mutex::new(None);
+        let calls = Cell::new(0);
+        let probe = |_: &std::path::Path| {
+            calls.set(calls.get() + 1);
+            Some(format!("build{}", calls.get()))
+        };
+        assert_eq!(
+            probe_if_changed(&cache, &cli, &probe).as_deref(),
+            Some("build1")
+        );
+        assert_eq!(
+            probe_if_changed(&cache, &cli, &probe).as_deref(),
+            Some("build1")
+        );
+        assert_eq!(calls.get(), 1, "an unchanged binary is not probed again");
+        // A different length is a different file (an install replaced it).
+        std::fs::write(&cli, b"longer").unwrap();
+        assert_eq!(
+            probe_if_changed(&cache, &cli, &probe).as_deref(),
+            Some("build2")
+        );
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn a_failed_probe_is_not_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("infigraph");
+        std::fs::write(&cli, b"half-written").unwrap();
+        let cache = std::sync::Mutex::new(None);
+        let calls = Cell::new(0);
+        let probe = |_: &std::path::Path| {
+            calls.set(calls.get() + 1);
+            (calls.get() > 1).then(|| "settled".to_string())
+        };
+        assert_eq!(probe_if_changed(&cache, &cli, &probe), None);
+        assert_eq!(
+            probe_if_changed(&cache, &cli, &probe).as_deref(),
+            Some("settled"),
+            "the same stamp is asked again after a failure"
+        );
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn a_missing_binary_is_unknown() {
+        let cache = std::sync::Mutex::new(None);
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            probe_if_changed(&cache, &dir.path().join("nope"), &|_| Some("x".into())),
+            None
+        );
     }
 }

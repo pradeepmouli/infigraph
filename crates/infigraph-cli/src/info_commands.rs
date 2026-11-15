@@ -1858,9 +1858,10 @@ pub(crate) fn cmd_ps(root: &Path) -> Result<()> {
         .zip(infigraph_core::daemon::control::query_status_many(&roots))
         .collect();
 
+    let installed = infigraph_core::daemon::installed_build_hash();
     println!(
-        "{:<8} {:<6} {:<10} {:<10} {:<28} {:<12} {:<7} {:<9} {:<9} PROJECT / EVIDENCE",
-        "PID", "STATE", "UPTIME", "RSS", "ROLE", "LEASES", "IDLE", "CODE", "DOCS"
+        "{:<8} {:<6} {:<10} {:<10} {:<28} {:<12} {:<7} {:<9} {:<9} {:<19} PROJECT / EVIDENCE",
+        "PID", "STATE", "UPTIME", "RSS", "ROLE", "LEASES", "IDLE", "CODE", "DOCS", "BUILD"
     );
     for (i, r) in rows.iter().enumerate() {
         let state = if r.alive { "live" } else { "dead" };
@@ -1873,8 +1874,9 @@ pub(crate) fn cmd_ps(root: &Path) -> Result<()> {
             .map(|b| format!("{} MB", b / (1024 * 1024)))
             .unwrap_or_else(|| "-".to_string());
         let [leases, idle, code, docs] = ps_status_cells(statuses.get(&i));
+        let build = ps_build_cell(r, installed.as_deref());
         println!(
-            "{:<8} {:<6} {:<10} {:<10} {:<28} {:<12} {:<7} {:<9} {:<9} {} [{}]",
+            "{:<8} {:<6} {:<10} {:<10} {:<28} {:<12} {:<7} {:<9} {:<9} {:<19} {} [{}]",
             r.pid,
             state,
             uptime,
@@ -1884,6 +1886,7 @@ pub(crate) fn cmd_ps(root: &Path) -> Result<()> {
             idle,
             code,
             docs,
+            build,
             r.projects.join(", "),
             r.evidence.join(",")
         );
@@ -1898,7 +1901,30 @@ pub(crate) fn cmd_ps(root: &Path) -> Result<()> {
             }
         }
     }
+    let (older, total) = infigraph_core::ps::older_build_servers(&rows, installed.as_deref());
+    if let (true, Some(installed)) = (older > 0, installed.as_deref()) {
+        println!(
+            "\n{older} of {total} MCP servers run an older build than the installed {}; \
+             reconnect them (`/mcp` in Claude Code, or restart the client).",
+            installed.chars().take(12).collect::<String>()
+        );
+    }
     Ok(())
+}
+
+/// `ps`'s BUILD cell: the build a process registered, with "older" when it is
+/// an MCP server that is not the installed one; `-` for a row no registration
+/// names.
+fn ps_build_cell(row: &infigraph_core::ps::ProcessRow, installed: Option<&str>) -> String {
+    let Some(hash) = row.build_hash.as_deref() else {
+        return "-".to_string();
+    };
+    let short: String = hash.chars().take(12).collect();
+    if infigraph_core::ps::runs_older_build(row, installed) {
+        format!("{short} older")
+    } else {
+        short
+    }
 }
 
 /// Who holds the leases that keep a daemon alive, for the row under it in
