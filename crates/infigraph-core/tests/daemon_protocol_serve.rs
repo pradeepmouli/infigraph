@@ -28,6 +28,45 @@ fn serve_write_indexes_and_writes_result_and_removes_request() {
     }
 }
 
+/// The daemon is the only writer of `embeddings.bin`: a client's update is a
+/// request it serves, answered with the vectors on disk afterwards.
+#[test]
+fn serve_write_updates_embeddings_for_a_client() {
+    let project_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project_dir.path().join("main.py"),
+        "def hello():\n    pass\n",
+    )
+    .unwrap();
+    let registry = bundled_registry().unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
+    infigraph.init().unwrap();
+    serve_write(&infigraph, &WriteRequest::Index { paths: None });
+
+    let result = serve_write(
+        &infigraph,
+        &WriteRequest::UpdateEmbeddings {
+            changed: vec!["main.py".to_string()],
+        },
+    );
+
+    match result {
+        WriteResult::Ok {
+            total_files,
+            indexed_files,
+        } => {
+            assert!(total_files >= 1, "the function has a vector on disk");
+            assert_eq!(indexed_files, 1);
+        }
+        other => panic!("expected Ok, got {other:?}"),
+    }
+    assert!(project_dir
+        .path()
+        .join(".infigraph")
+        .join("embeddings.bin")
+        .exists());
+}
+
 #[test]
 fn serve_write_writes_err_result_on_failure_without_panicking() {
     let project_dir = tempfile::tempdir().unwrap();

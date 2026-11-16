@@ -519,7 +519,7 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
 
         if !done {
             let backend = prism.backend().context("graph not initialized")?;
-            let count = infigraph_core::embed::update_embeddings(backend, root, &changed)?;
+            let count = infigraph_core::embed::update_embeddings_routed(backend, root, &changed)?;
             println!("Saved {} embeddings to .infigraph/embeddings.bin", count);
         }
     }
@@ -1647,7 +1647,7 @@ pub(crate) fn import_scip_results_and_embed(
         }
     }
     if !done {
-        match infigraph_core::embed::update_embeddings(backend, &root_buf, &[]) {
+        match infigraph_core::embed::update_embeddings_routed(backend, &root_buf, &[]) {
             Ok(n) => {
                 let new = n.saturating_sub(pre_count);
                 if new > 0 {
