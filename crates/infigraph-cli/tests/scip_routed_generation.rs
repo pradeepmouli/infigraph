@@ -72,8 +72,7 @@ fn cli(root: &Path, home: &Path, backend: &str, enrich: bool) -> Command {
         .env(infigraph_core::BACKEND_ENV, backend)
         .env("INFIGRAPH_NO_WATCH", "1")
         .env_remove("INFIGRAPH_WATCH_DAEMON")
-        .env_remove("INFIGRAPH_DOCS_ENABLED")
-        .env(infigraph_core::scip_switch::background_env_name(), "0");
+        .env_remove("INFIGRAPH_DOCS_ENABLED");
     if enrich {
         command.env_remove(infigraph_core::scip_switch::enabled_env_name());
     } else {

@@ -1984,11 +1984,12 @@ const CONFIG_CATEGORY: &str = "config";
 /// -- exempt from that check -- is where each one gets explained.
 /// A warning per deprecated setting still stated in `config.toml`: it works,
 /// and the replacement is named. Today: the `[daemon_idle]` keys, renamed
-/// `[daemon]` `idle_grace_secs` / `idle_check_secs` / `client_release_secs`.
+/// `[daemon]` `idle_grace_secs` / `idle_check_secs` / `client_release_secs`;
+/// and a removed key that is now ignored (`[scip] background`).
 fn deprecated_setting_warnings(scope: crate::settings_file::ConfigScope<'_>) -> Vec<CheckResult> {
     let docs = crate::settings_file::layers(scope);
     let layers: Vec<&toml_edit::Item> = docs.iter().flatten().map(|doc| doc.as_item()).collect();
-    crate::daemon::deprecated_daemon_idle_keys(&layers)
+    let renamed = crate::daemon::deprecated_daemon_idle_keys(&layers)
         .into_iter()
         .map(|(old, new)| {
             CheckResult::warn(
@@ -1997,8 +1998,18 @@ fn deprecated_setting_warnings(scope: crate::settings_file::ConfigScope<'_>) -> 
                 format!("{old} is deprecated and still honoured; {new} replaces it"),
                 format!("rename it to {new} in config.toml (the new key wins if both are set)"),
             )
-        })
-        .collect()
+        });
+    let removed = crate::scip_switch::removed_scip_keys(&layers)
+        .into_iter()
+        .map(|key| {
+            CheckResult::warn(
+                CONFIG_CATEGORY,
+                key.clone(),
+                format!("{key} was removed and is ignored: SCIP indexers always run at nice +10"),
+                "delete it from config.toml",
+            )
+        });
+    renamed.chain(removed).collect()
 }
 
 pub fn check_settings(ctx: &DoctorContext) -> Vec<CheckResult> {

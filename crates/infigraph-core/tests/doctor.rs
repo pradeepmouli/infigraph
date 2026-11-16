@@ -2097,6 +2097,38 @@ fn check_settings_warns_about_a_deprecated_daemon_idle_key() {
     );
 }
 
+/// `[scip] background` was removed. A config that still states it must load
+/// (nothing reads the key) and `doctor` says it is ignored.
+#[test]
+fn check_settings_warns_that_a_removed_scip_background_key_is_ignored() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().join("proj");
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    std::fs::write(
+        root.join(".infigraph").join("config.toml"),
+        "[scip]\nbackground = false\n",
+    )
+    .unwrap();
+    let ctx = ctx_for(DoctorScope::Project(root), Registry::default());
+
+    let results = with_isolated_home(|| infigraph_core::doctor::check_settings(&ctx));
+
+    assert!(
+        results
+            .iter()
+            .any(|r| r.status == CheckStatus::Warn && r.name.contains("[scip] background")),
+        "no warning about the removed key: {results:?}"
+    );
+    assert!(
+        results.iter().any(|r| r.status == CheckStatus::Pass),
+        "a config stating it must still load: {results:?}"
+    );
+    assert!(
+        !results.iter().any(|r| r.status == CheckStatus::Fail),
+        "{results:?}"
+    );
+}
+
 #[test]
 fn check_settings_is_quiet_when_only_the_new_daemon_keys_are_used() {
     let dir = tempfile::TempDir::new().unwrap();
