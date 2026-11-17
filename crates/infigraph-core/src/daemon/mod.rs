@@ -2867,35 +2867,7 @@ fn serve_request_locked(
     }
     match begin_index_op(root, "infigraph daemon", Duration::from_secs(30)) {
         Ok(IndexOpOutcome::Acquired(_guard)) => {
-            // A live writer holds the graph: the write waits for it. No open
-            // attempt, no backoff step, no latch -- the same deferral as a
-            // backoff, so the client's own timeout is the only limit.
-            if held.is_none() {
-                if wait_for_graph_writer(root) {
-                    return Err(reply);
-                }
-                crate::degraded::live::clear(root, crate::degraded::GRAPH_HELD_BY_WRITER);
-            }
-            match watch_db(root, registry, held) {
-                Ok(prism) => {
-                    reopen_backoff.succeeded(root);
-                    let _slow = crate::phase_clock::SlowOp::start(|| {
-                        format!("write request {}", request.kind())
-                    });
-                    reply.send(crate::daemon_protocol::serve_write(&prism, request));
-                    Ok(())
-                }
-                Err(e)
-                    if crate::graph::store::lock_contention_in_chain(&e)
-                        && wait_for_graph_writer(root) =>
-                {
-                    Err(reply)
-                }
-                Err(e) => {
-                    log_reopen_failure(root, "daemon", reopen_backoff, &e);
-                    Err(reply)
-                }
-            }
+            serve_on_graph(root, request, reply, registry, held, reopen_backoff)
         }
         Ok(o @ IndexOpOutcome::AlreadyRunning(_)) => {
             eprintln!(
@@ -2910,6 +2882,69 @@ fn serve_request_locked(
             Err(reply)
         }
     }
+}
+
+/// Serves `request` against the daemon's graph handle, opening it first if
+/// needed. The caller decides whether `index.lock` is held around this:
+/// `serve_request_locked` holds it for every write that changes the graph;
+/// `UpdateEmbeddings` (reads the graph, writes only `embeddings.bin`) does
+/// not. Hands the reply back, leaving the write deferred, while a live
+/// writer holds the graph or the reopen backs off.
+fn serve_on_graph(
+    root: &Path,
+    request: &WriteRequest,
+    reply: WriteReply,
+    registry: &Arc<crate::lang::LanguageRegistry>,
+    held: &mut HeldPrism,
+    reopen_backoff: &mut ReopenBackoff,
+) -> std::result::Result<(), WriteReply> {
+    // A live writer holds the graph: the write waits for it. No open
+    // attempt, no backoff step, no latch -- the same deferral as a
+    // backoff, so the client's own timeout is the only limit.
+    if held.is_none() {
+        if wait_for_graph_writer(root) {
+            return Err(reply);
+        }
+        crate::degraded::live::clear(root, crate::degraded::GRAPH_HELD_BY_WRITER);
+    }
+    match watch_db(root, registry, held) {
+        Ok(prism) => {
+            reopen_backoff.succeeded(root);
+            let _slow =
+                crate::phase_clock::SlowOp::start(|| format!("write request {}", request.kind()));
+            reply.send(crate::daemon_protocol::serve_write(&prism, request));
+            Ok(())
+        }
+        Err(e)
+            if crate::graph::store::lock_contention_in_chain(&e) && wait_for_graph_writer(root) =>
+        {
+            Err(reply)
+        }
+        Err(e) => {
+            log_reopen_failure(root, "daemon", reopen_backoff, &e);
+            Err(reply)
+        }
+    }
+}
+
+/// Serves a client's `UpdateEmbeddings` without `index.lock`: it reads the
+/// graph and writes only `embeddings.bin`, whose one writer is this loop
+/// thread, so the lock would only keep every graph writer waiting behind a
+/// slow embedding. Unlike `serve_request_locked` it need not defer for the
+/// daemon's own drain: that deferral exists because waiting for the lock
+/// would park the thread that releases it, and there is no lock here.
+fn serve_embeddings_unlocked(
+    root: &Path,
+    request: &WriteRequest,
+    reply: WriteReply,
+    registry: &Arc<crate::lang::LanguageRegistry>,
+    held: &mut HeldPrism,
+    reopen_backoff: &mut ReopenBackoff,
+) -> std::result::Result<(), WriteReply> {
+    if !reopen_backoff.should_attempt() {
+        return Err(reply);
+    }
+    serve_on_graph(root, request, reply, registry, held, reopen_backoff)
 }
 
 /// One log line per failed reopen, carrying the attempt count and the
@@ -4353,6 +4388,12 @@ where
                 Err((request, reply)) => Routed::NotYet(request, reply),
             }
         }
+        embed @ WriteRequest::UpdateEmbeddings { .. } => {
+            match serve_embeddings_unlocked(root, &embed, reply, registry, held, reopen_backoff) {
+                Ok(()) => Routed::Done,
+                Err(reply) => Routed::NotYet(embed, reply),
+            }
+        }
         other => match serve_request_locked(
             root,
             &other,
@@ -5586,6 +5627,36 @@ mod tests {
                 .exists(),
             "no graph file may have been created by a reopen attempt"
         );
+    }
+
+    /// A client's `UpdateEmbeddings` is served while another process holds
+    /// `index.lock`: it reads the graph and writes only `embeddings.bin`, so
+    /// the graph's write lock would only make it (and the loop thread it
+    /// runs on) wait behind, or in front of, an unrelated writer. Any other
+    /// write waits for the lock; this one answers at once.
+    #[test]
+    fn an_embeddings_update_is_served_while_index_lock_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(root.join("a.py"), "def a():\n    pass\n").unwrap();
+
+        let _held = match begin_index_op(&root, "test holder", Duration::from_secs(5)).unwrap() {
+            IndexOpOutcome::Acquired(g) => g,
+            _ => panic!("the lock was free"),
+        };
+        let mut router = Router::new(&root);
+        let started = std::time::Instant::now();
+        let (routed, rx) = router.route_new(WriteRequest::UpdateEmbeddings { changed: vec![] });
+        assert!(
+            matches!(routed, Routed::Done),
+            "the update must be served, not deferred behind index.lock"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "serving waited for index.lock ({:?})",
+            started.elapsed()
+        );
+        rx.try_recv().expect("the client is answered at once");
     }
 
     #[test]
