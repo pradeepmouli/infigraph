@@ -1008,21 +1008,59 @@ pub fn update_embeddings_routed(
     {
         return update_embeddings(backend, root, changed_files);
     }
+    update_embeddings_routed_via(backend, root, changed_files, &|request| {
+        crate::daemon::writes::submit(
+            root,
+            request,
+            crate::daemon::writes::WriteOpts {
+                timeout: ROUTED_UPDATE_TIMEOUT,
+                cancel: None,
+                on_slot_wait: None,
+            },
+        )
+    })
+}
+
+/// [`update_embeddings_routed`] with the transport supplied by the caller: the
+/// seam a test uses to play a daemon that cannot read the request.
+///
+/// A daemon of an older build closes the connection without a reply to a
+/// request it cannot parse (`ControlError::Incompatible`), which is exactly
+/// what `UpdateEmbeddings` is to one that predates it. That alone falls back
+/// to the old behaviour, an in-place update, with one warning naming the
+/// daemon's build; any other failure is returned, since the daemon may have
+/// started the update.
+#[doc(hidden)]
+pub fn update_embeddings_routed_via(
+    backend: &dyn crate::graph::GraphBackend,
+    root: &Path,
+    changed_files: &[&str],
+    send: &dyn Fn(
+        &crate::daemon_protocol::WriteRequest,
+    ) -> Result<crate::daemon_protocol::WriteResult>,
+) -> Result<usize> {
+    use crate::daemon::control::ControlError;
+    use crate::daemon_protocol::WriteResult;
     let request = crate::daemon_protocol::WriteRequest::UpdateEmbeddings {
         changed: changed_files.iter().map(|f| f.to_string()).collect(),
     };
-    match crate::daemon::writes::submit(
-        root,
-        &request,
-        crate::daemon::writes::WriteOpts {
-            timeout: ROUTED_UPDATE_TIMEOUT,
-            cancel: None,
-            on_slot_wait: None,
-        },
-    )? {
-        crate::daemon_protocol::WriteResult::Ok { total_files, .. } => Ok(total_files),
-        crate::daemon_protocol::WriteResult::Err { message } => anyhow::bail!(message),
-        other => anyhow::bail!("unexpected reply to UpdateEmbeddings: {other:?}"),
+    match send(&request) {
+        Ok(WriteResult::Ok { total_files, .. }) => Ok(total_files),
+        Ok(WriteResult::Err { message }) => anyhow::bail!(message),
+        Ok(other) => anyhow::bail!("unexpected reply to UpdateEmbeddings: {other:?}"),
+        Err(e) if e.downcast_ref::<ControlError>() == Some(&ControlError::Incompatible) => {
+            let daemon = crate::daemon::control::query_status(root)
+                .map(|s| format!("build {}", s.build))
+                .unwrap_or_else(|_| "an older build".to_string());
+            eprintln!(
+                "warning: the daemon ({daemon}) predates UpdateEmbeddings (this is build {}); \
+                 updating embeddings in this process. Run `infigraph daemon-restart` to move \
+                 them to the daemon.",
+                crate::build_hash()
+            );
+            update_embeddings(backend, root, changed_files)
+        }
+        Err(e) => Err(e),
     }
 }
 

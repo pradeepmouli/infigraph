@@ -437,3 +437,47 @@ fn an_update_that_returns_an_error_is_recorded_as_failed() {
         "{problem:?}"
     );
 }
+
+/// A daemon of a build that predates `UpdateEmbeddings` closes the connection
+/// without a reply (`ControlError::Incompatible`); the client then does the
+/// update itself, which is what it did against that daemon before routing.
+#[test]
+fn an_older_daemon_that_cannot_read_the_request_falls_back_to_an_in_place_update() {
+    use infigraph_core::daemon::control::ControlError;
+    let (dir, ig) = setup();
+    std::fs::remove_file(emb_path(dir.path())).unwrap();
+    let backend = ig.backend().unwrap();
+
+    let sent = std::cell::Cell::new(0);
+    let n = infigraph_core::embed::update_embeddings_routed_via(backend, dir.path(), &[], &|_| {
+        sent.set(sent.get() + 1);
+        Err(ControlError::Incompatible.into())
+    })
+    .unwrap();
+
+    assert_eq!(sent.get(), 1, "the daemon was asked once");
+    assert!(n > 0, "the fallback embedded the symbols");
+    assert!(emb_path(dir.path()).exists(), "and wrote the file itself");
+}
+
+/// Any other failure stays an error: the daemon may have started the update,
+/// and a second writer is exactly what routing removed.
+#[test]
+fn any_other_daemon_failure_is_not_retried_in_place() {
+    use infigraph_core::daemon::control::ControlError;
+    let (dir, ig) = setup();
+    std::fs::remove_file(emb_path(dir.path())).unwrap();
+    let backend = ig.backend().unwrap();
+
+    for err in [ControlError::Lost, ControlError::Unresponsive] {
+        let result =
+            infigraph_core::embed::update_embeddings_routed_via(backend, dir.path(), &[], &|_| {
+                Err(err.clone().into())
+            });
+        assert!(result.is_err(), "{err:?} must be reported");
+    }
+    assert!(
+        !emb_path(dir.path()).exists(),
+        "nothing wrote embeddings.bin behind the daemon's back"
+    );
+}
