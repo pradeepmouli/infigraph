@@ -987,6 +987,45 @@ pub fn update_embeddings(
     update_embeddings_with(backend, root, changed_files, &best_embedder)
 }
 
+/// How long a client waits for the daemon's embeddings update (a cold
+/// build embeds every symbol).
+const ROUTED_UPDATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// [`update_embeddings`] for a process that is not the daemon. `embeddings.bin`
+/// is rewritten whole from a read of itself, so two writers lose each other's
+/// vectors: under the daemon backend the daemon is the only writer and this
+/// asks it (`WriteRequest::UpdateEmbeddings`, answered after its own
+/// updates, never alongside one); under `INFIGRAPH_BACKEND=kuzu` this process
+/// holds the graph itself, no daemon can open it, and it updates in place.
+/// The daemon's own calls use [`update_embeddings`] directly.
+pub fn update_embeddings_routed(
+    backend: &dyn crate::graph::GraphBackend,
+    root: &Path,
+    changed_files: &[&str],
+) -> Result<usize> {
+    if crate::validated_backend()? != crate::BackendChoice::Daemon
+        || crate::daemon::lease::is_self_daemon(root)
+    {
+        return update_embeddings(backend, root, changed_files);
+    }
+    let request = crate::daemon_protocol::WriteRequest::UpdateEmbeddings {
+        changed: changed_files.iter().map(|f| f.to_string()).collect(),
+    };
+    match crate::daemon::writes::submit(
+        root,
+        &request,
+        crate::daemon::writes::WriteOpts {
+            timeout: ROUTED_UPDATE_TIMEOUT,
+            cancel: None,
+            on_slot_wait: None,
+        },
+    )? {
+        crate::daemon_protocol::WriteResult::Ok { total_files, .. } => Ok(total_files),
+        crate::daemon_protocol::WriteResult::Err { message } => anyhow::bail!(message),
+        other => anyhow::bail!("unexpected reply to UpdateEmbeddings: {other:?}"),
+    }
+}
+
 /// [`update_embeddings`] with the embedder supplied by the caller: the seam
 /// a test uses to exercise an embedder that fails.
 #[doc(hidden)]

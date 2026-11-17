@@ -271,7 +271,7 @@ where
                                         let changed: Vec<&str> =
                                             r.extractions.iter().map(|e| e.file.as_str()).collect();
                                         if let Some(eb) = p.backend() {
-                                            match crate::embed::update_embeddings(
+                                            match crate::embed::update_embeddings_routed(
                                                 eb,
                                                 &root_owned,
                                                 &changed,

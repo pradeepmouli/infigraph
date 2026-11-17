@@ -1564,6 +1564,7 @@ where
                 removed_in_drain,
             } = drain_in_flight.take().expect("checked is_some just above");
             let (guard, finish) = finish_drain(&infigraph_dir, drain_rt.block_on(handle));
+            let mut embed_after_drain: Option<Vec<String>> = None;
             match finish {
                 DrainFinish::Completed(outcome) => {
                     fault::clear(&infigraph_dir, None);
@@ -1603,19 +1604,19 @@ where
                             });
                         }
                     }
-                    if let Some(backend) = prism.backend() {
-                        let changed: Vec<&str> = outcome
+                    // Embedded after `index.lock` is released (below): the
+                    // loop thread is the only writer of `embeddings.bin`
+                    // (clients ask it through `UpdateEmbeddings`), so the
+                    // update needs no lock of its own, and holding the
+                    // graph's write lock through it only kept every other
+                    // writer waiting.
+                    embed_after_drain = Some(
+                        outcome
                             .extractions
                             .iter()
-                            .map(|e| e.file.as_str())
-                            .collect();
-                        if !changed.is_empty() {
-                            if let Err(e) = crate::embed::update_embeddings(backend, root, &changed)
-                            {
-                                eprintln!("[watch] embedding update failed: {e}");
-                            }
-                        }
-                    }
+                            .map(|e| e.file.clone())
+                            .collect::<Vec<String>>(),
+                    );
                     for extraction in &outcome.extractions {
                         let cross = has_cross_file_calls(&prism, &extraction.file);
                         let abs_path = root.join(&extraction.file);
@@ -1638,6 +1639,14 @@ where
                 DrainFinish::Failed => poison_watch_db(&mut held_prism),
             }
             drop(guard);
+            if let (Some(files), Some(backend)) = (embed_after_drain, prism.backend()) {
+                if !files.is_empty() {
+                    let changed: Vec<&str> = files.iter().map(String::as_str).collect();
+                    if let Err(e) = crate::embed::update_embeddings(backend, root, &changed) {
+                        eprintln!("[watch] embedding update failed: {e}");
+                    }
+                }
+            }
         }
 
         // Reap a finished full-reindex build the same way the regular drain

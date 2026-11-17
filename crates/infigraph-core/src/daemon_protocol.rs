@@ -158,6 +158,13 @@ pub enum WriteRequest {
         acks: Vec<DocAck>,
         drop: Vec<String>,
     },
+    /// Bring `embeddings.bin` (and `clone-bodies.bin`) up to date with the
+    /// graph for `changed` (root-relative paths; empty = reconcile the whole
+    /// file). The daemon is the only process that writes those files: the
+    /// update is a read-modify-write of one file, so two writers lose each
+    /// other's vectors. Answered `Ok { total_files: vectors on disk,
+    /// indexed_files: changed.len() }`.
+    UpdateEmbeddings { changed: Vec<String> },
 }
 
 impl WriteRequest {
@@ -799,6 +806,23 @@ pub fn serve_write(infigraph: &CodeIndex, request: &WriteRequest) -> WriteResult
                 },
             }
         }
+        WriteRequest::UpdateEmbeddings { changed } => match infigraph.backend() {
+            Some(b) => {
+                let changed_refs: Vec<&str> = changed.iter().map(String::as_str).collect();
+                match crate::embed::update_embeddings(b, infigraph.root(), &changed_refs) {
+                    Ok(total) => WriteResult::Ok {
+                        total_files: total,
+                        indexed_files: changed.len(),
+                    },
+                    Err(e) => WriteResult::Err {
+                        message: e.to_string(),
+                    },
+                }
+            }
+            None => WriteResult::Err {
+                message: "graph not initialized".to_string(),
+            },
+        },
         WriteRequest::FullReindex => WriteResult::Err {
             message: "FullReindex not yet implemented".to_string(),
         },

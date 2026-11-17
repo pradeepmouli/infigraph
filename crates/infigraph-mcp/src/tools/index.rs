@@ -267,7 +267,7 @@ pub fn tool_index_project(args: &Value) -> Result<String> {
             }
         }
         if !embed_done {
-            match embed::update_embeddings(backend, &root, &changed) {
+            match embed::update_embeddings_routed(backend, &root, &changed) {
                 Ok(n) => out.push_str(&format!("Saved {} embeddings\n", n)),
                 Err(e) => out.push_str(&format!("warning: embedding update failed: {e}\n")),
             }
