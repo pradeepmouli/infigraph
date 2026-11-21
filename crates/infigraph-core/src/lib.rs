@@ -576,14 +576,7 @@ impl CodeIndex {
                         if attempts.len() >= crate::recovery::CRASH_LOOP_THRESHOLD {
                             let _ =
                                 crate::recovery::write_crash_loop_marker(infigraph_dir, &attempts);
-                            anyhow::bail!(
-                                "crash-loop detected: {} auto-rebuild attempts within the last \
-                                 hour -- refusing further automatic rebuilds. Investigate the \
-                                 underlying cause, then delete {} to reset and retry manually \
-                                 with `infigraph rebuild`.",
-                                attempts.len(),
-                                crate::recovery::crash_loop_marker_path(infigraph_dir).display(),
-                            );
+                            anyhow::bail!(crate::recovery::crash_loop_refusal(attempts.len()));
                         }
                         // Say what this actually does. It quarantines the
                         // unreadable graph and opens a fresh, EMPTY one -- it
@@ -682,8 +675,11 @@ impl CodeIndex {
                         // this path is reached on any durable open failure,
                         // not only a dead holder -- `recovery_rebuild_wanted`
                         // keys off the sentinel's existence, not that field.
-                        let _ =
-                            crate::recovery::mark_recovery_needed(infigraph_dir, 0, &self.db_path);
+                        let _ = crate::recovery::mark_recovery_needed_recorded(
+                            infigraph_dir,
+                            0,
+                            &self.db_path,
+                        );
                         let kb = graph::KuzuBackend::open(&self.db_path).with_context(|| {
                             format!("graph still unreadable after wipe (was: {last_err})")
                         })?;

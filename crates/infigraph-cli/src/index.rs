@@ -134,6 +134,13 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
                 .exists());
 
     if full {
+        // A person asked for this rebuild: the crash-loop breaker stops
+        // automatic rebuilds from looping, not a retry after a human looked.
+        // Reset before a faulted daemon is replaced below, or its successor
+        // re-derives the refusal from the attempts log at start.
+        if !remote {
+            infigraph_core::recovery::reset_crash_loop(&tg_dir_for_promotion_check)?;
+        }
         if remote {
             // Remote mode: clear the Neo4j graph (local .infigraph/ is irrelevant)
             #[cfg(feature = "remote")]

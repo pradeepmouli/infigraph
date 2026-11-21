@@ -47,12 +47,37 @@ pub fn mark_recovery_needed(
     dead_pid: u32,
     quarantined_to: &Path,
 ) -> Result<()> {
+    write_recovery_sentinel(infigraph_dir, dead_pid, quarantined_to, false)
+}
+
+/// [`mark_recovery_needed`] for a caller that has already recorded this
+/// recovery's attempt ([`record_recovery_attempt`]): `CodeIndex::init`
+/// records before it wipes, because a wipe whose reopen fails never reaches
+/// a rebuild. The sentinel says so, and [`rebuild_started`] then does not
+/// record the same recovery a second time. Counting it twice made a single
+/// recovery trip the breaker (`CRASH_LOOP_THRESHOLD` is 2): every recovery in
+/// one project's log came in pairs a second apart.
+pub fn mark_recovery_needed_recorded(
+    infigraph_dir: &Path,
+    dead_pid: u32,
+    quarantined_to: &Path,
+) -> Result<()> {
+    write_recovery_sentinel(infigraph_dir, dead_pid, quarantined_to, true)
+}
+
+fn write_recovery_sentinel(
+    infigraph_dir: &Path,
+    dead_pid: u32,
+    quarantined_to: &Path,
+    attempt_recorded: bool,
+) -> Result<()> {
     std::fs::create_dir_all(infigraph_dir)
         .with_context(|| format!("create {}", infigraph_dir.display()))?;
     let payload = serde_json::json!({
         "dead_pid": dead_pid,
         "quarantined_to": quarantined_to.display().to_string(),
         "detected_at": now_epoch_secs(),
+        "attempt_recorded": attempt_recorded,
     });
     crate::daemon_protocol::write_atomic(
         &recovery_needed_path(infigraph_dir),
@@ -64,6 +89,17 @@ pub fn pending_recovery(infigraph_dir: &Path) -> bool {
     recovery_needed_path(infigraph_dir).exists()
 }
 
+/// Whether the pending sentinel's recovery already has its attempt recorded
+/// ([`mark_recovery_needed_recorded`]). An unreadable sentinel answers
+/// `false`, so the attempt is counted rather than lost.
+fn sentinel_attempt_recorded(infigraph_dir: &Path) -> bool {
+    std::fs::read_to_string(recovery_needed_path(infigraph_dir))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("attempt_recorded").and_then(|b| b.as_bool()))
+        .unwrap_or(false)
+}
+
 pub fn clear_recovery_needed(infigraph_dir: &Path) -> Result<()> {
     let path = recovery_needed_path(infigraph_dir);
     if path.exists() {
@@ -72,7 +108,11 @@ pub fn clear_recovery_needed(infigraph_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Timestamps of auto-triggered rebuilds still inside the crash-loop window.
+/// The line [`reset_crash_loop`] appends: attempts above it no longer count.
+const RESET_LINE_PREFIX: &str = "reset ";
+
+/// Timestamps of auto-triggered rebuilds still inside the crash-loop window,
+/// counting only those after the last manual reset ([`reset_crash_loop`]).
 pub fn recent_recovery_attempts(infigraph_dir: &Path) -> Result<Vec<u64>> {
     let path = infigraph_dir.join(RECOVERY_ATTEMPTS_LOG);
     if !path.exists() {
@@ -80,11 +120,61 @@ pub fn recent_recovery_attempts(infigraph_dir: &Path) -> Result<Vec<u64>> {
     }
     let content = std::fs::read_to_string(&path).context("read recovery-attempts.log")?;
     let cutoff = now_epoch_secs().saturating_sub(CRASH_LOOP_WINDOW.as_secs());
-    Ok(content
-        .lines()
-        .filter_map(|l| l.trim().parse::<u64>().ok())
-        .filter(|&ts| ts >= cutoff)
-        .collect())
+    let mut attempts = Vec::new();
+    for line in content.lines().map(str::trim) {
+        if line.starts_with(RESET_LINE_PREFIX) {
+            attempts.clear();
+        } else if let Ok(ts) = line.parse::<u64>() {
+            if ts >= cutoff {
+                attempts.push(ts);
+            }
+        }
+    }
+    Ok(attempts)
+}
+
+/// A person asked for a rebuild (`infigraph rebuild`, `index --full`): the
+/// breaker exists to stop *automatic* rebuilds from looping, not a human
+/// retrying after looking. Removes the crash-loop marker and appends a reset
+/// line, so earlier attempts stop counting while the log keeps them for the
+/// next incident. Deleting the marker alone never worked: the next start
+/// re-derived it from the attempts log.
+pub fn reset_crash_loop(infigraph_dir: &Path) -> Result<()> {
+    use std::io::Write;
+    let had_marker = crash_loop_marker_path(infigraph_dir).exists();
+    if had_marker {
+        std::fs::remove_file(crash_loop_marker_path(infigraph_dir))
+            .context("remove recovery-crash-loop marker")?;
+    }
+    let path = infigraph_dir.join(RECOVERY_ATTEMPTS_LOG);
+    if !had_marker && recent_recovery_attempts(infigraph_dir)?.is_empty() {
+        return Ok(());
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .context("open recovery-attempts.log for append")?;
+    writeln!(f, "{RESET_LINE_PREFIX}{}", now_epoch_secs())
+        .context("append recovery-attempts.log")?;
+    f.sync_all().ok();
+    crate::audit::audit_log(
+        "recovery",
+        "crash-loop-reset",
+        "a manual rebuild reset the crash-loop breaker",
+        &infigraph_dir.display().to_string(),
+    );
+    Ok(())
+}
+
+/// The one wording of the rebuild breaker's refusal.
+pub fn crash_loop_refusal(attempts: usize) -> String {
+    format!(
+        "crash-loop detected: {attempts} automatic rebuilds within the last hour -- refusing \
+         further automatic rebuilds. Look at daemon.log and any crash report \
+         (~/Library/Logs/DiagnosticReports/infigraph-*.ips on macOS), then run \
+         `infigraph rebuild`, which resets this guard."
+    )
 }
 
 pub fn record_recovery_attempt(infigraph_dir: &Path) -> Result<()> {
@@ -175,10 +265,8 @@ pub fn write_crash_loop_marker(infigraph_dir: &Path, attempts: &[u64]) -> Result
     )
 }
 
-/// `Some(prior attempt timestamps)` once the breaker has tripped. A human
-/// clears this by deleting the marker file after fixing the underlying
-/// cause -- matching the existing "delete the lock if you don't expect a
-/// watcher here" convention `doctor`'s remediation hints already use.
+/// `Some(prior attempt timestamps)` once the breaker has tripped. A manual
+/// rebuild clears it ([`reset_crash_loop`]).
 pub fn crash_loop_detected(infigraph_dir: &Path) -> Option<Vec<u64>> {
     let content = std::fs::read_to_string(crash_loop_marker_path(infigraph_dir)).ok()?;
     let v: serde_json::Value = serde_json::from_str(&content).ok()?;
@@ -438,7 +526,9 @@ pub fn rebuild_started(infigraph_dir: &Path) -> Result<()> {
     if !pending_recovery(infigraph_dir) {
         return Ok(());
     }
-    record_recovery_attempt(infigraph_dir)?;
+    if !sentinel_attempt_recorded(infigraph_dir) {
+        record_recovery_attempt(infigraph_dir)?;
+    }
     crate::audit::audit_log(
         "recovery",
         "auto-triggered-full-reindex",
@@ -564,6 +654,95 @@ mod tests {
             "a rebuild with no sentinel pending is not a recovery attempt"
         );
         assert!(crash_loop_detected(dir).is_none());
+    }
+
+    /// One recovery is one attempt. `CodeIndex::init` records before it
+    /// wipes and leaves a sentinel saying so; the rebuild that answers that
+    /// sentinel must not record it again. It did, and every recovery in a
+    /// project's log came in pairs a second apart, so one recovery tripped
+    /// the breaker (threshold 2).
+    #[test]
+    fn a_recovery_init_already_counted_is_not_counted_again_when_its_rebuild_starts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let corrupt = dir.join(crate::graph::names::sibling(".corrupt.1"));
+
+        record_recovery_attempt(dir).unwrap();
+        mark_recovery_needed_recorded(dir, 0, &corrupt).unwrap();
+        assert!(
+            recovery_rebuild_wanted(dir).unwrap(),
+            "one prior attempt is under the threshold"
+        );
+        rebuild_started(dir).unwrap();
+
+        assert_eq!(recent_recovery_attempts(dir).unwrap().len(), 1);
+        assert!(
+            !pending_recovery(dir),
+            "the rebuild still answers the sentinel"
+        );
+
+        // A second, separate recovery inside the hour still trips it.
+        record_recovery_attempt(dir).unwrap();
+        mark_recovery_needed_recorded(dir, 0, &corrupt).unwrap();
+        assert!(!recovery_rebuild_wanted(dir).unwrap());
+        assert!(crash_loop_detected(dir).is_some());
+    }
+
+    /// The read path's sentinel records nothing, so its rebuild is what counts.
+    #[test]
+    fn a_recovery_the_read_path_signalled_is_counted_once_when_its_rebuild_starts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        mark_recovery_needed(
+            dir,
+            7,
+            &dir.join(crate::graph::names::sibling(".corrupt.2")),
+        )
+        .unwrap();
+        rebuild_started(dir).unwrap();
+        assert_eq!(recent_recovery_attempts(dir).unwrap().len(), 1);
+    }
+
+    /// A manual rebuild resets the breaker: deleting the marker alone never
+    /// did, because the next start re-derived it from the attempts log. The
+    /// log keeps the old attempts for the next incident.
+    #[test]
+    fn a_manual_reset_clears_the_breaker_and_keeps_the_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for _ in 0..CRASH_LOOP_THRESHOLD {
+            record_recovery_attempt(dir).unwrap();
+        }
+        write_crash_loop_marker(dir, &recent_recovery_attempts(dir).unwrap()).unwrap();
+
+        reset_crash_loop(dir).unwrap();
+
+        assert!(crash_loop_detected(dir).is_none(), "the marker is gone");
+        assert!(
+            recent_recovery_attempts(dir).unwrap().is_empty(),
+            "nothing counts after a reset"
+        );
+        let log = std::fs::read_to_string(dir.join(RECOVERY_ATTEMPTS_LOG)).unwrap();
+        assert_eq!(
+            log.lines().filter(|l| l.parse::<u64>().is_ok()).count(),
+            CRASH_LOOP_THRESHOLD,
+            "the attempts themselves are kept: {log}"
+        );
+        record_recovery_attempt(dir).unwrap();
+        assert_eq!(
+            recent_recovery_attempts(dir).unwrap().len(),
+            1,
+            "a later one counts"
+        );
+    }
+
+    /// A reset with nothing to reset writes nothing (and creates nothing).
+    #[test]
+    fn a_reset_with_nothing_to_reset_leaves_no_trace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".infigraph");
+        reset_crash_loop(&dir).unwrap();
+        assert!(!dir.exists());
     }
 
     #[test]
