@@ -1027,13 +1027,7 @@ impl GraphStore {
         // else -- a distinct, unambiguous refusal rather than another
         // quarantine attempt or degrade lookup.
         if let Some(attempts) = crate::recovery::crash_loop_detected(infigraph_dir) {
-            anyhow::bail!(
-                "crash-loop detected: {} auto-rebuild attempts within the last hour -- refusing \
-                 further automatic rebuilds. Investigate the underlying cause, then delete {} to \
-                 reset and retry manually with `infigraph rebuild`.",
-                attempts.len(),
-                crate::recovery::crash_loop_marker_path(infigraph_dir).display(),
-            );
+            anyhow::bail!(crate::recovery::crash_loop_refusal(attempts.len()));
         }
 
         if path.exists() {

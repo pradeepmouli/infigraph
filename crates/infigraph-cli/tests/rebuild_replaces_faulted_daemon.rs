@@ -140,3 +140,37 @@ fn rebuild_goes_through_a_daemon_refusing_for_growth_without_restarting_it() {
     );
     assert!(fault_cleared, "the successful rebuild clears the refusal");
 }
+
+/// A tripped crash-loop breaker is reset by the rebuild its message names.
+/// Deleting the marker, which the message used to prescribe, reset nothing:
+/// the next start re-derived the refusal from the attempts log, so a project
+/// stayed refused until its attempts aged out of the hour. Through the
+/// daemon, because a local `rebuild` wipes `.infigraph/` (the log with it)
+/// anyway, while the daemon's rebuild swaps only the graph.
+#[test]
+fn rebuild_resets_a_tripped_crash_loop_breaker() {
+    use infigraph_core::recovery;
+    let (project, home, mut daemon) = project_with_daemon();
+    let dir = project.path().join(".infigraph");
+    for _ in 0..recovery::CRASH_LOOP_THRESHOLD {
+        recovery::record_recovery_attempt(&dir).unwrap();
+    }
+    recovery::write_crash_loop_marker(&dir, &recovery::recent_recovery_attempts(&dir).unwrap())
+        .unwrap();
+
+    let output = rebuild(project.path(), home.path());
+    let marker_gone = recovery::crash_loop_detected(&dir).is_none();
+    let attempts = recovery::recent_recovery_attempts(&dir).unwrap();
+    stop_daemons(project.path(), &mut daemon);
+
+    assert!(
+        output.status.success(),
+        "rebuild must succeed:\nstderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(marker_gone, "the marker is gone");
+    assert!(
+        attempts.is_empty(),
+        "the attempts before the rebuild no longer count: {attempts:?}"
+    );
+}
