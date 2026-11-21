@@ -85,9 +85,10 @@ impl std::fmt::Display for UndecidedOpen {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "the graph {} could not be checked just now: the probe that decides it could not \
-             finish (killed, could not start, or ran past its time budget), so nothing was \
-             decided and it was NOT quarantined",
+            "the graph {} could not be checked just now: the probe that decides it gave no \
+             verdict (killed, could not start, ran past its time budget, or failed for a \
+             reason that is not the graph's -- its `[graph] probe of` line says which), so \
+             nothing was decided and it was NOT quarantined",
             self.graph
         )
     }
@@ -148,12 +149,16 @@ pub fn validate_db_file(path: &Path) -> Result<()> {
         return Ok(()); // legacy directory layout — let Kuzu handle it
     }
     if meta.len() < MIN_DB_FILE_SIZE {
-        anyhow::bail!(
-            "database file {} is truncated/corrupt ({} bytes, expected at least {})",
-            path.display(),
-            meta.len(),
-            MIN_DB_FILE_SIZE
-        );
+        // A verdict on the file itself, so typed as one: the probe calls a
+        // graph corrupt only on `GraphCorruption` (`probe::exit_code_for`).
+        return Err(anyhow::Error::new(GraphCorruption {
+            detail: format!(
+                "database file {} is truncated/corrupt ({} bytes, expected at least {})",
+                path.display(),
+                meta.len(),
+                MIN_DB_FILE_SIZE
+            ),
+        }));
     }
     Ok(())
 }
@@ -268,9 +273,14 @@ pub fn db_lock_path(db_path: &Path) -> PathBuf {
 ///
 /// The busy wording keeps the "failed to open kuzu db" prefix so
 /// `is_transient_wal_open_race_error` still recognises it as retryable.
+///
+/// Whether the message mentions the WAL is [`mentions_wal`], never a bare
+/// substring test: an open failure under `.../walprobe/` or `~/wallet-app/`
+/// (a permission error, say) was a corruption verdict because the path
+/// contained the letters.
 fn classify_read_only_open_failure(msg: String, live_holder: Option<u32>) -> anyhow::Error {
     let lower = msg.to_lowercase();
-    if !lower.contains("wal") {
+    if !mentions_wal(&lower) {
         return anyhow::anyhow!(msg);
     }
     // A WAL that is *absent* is never damage -- it is the normal, fully
@@ -299,6 +309,20 @@ fn classify_read_only_open_failure(msg: String, live_holder: Option<u32>) -> any
         ),
         None => anyhow::Error::new(GraphCorruption { detail: msg }),
     }
+}
+
+/// Whether a lowercased open error names the WAL as a word: lbug's own
+/// wording ("corrupted wal file", "invalid wal record type") or a WAL file
+/// (`code.kuzu.wal`, `code.kuzu.wal.checkpoint`). Not the letters inside a
+/// name (`walprobe`, `wallet-app`, `my_wal`), and not a path component that
+/// starts with them (`/wal/`): a WAL file is always `<graph>.wal`.
+fn mentions_wal(lower: &str) -> bool {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+    lower.match_indices("wal").any(|(i, _)| {
+        let before = lower[..i].chars().next_back();
+        let after = lower[i + 3..].chars().next();
+        !before.is_some_and(|c| is_word(c) || c == '/') && !after.is_some_and(is_word)
+    })
 }
 
 /// How a dead WAL holder died, phrased for the refusal message (#146).
@@ -584,7 +608,7 @@ pub fn lock_contention_in_chain(err: &anyhow::Error) -> bool {
 /// what may just be a race.
 pub fn is_transient_wal_open_race_error(err: &anyhow::Error) -> bool {
     let msg = err.to_string();
-    msg.contains("failed to open kuzu db") && msg.to_lowercase().contains("wal")
+    msg.contains("failed to open kuzu db") && mentions_wal(&msg.to_lowercase())
 }
 
 /// lbug's `DatabaseHeader` refusal for a data file stamped with a storage
@@ -3335,6 +3359,36 @@ mod tests {
     #[test]
     fn no_holders_at_all_changes_nothing() {
         assert_eq!(live_graph_writer_from(None, &[]), None);
+    }
+
+    #[test]
+    fn a_wal_in_the_project_path_is_not_a_wal_failure() {
+        // Found by replaying the sittir evidence under `.../walprobe/`: a
+        // permission error became a corruption verdict through the path.
+        for dir in ["walprobe", "wallet-app", "my_wal", "pre-wal", "wal"] {
+            let err = classify_read_only_open_failure(
+                format!(
+                    "failed to open kuzu db (read-only): IO exception: Cannot open file \
+                     /tmp/{dir}/.infigraph/code.kuzu: Permission denied"
+                ),
+                None,
+            );
+            assert!(
+                err.downcast_ref::<GraphCorruption>().is_none(),
+                "{dir}: a path is not a WAL: {err}"
+            );
+        }
+        for msg in [
+            "Corrupted wal file. Read out invalid WAL record type.",
+            "IO exception: Cannot read file /tmp/walprobe/.infigraph/code.kuzu.wal",
+            "IO exception: bad header in /tmp/x/.infigraph/code.kuzu.wal.checkpoint",
+        ] {
+            let err = classify_read_only_open_failure(msg.to_string(), None);
+            assert!(
+                err.downcast_ref::<GraphCorruption>().is_some(),
+                "{msg}: a real WAL failure stays corruption"
+            );
+        }
     }
 
     #[test]

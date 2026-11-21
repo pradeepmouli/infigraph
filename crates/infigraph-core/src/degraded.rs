@@ -122,8 +122,9 @@ pub enum DegradedMode {
     /// (`graph::id_scheme`). An incremental index cannot adopt it a file at a
     /// time, so the daemon rebuilds it whole.
     IdsOutdated,
-    /// A probe of the graph was killed, could not start, or ran past its time
-    /// budget, so nothing is known about the graph. The open was refused and
+    /// A probe of the graph was killed, could not start, ran past its time
+    /// budget, or failed without a verdict on the image (`probe::Probe`), so
+    /// nothing is known about the graph. The open was refused and
     /// the graph was left exactly as it was; the next open asks again.
     OpenUndecided,
     /// A SCIP import met object-literal members in a process that had no
@@ -325,8 +326,9 @@ impl DegradedMode {
                  glossary key may name nothing"
                 .to_string(),
             DegradedMode::OpenUndecided => "the graph could not be checked just now (its probe \
-                 was killed, could not start, or ran out of time), so this open was refused and \
-                 nothing was changed"
+                 was killed, could not start, ran out of time, or failed for a reason that is \
+                 not the graph's; its `[graph] probe of` log line says which), so this open was \
+                 refused and nothing was changed"
                 .to_string(),
             DegradedMode::ScipLiteralOwnersUnavailable => "a SCIP import named object-literal \
                  members without knowing their owners (no language registry in this process): \
