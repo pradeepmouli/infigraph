@@ -4131,8 +4131,8 @@ fn recover_or_quarantine_swapped_in_graph_with(
             }
             if verdict == crate::quarantine::WalRecovery::Indeterminate {
                 return SwapReopen::Undecided {
-                    note: "the probe that decides the swapped-in graph's fate could not finish; \
-                           nothing was quarantined"
+                    note: "the probe that decides the swapped-in graph's fate gave no verdict \
+                           (its `[graph] probe of` line says why); nothing was quarantined"
                         .to_string(),
                 };
             }

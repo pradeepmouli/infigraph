@@ -117,7 +117,8 @@ pub enum WalRecovery {
     /// picture for diagnosis.
     NotRecoverable,
     /// Nothing was decided: the probe could not start, was killed from
-    /// outside, or ran out of time (see [`crate::probe::Probe`]). Every WAL
+    /// outside, ran out of time, or failed without a verdict on the image
+    /// (see [`crate::probe::Probe`]). Every WAL
     /// moved for the experiment is back where it was. The caller MUST NOT
     /// quarantine and MUST NOT count this as a recovery attempt: it should
     /// report the open as transiently refused and try again later.
