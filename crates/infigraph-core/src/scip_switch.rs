@@ -109,16 +109,80 @@ pub fn known_languages() -> Vec<&'static str> {
     known
 }
 
-/// Names in `[scip] disable` that no indexer serves (a typo). They disable
-/// nothing; `infigraph index` and `doctor` say so, and the degraded mode
-/// `scip-unknown-language` shows it everywhere else.
+/// Where the names of the languages this binary extracts come from. Core
+/// cannot build the bundled registry (it lives in `infigraph-languages`,
+/// above core), so each binary hands in a function that does, first thing in
+/// `main`, as it declares itself probe-capable. A function, not a list:
+/// building the registry costs, and it is asked only when `[scip] disable`
+/// names something no indexer serves.
+static LANGUAGE_NAMES: std::sync::OnceLock<fn() -> Vec<String>> = std::sync::OnceLock::new();
+
+/// Declare how to list the languages this binary extracts. The first call
+/// wins.
+pub fn set_language_names(names: fn() -> Vec<String>) {
+    let _ = LANGUAGE_NAMES.set(names);
+}
+
+/// Whether `name` is a language this binary extracts, asked once per process
+/// (the list is fixed for its life). With no source declared (a library or
+/// test caller), nothing is.
+fn is_extracted_language(name: &str) -> bool {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    // Nothing is cached until a source is declared: an answer asked before
+    // `main` declared one must not stick for the life of the process.
+    let Some(source) = LANGUAGE_NAMES.get() else {
+        return false;
+    };
+    NAMES
+        .get_or_init(|| source().into_iter().map(|n| n.to_lowercase()).collect())
+        .iter()
+        .any(|n| n == name)
+}
+
+/// Names in `[scip] disable` that are no language at all (a typo). They
+/// disable nothing; `infigraph index` refuses them, `doctor` FAILs them and
+/// the degraded mode `scip-unknown-language` shows them everywhere else.
+/// A language this binary extracts that no indexer serves (`yaml`) is not
+/// one: it is never enriched, so listing it is a statement of intent that
+/// costs nothing ([`never_enriched_languages`]).
 pub fn unknown_languages(root: &Path) -> Vec<String> {
     let known = known_languages();
     disabled_languages(root)
         .into_iter()
         .map(|d| d.name)
-        .filter(|name| !known.contains(&name.as_str()))
+        .filter(|name| !known.contains(&name.as_str()) && !is_extracted_language(name))
         .collect()
+}
+
+/// Names in `[scip] disable` for languages this binary extracts but no SCIP
+/// indexer serves: no enrichment would ever run for them, with or without
+/// the entry. `doctor` says so.
+pub fn never_enriched_languages(root: &Path) -> Vec<String> {
+    let known = known_languages();
+    disabled_languages(root)
+        .into_iter()
+        .map(|d| d.name)
+        .filter(|name| !known.contains(&name.as_str()) && is_extracted_language(name))
+        .collect()
+}
+
+/// The languages of `detected` an implicit enrichment will actually enrich:
+/// not disabled, and served by some SCIP indexer, sorted. What a report of
+/// "enrichment scheduled for" names; `detected` alone also holds languages no
+/// indexer serves (yaml, json, markdown) and disabled ones, and listing those
+/// read as if SCIP ran on them. Empty when `[scip] enabled` is off.
+pub fn enrichable_languages(root: &Path, detected: &[String]) -> Vec<String> {
+    if !scip_enabled(root) {
+        return Vec::new();
+    }
+    let known = known_languages();
+    let detected: HashSet<String> = detected.iter().cloned().collect();
+    let mut out: Vec<String> = enabled_languages(root, &detected)
+        .into_iter()
+        .filter(|l| known.contains(&l.as_str()))
+        .collect();
+    out.sort_unstable();
+    out
 }
 
 /// `detected` without the languages `[scip] disable` names: what an implicit
@@ -514,6 +578,41 @@ mod disable_tests {
         assert_eq!(
             enabled_languages(tmp.path(), &set(&["python", "rust"])),
             set(&["rust"])
+        );
+    }
+
+    /// A language the binary extracts that no SCIP indexer serves (yaml) is
+    /// a harmless entry, not a typo: `infigraph index` used to refuse to run
+    /// over it. A name that is no language at all still is one.
+    #[test]
+    fn a_language_no_indexer_serves_is_accepted_and_a_typo_is_not() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(disable_env_name());
+        let _home = PinnedHome::empty();
+        fn names() -> Vec<String> {
+            ["yaml", "python", "c", "cpp", "JSON"]
+                .map(String::from)
+                .to_vec()
+        }
+        set_language_names(names);
+        let tmp = tempfile::tempdir().unwrap();
+        project_disable(tmp.path(), &["yaml", "json", "cpp", "c", "yml"]);
+
+        assert_eq!(unknown_languages(tmp.path()), ["yml"]);
+        assert_eq!(never_enriched_languages(tmp.path()), ["yaml", "json"]);
+        assert_eq!(
+            enabled_languages(tmp.path(), &set(&["c", "cpp", "rust"])),
+            set(&["rust"]),
+            "c and cpp are switched off"
+        );
+        // What "enrichment scheduled for" reports: neither the disabled
+        // languages nor ones no indexer serves.
+        let detected: Vec<String> = ["yaml", "markdown", "c", "cpp", "rust", "python"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            enrichable_languages(tmp.path(), &detected),
+            ["python", "rust"]
         );
     }
 

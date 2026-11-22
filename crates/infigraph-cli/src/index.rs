@@ -77,7 +77,7 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     let unknown = infigraph_core::scip_switch::unknown_languages(root);
     if !unknown.is_empty() {
         anyhow::bail!(
-            "[scip] disable names no SCIP indexer serves: {}; it disables nothing. Use one of: {}. \
+            "[scip] disable names no language: {}; it disables nothing. Use one of: {}. \
              To stop indexing a language altogether use `[ignore] code = [\"**/*.py\"]` \
              (docs/CODE-PARSING.md, \"Stopping one language\")",
             unknown.join(", "),
@@ -236,12 +236,19 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
                     detected_languages,
                 } => {
                     println!("Indexed {indexed_files} files ({total_files} total, full reindex)");
-                    if detected_languages.is_empty() {
-                        println!("No SCIP-eligible languages detected; skipping enrichment.");
+                    let enrichable = infigraph_core::scip_switch::enrichable_languages(
+                        root,
+                        &detected_languages,
+                    );
+                    if enrichable.is_empty() {
+                        println!(
+                            "No language here is enriched by SCIP (none detected that an indexer \
+                             serves and `[scip]` leaves enabled); skipping enrichment."
+                        );
                     } else {
                         println!(
                             "SCIP enrichment scheduled on the daemon in the background for: {}",
-                            detected_languages.join(", ")
+                            enrichable.join(", ")
                         );
                     }
                 }

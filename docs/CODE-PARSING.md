@@ -343,8 +343,16 @@ Two different things, two different switches:
   are still indexed and watched; only the compiler-grade SCIP pass skips
   that language. An indexer that serves several languages (scip-typescript:
   typescript, javascript, tsx, jsx) is skipped only when all of them are
-  disabled. A name no indexer serves is refused by `infigraph index` and
-  failed by `infigraph doctor`.
+  disabled. The project list and `~/.infigraph/config.toml` (machine-wide)
+  combine. A language Infigraph indexes that no SCIP indexer serves
+  (`yaml`, `toml`) may be listed too: it is never enriched either way, and
+  `infigraph doctor` says so. A name that is no language at all (a typo) is
+  refused by `infigraph index` and failed by `infigraph doctor`.
+
+  ```toml
+  [scip]
+  disable = ["c", "cpp", "yaml"]   # scip-clang never starts here
+  ```
 
 ### Parallel processing
 

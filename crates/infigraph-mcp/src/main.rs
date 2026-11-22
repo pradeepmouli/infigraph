@@ -12,6 +12,7 @@ fn main() -> Result<()> {
     if infigraph_core::probe::run_if_probe_child() {
         return Ok(());
     }
+    infigraph_core::scip_switch::set_language_names(infigraph_languages::language_names);
 
     let args: Vec<String> = std::env::args().collect();
 

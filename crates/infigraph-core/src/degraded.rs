@@ -339,7 +339,7 @@ impl DegradedMode {
                  list, e.g. {first}"
             ),
             DegradedMode::ScipUnknownLanguage { names } => format!(
-                "`[scip] disable` names {names}, which no SCIP indexer serves: it disables \
+                "`[scip] disable` names {names}, which is no language: it disables \
                  nothing, so the indexer you meant still runs"
             ),
             DegradedMode::KeylessDuplicateEdges { extra_rows, tables } => format!(
