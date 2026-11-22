@@ -164,7 +164,8 @@ pub fn try_recover_by_setting_wal_aside_with(
     // in the other order meant a healthy graph with no WAL fell out as "not
     // recoverable" without ever being examined, and each caller had to re-probe
     // for itself to avoid quarantining it -- which only one of them did.
-    match probe(&source) {
+    let first = probe(&source);
+    match first {
         Probe::Opens => return WalRecovery::AlreadyHealthy,
         Probe::Indeterminate => return WalRecovery::Indeterminate,
         // A checkpoint is in the way. A live holder may be running it, and
@@ -185,20 +186,27 @@ pub fn try_recover_by_setting_wal_aside_with(
     }
 
     let mut wal_paths = crate::graph::wal_family_paths(&source);
-    if wal_paths.is_empty() {
-        // Does not open, and has no WAL to blame for it.
-        return WalRecovery::NotRecoverable;
-    }
     // A writer that died inside lbug's checkpoint can leave an EMPTY `<db>.shadow`
-    // beside its WAL. lbug still reports "checkpoint is in progress" while it is
-    // there, so the image can never be asked with the WAL aside alone. It holds no
-    // page, so it is set aside with the family and put back with it. A shadow with
+    // (with or without its WAL). lbug still reports "checkpoint is in progress" while
+    // it is there, so the image can never be asked with the WAL aside alone. It holds
+    // no page, so it is set aside with the family and put back with it. A shadow with
     // content is pages a checkpoint was copying: never moved, and the open stays
     // undecided. Kept here, not in `wal_family_paths`, whose other callers (remove,
     // snapshot, quarantine) must not change.
     let shadow = PathBuf::from(format!("{}.shadow", source.display()));
     if std::fs::metadata(&shadow).is_ok_and(|m| m.is_file() && m.len() == 0) {
         wal_paths.push(shadow);
+    }
+    if wal_paths.is_empty() {
+        // Nothing to set aside. "No WAL to blame" only clears the files when the open
+        // failed for another reason: a checkpoint still in the way (a shadow with
+        // content, say) is nothing this step can explain, and a quarantine here would
+        // discard a healthy graph.
+        return if first == Probe::WalInTheWay {
+            WalRecovery::Indeterminate
+        } else {
+            WalRecovery::NotRecoverable
+        };
     }
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1091,6 +1099,44 @@ mod tests {
                 b"pages a checkpoint was copying"
             );
             assert!(side(&source, ".wal.checkpoint").exists());
+            assert!(filed(tmp.path()).is_empty());
+        }
+
+        #[test]
+        fn an_empty_shadow_alone_is_set_aside_and_the_graph_opens() {
+            let tmp = tempfile::tempdir().unwrap();
+            let source = dead_writer_graph(tmp.path(), b"");
+            std::fs::remove_file(side(&source, ".wal.checkpoint")).unwrap();
+            assert_eq!(real_probe(&source), Probe::WalInTheWay, "fixture premise");
+
+            let got = try_recover_by_setting_wal_aside_with(
+                tmp.path(),
+                crate::graph::names::STEM,
+                real_probe,
+            );
+            assert_eq!(got, WalRecovery::Recovered);
+            assert!(!side(&source, ".shadow").exists());
+            assert_eq!(filed(tmp.path()).len(), 1, "{:?}", filed(tmp.path()));
+        }
+
+        #[test]
+        fn a_non_empty_shadow_alone_never_permits_quarantine() {
+            let tmp = tempfile::tempdir().unwrap();
+            let source = dead_writer_graph(tmp.path(), b"pages a checkpoint was copying");
+            std::fs::remove_file(side(&source, ".wal.checkpoint")).unwrap();
+            assert_eq!(real_probe(&source), Probe::WalInTheWay, "fixture premise");
+
+            let got = try_recover_by_setting_wal_aside_with(
+                tmp.path(),
+                crate::graph::names::STEM,
+                real_probe,
+            );
+            assert_eq!(got, WalRecovery::Indeterminate);
+            assert!(!got.permits_quarantine());
+            assert_eq!(
+                std::fs::read(side(&source, ".shadow")).unwrap(),
+                b"pages a checkpoint was copying"
+            );
             assert!(filed(tmp.path()).is_empty());
         }
     }
