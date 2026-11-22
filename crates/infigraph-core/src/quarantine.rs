@@ -184,10 +184,21 @@ pub fn try_recover_by_setting_wal_aside_with(
         Probe::DoesNotOpen | Probe::Unavailable => {}
     }
 
-    let wal_paths = crate::graph::wal_family_paths(&source);
+    let mut wal_paths = crate::graph::wal_family_paths(&source);
     if wal_paths.is_empty() {
         // Does not open, and has no WAL to blame for it.
         return WalRecovery::NotRecoverable;
+    }
+    // A writer that died inside lbug's checkpoint can leave an EMPTY `<db>.shadow`
+    // beside its WAL. lbug still reports "checkpoint is in progress" while it is
+    // there, so the image can never be asked with the WAL aside alone. It holds no
+    // page, so it is set aside with the family and put back with it. A shadow with
+    // content is pages a checkpoint was copying: never moved, and the open stays
+    // undecided. Kept here, not in `wal_family_paths`, whose other callers (remove,
+    // snapshot, quarantine) must not change.
+    let shadow = PathBuf::from(format!("{}.shadow", source.display()));
+    if std::fs::metadata(&shadow).is_ok_and(|m| m.is_file() && m.len() == 0) {
+        wal_paths.push(shadow);
     }
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -975,5 +986,112 @@ mod tests {
             filed.is_empty(),
             "nothing should have been filed: {filed:?}"
         );
+    }
+
+    /// A real lbug graph left by a writer that died inside `finishCheckpoint` (wt-2c-census,
+    /// 2026-11-22): its WAL has become `<db>.wal.checkpoint` and an `<db>.shadow` sits beside
+    /// it. The probe is a real read-only open, so what lbug says about the files is what the
+    /// recovery sees.
+    mod dead_checkpoint {
+        use super::*;
+        use crate::graph::GraphStore;
+        use crate::probe::Probe;
+
+        fn real_probe(source: &Path) -> Probe {
+            match GraphStore::open_read_only(source) {
+                Ok(_) => Probe::Opens,
+                Err(e) if crate::graph::is_checkpoint_in_progress_error(&e) => Probe::WalInTheWay,
+                Err(_) => Probe::DoesNotOpen,
+            }
+        }
+
+        fn side(source: &Path, suffix: &str) -> PathBuf {
+            PathBuf::from(format!("{}{suffix}", source.display()))
+        }
+
+        /// `<dir>/<STEM>` holding one checkpointed Folder row and one committed only in the
+        /// WAL, as a writer killed mid-checkpoint leaves it: the WAL is `.wal.checkpoint`, the
+        /// shadow holds `shadow`.
+        fn dead_writer_graph(dir: &Path, shadow: &[u8]) -> PathBuf {
+            let live = dir.join("live");
+            std::fs::create_dir_all(&live).unwrap();
+            let live_db = live.join(crate::graph::names::STEM);
+            {
+                let store = GraphStore::open(&live_db).unwrap();
+                store
+                    .connection()
+                    .unwrap()
+                    .query("CREATE (:Folder {id: 'base', name: 'base', path: 'base'})")
+                    .unwrap();
+            } // closing checkpoints: `base` is in the image
+            let source = dir.join(crate::graph::names::STEM);
+            {
+                let writer = GraphStore::open(&live_db).unwrap();
+                writer
+                    .connection()
+                    .unwrap()
+                    .query("CREATE (:Folder {id: 'wal-row', name: 'w', path: 'w'})")
+                    .unwrap();
+                assert!(std::fs::metadata(side(&live_db, ".wal")).unwrap().len() > 0);
+                // Copy while the writer is open and its WAL unfolded.
+                std::fs::copy(&live_db, &source).unwrap();
+                std::fs::copy(side(&live_db, ".wal"), side(&source, ".wal.checkpoint")).unwrap();
+            }
+            std::fs::write(side(&source, ".shadow"), shadow).unwrap();
+            source
+        }
+
+        fn filed(dir: &Path) -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains("torn-wal"))
+                .collect();
+            v.sort();
+            v
+        }
+
+        #[test]
+        fn an_empty_shadow_beside_a_dead_checkpoint_is_set_aside_with_the_wal() {
+            let tmp = tempfile::tempdir().unwrap();
+            let source = dead_writer_graph(tmp.path(), b"");
+            assert_eq!(real_probe(&source), Probe::WalInTheWay, "fixture premise");
+
+            let got = try_recover_by_setting_wal_aside_with(
+                tmp.path(),
+                crate::graph::names::STEM,
+                real_probe,
+            );
+            assert_eq!(got, WalRecovery::Recovered);
+            assert!(!side(&source, ".shadow").exists());
+            assert!(!side(&source, ".wal.checkpoint").exists());
+            let names = filed(tmp.path());
+            assert!(names.iter().any(|n| n.ends_with(".shadow")), "{names:?}");
+            assert!(
+                names.iter().any(|n| n.ends_with(".wal.checkpoint")),
+                "{names:?}"
+            );
+        }
+
+        #[test]
+        fn a_non_empty_shadow_is_never_moved_and_the_answer_stays_undecided() {
+            let tmp = tempfile::tempdir().unwrap();
+            let source = dead_writer_graph(tmp.path(), b"pages a checkpoint was copying");
+            assert_eq!(real_probe(&source), Probe::WalInTheWay, "fixture premise");
+
+            let got = try_recover_by_setting_wal_aside_with(
+                tmp.path(),
+                crate::graph::names::STEM,
+                real_probe,
+            );
+            assert_eq!(got, WalRecovery::Indeterminate);
+            assert_eq!(
+                std::fs::read(side(&source, ".shadow")).unwrap(),
+                b"pages a checkpoint was copying"
+            );
+            assert!(side(&source, ".wal.checkpoint").exists());
+            assert!(filed(tmp.path()).is_empty());
+        }
     }
 }
