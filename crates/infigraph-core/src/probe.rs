@@ -63,8 +63,31 @@ pub fn run_if_probe_child() -> bool {
         // probe threw away is how a 162 MB graph was quarantined with nothing
         // to say why (sittir, 2026-11-20).
         eprintln!("{e:#}");
+        if crate::graph::is_checkpoint_in_progress_error(e) {
+            // Who holds the checkpoint is the whole question: a leftover
+            // `.wal.checkpoint`, a live writer, or this probe's own parent
+            // (wt-2c-census, 2026-11-21: the error survived setting the WAL
+            // aside, and nothing said who held it).
+            eprintln!(
+                "lbug checkpoint lock files open in: {:?} (this probe is {}, its parent {})",
+                crate::graph::lbug_checkpoint_lock_holders(Path::new(&path)),
+                std::process::id(),
+                parent_pid()
+            );
+        }
     }
     std::process::exit(exit_code_for(&result));
+}
+
+fn parent_pid() -> u32 {
+    #[cfg(unix)]
+    {
+        std::os::unix::process::parent_id()
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
 }
 
 /// The probe child's exit status when it could not open the graph for a
@@ -73,17 +96,26 @@ pub fn run_if_probe_child() -> bool {
 /// [`Probe::Indeterminate`].
 const UNDECIDED_EXIT: i32 = 3;
 
+/// The probe child's exit status when lbug refused the open because a
+/// checkpoint is in progress: a `.wal.checkpoint` beside the image, left by a
+/// writer that died mid-checkpoint or held by one still running it.
+/// [`classify_probe_exit`] reads it as [`Probe::WalInTheWay`].
+const WAL_IN_THE_WAY_EXIT: i32 = 4;
+
 /// The probe child's exit status for its result. Only a verdict against the
 /// image itself is "does not open" (exit 1): that is the one answer that
 /// licenses a quarantine (DESIGN-hardening R3.1.1, no destructive recovery
 /// without a corruption verdict), so any other failure is undecided. The
 /// verdict is [`crate::graph::GraphCorruption`], which `open_read_only` and
 /// `validate_db_file` raise exactly when they have judged the file; a fault
-/// signal from a damaged image is judged by the parent instead.
+/// signal from a damaged image is judged by the parent instead. A checkpoint
+/// in the way is its own answer: no verdict either, but one that says the
+/// WAL family must be set aside before the image can be asked anything.
 fn exit_code_for(result: &anyhow::Result<()>) -> i32 {
     match result {
         Ok(()) => 0,
         Err(e) if e.chain().any(|c| c.is::<crate::graph::GraphCorruption>()) => 1,
+        Err(e) if crate::graph::is_checkpoint_in_progress_error(e) => WAL_IN_THE_WAY_EXIT,
         Err(_) => UNDECIDED_EXIT,
     }
 }
@@ -189,6 +221,15 @@ pub enum Probe {
     /// ran past [`PROBE_TIMEOUT`], or failed without a verdict on the image.
     /// The caller must not quarantine.
     Indeterminate,
+    /// lbug refused the open as it stands because a checkpoint is in
+    /// progress (a `.wal.checkpoint` beside the image). Not a verdict on the
+    /// image, so never a quarantine; but unlike [`Probe::Indeterminate`] it
+    /// says what is in the way. When no live process holds the graph, the
+    /// checkpoint is a dead writer's leftover and setting the WAL family aside
+    /// is the way to ask the image (wt-2c-census, 2026-11-21: read as
+    /// undecided, the daemon refused the graph for 30 minutes until a manual
+    /// rebuild).
+    WalInTheWay,
     /// This process cannot run a probe at all: it never declared itself
     /// probe-capable ([`run_if_probe_child`]), or it cannot name its own
     /// executable. No retry can change that, so it is not "could not be
@@ -331,6 +372,7 @@ fn classify_probe_exit(status: std::process::ExitStatus) -> Probe {
             // The child judged the image itself (see `exit_code_for`). Any
             // other status -- its undecided exit, a panic -- is no verdict.
             None if status.code() == Some(1) => Probe::DoesNotOpen,
+            None if status.code() == Some(WAL_IN_THE_WAY_EXIT) => Probe::WalInTheWay,
             None => Probe::Indeterminate,
             // A fault in the image (SIGBUS on a damaged file, lbug's abort),
             // the evidence this probe exists to find.
@@ -343,10 +385,10 @@ fn classify_probe_exit(status: std::process::ExitStatus) -> Probe {
     }
     #[cfg(not(unix))]
     {
-        if status.code() == Some(1) {
-            Probe::DoesNotOpen
-        } else {
-            Probe::Indeterminate
+        match status.code() {
+            Some(1) => Probe::DoesNotOpen,
+            Some(WAL_IN_THE_WAY_EXIT) => Probe::WalInTheWay,
+            _ => Probe::Indeterminate,
         }
     }
 }
@@ -429,6 +471,61 @@ mod tests {
         }
     }
 
+    /// The child's checkpoint-in-the-way exit is its own answer, neither a
+    /// verdict nor plain "undecided".
+    #[test]
+    fn a_probe_that_finds_a_checkpoint_in_the_way_says_so() {
+        assert_eq!(
+            run_probe_command(
+                sh(&format!("exit {WAL_IN_THE_WAY_EXIT}")),
+                Duration::from_secs(5)
+            )
+            .verdict,
+            Probe::WalInTheWay
+        );
+    }
+
+    /// The real thing: a `.wal.checkpoint` left beside an intact image (a
+    /// writer that died mid-checkpoint, wt-2c-census 2026-11-21) makes lbug
+    /// refuse every read-only open, and the child says the WAL is in the way
+    /// rather than "undecided", which stopped recovery before it set the WAL
+    /// aside.
+    #[test]
+    fn a_leftover_checkpoint_is_the_wal_in_the_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join(crate::graph::names::STEM);
+        drop(crate::graph::GraphStore::open(&graph).unwrap());
+        std::fs::write(
+            dir.path()
+                .join(crate::graph::names::sibling(".wal.checkpoint")),
+            b"left by a writer that died mid-checkpoint",
+        )
+        .unwrap();
+        let result = open_and_scan(&graph);
+        assert_eq!(
+            exit_code_for(&result),
+            WAL_IN_THE_WAY_EXIT,
+            "got: {:?}",
+            result.err()
+        );
+    }
+
+    /// Who has lbug's checkpoint lock files open is what a checkpoint in the
+    /// way is about, so the probe names them; a process holding one is seen.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_process_with_a_checkpoint_lock_open_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join(crate::graph::names::STEM);
+        let [intent, _] = crate::graph::lbug_checkpoint_lock_paths(&graph);
+        let _held = std::fs::File::create(&intent).unwrap();
+        assert!(
+            crate::graph::lbug_checkpoint_lock_holders(&graph).contains(&std::process::id()),
+            "this process has {} open",
+            intent.display()
+        );
+    }
+
     /// What the child printed comes back with its verdict, so the parent can
     /// log why it did not open.
     #[test]
@@ -480,6 +577,13 @@ mod tests {
                 "probe query failed: buffer pool is full"
             ))),
             UNDECIDED_EXIT
+        );
+        assert_eq!(
+            exit_code_for(&Err(anyhow::anyhow!(
+                "failed to open kuzu db (read-only): Runtime exception: Cannot open database in \
+                 read-only mode while checkpoint is in progress. Please retry later."
+            ))),
+            WAL_IN_THE_WAY_EXIT
         );
     }
 

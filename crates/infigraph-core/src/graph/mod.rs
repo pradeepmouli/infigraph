@@ -53,8 +53,9 @@ pub use session_store::{
 pub use store::{
     db_lock_path, is_checkpoint_in_progress_error, is_lock_contention_error,
     is_storage_version_mismatch_error, is_transient_open_error, is_transient_wal_open_race_error,
-    is_undecided_open, lock_contention_context, non_corruption_open_context,
-    open_failure_is_not_a_fault, open_failure_is_not_corruption, remove_wal_family,
+    is_undecided_open, lbug_checkpoint_lock_holders, lbug_checkpoint_lock_paths,
+    lock_contention_context, non_corruption_open_context, open_failure_is_not_a_fault,
+    open_failure_is_not_corruption, other_live_graph_holder, remove_wal_family,
     storage_version_mismatch_context, unclean_shutdown_wal_holder, validate_db_file,
     wal_family_paths, DegradeReason, GraphCorruption, GraphStats, GraphStore, UndecidedOpen,
     WriteLock,
