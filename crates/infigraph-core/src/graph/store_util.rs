@@ -619,7 +619,7 @@ pub(crate) fn unwind_edges_from_pairs(
     // exactly the graph that must not be handed thousands more writes: it
     // grew to 39 GB, 643x its 65 MB baseline, and was quarantined and
     // dropped whole (41 GB) twice in two days. The gate could not be added
-    // by accident, either -- this took only a `&GatedConnection`, so it had no
+    // by accident, either -- this took only a `&Connection`, so it had no
     // way to reach the store the check needs.
     let mut gate = store.growth_gate(1);
     let mut failed = 0usize;

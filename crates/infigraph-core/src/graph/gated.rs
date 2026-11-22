@@ -7,7 +7,10 @@
 //! schema read at open). `tests/gate_guard.rs` fails on a raw `Connection::new`
 //! on the code graph elsewhere.
 //!
-//! * a statement holds the gate **shared** (`query`, `prepare`, `execute`);
+//! * a statement holds the gate **shared** (`query`, `prepare`). There is no
+//!   `execute`: a prepared `COPY FROM` run that way would force its checkpoint
+//!   outside the wrapper, and no production caller prepares anything but a read
+//!   (`ensure_read_only`, then `query`);
 //! * `CHECKPOINT` holds it **exclusive**;
 //! * a `COPY ... FROM` forces a checkpoint at its commit, so outside a
 //!   transaction it becomes `BEGIN`, the `COPY` (shared), then `COMMIT`
@@ -20,7 +23,7 @@
 //! * `COPY (...) TO` reads: the database says so (`is_read_only`), not the text.
 
 use super::store::GraphStore;
-use kuzu::{Connection, Error, PreparedStatement, QueryResult, Value};
+use kuzu::{Connection, Error, PreparedStatement, QueryResult};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct GatedConnection<'a> {
@@ -140,11 +143,12 @@ impl<'a> GatedConnection<'a> {
                     .to_string(),
             ));
         }
-        {
-            let _s = self.store.gate().shared();
-            self.conn.query("BEGIN TRANSACTION")?;
-        }
-        self.set_tx(true);
+        // The one BEGIN path: the open-transaction count moves while the shared
+        // gate is still held, so a fold that takes the gate exclusive reads a count
+        // that already includes this transaction (a count raised after the guard was
+        // dropped left a window for a fold to wait on this BEGIN's write transaction
+        // while the COPY waited on the gate).
+        self.query("BEGIN TRANSACTION")?;
         let copied = {
             let _s = self.store.gate().shared();
             self.conn.query(sql)
@@ -179,15 +183,6 @@ impl<'a> GatedConnection<'a> {
         // Binding and planning read the catalog and statistics.
         let _s = self.store.gate().shared();
         self.conn.prepare(sql)
-    }
-
-    pub fn execute(
-        &self,
-        statement: &mut PreparedStatement,
-        params: Vec<(&str, Value)>,
-    ) -> Result<QueryResult<'a>, Error> {
-        let _s = self.store.gate().shared();
-        self.conn.execute(statement, params)
     }
 }
 
@@ -276,23 +271,8 @@ mod tests {
         let (_dir, store) = store();
         let conn = store.connection().unwrap();
         let ran = std::sync::atomic::AtomicUsize::new(0);
-        let prepared_ready = AtomicBool::new(false);
-        let fold_taken = AtomicBool::new(false);
+        let fold = store.gate().exclusive();
         std::thread::scope(|s| {
-            // A `PreparedStatement` is not `Send`: it is made and run on one thread.
-            s.spawn(|| {
-                let mut prepared = conn
-                    .prepare("MATCH (s:Symbol {id: $id}) RETURN s.id")
-                    .unwrap();
-                prepared_ready.store(true, SeqCst);
-                until(|| fold_taken.load(SeqCst));
-                conn.execute(&mut prepared, vec![("id", kuzu::Value::String("a".into()))])
-                    .unwrap();
-                ran.fetch_add(1, SeqCst);
-            });
-            until(|| prepared_ready.load(SeqCst));
-            let fold = store.gate().exclusive();
-            fold_taken.store(true, SeqCst);
             s.spawn(|| {
                 conn.query("RETURN 1").unwrap();
                 ran.fetch_add(1, SeqCst);
@@ -301,11 +281,11 @@ mod tests {
                 conn.prepare("RETURN 2").unwrap();
                 ran.fetch_add(1, SeqCst);
             });
-            until(|| store.gate().blocked_shared() == 3);
+            until(|| store.gate().blocked_shared() == 2);
             assert_eq!(ran.load(SeqCst), 0, "a statement ran beside the checkpoint");
             drop(fold);
         });
-        assert_eq!(ran.load(SeqCst), 3);
+        assert_eq!(ran.load(SeqCst), 2);
     }
 
     /// While a COPY commit waits, a new statement waits behind it (no starvation of
@@ -555,17 +535,20 @@ mod tests {
         assert!(wal() >= before, "a fold ran inside a transaction");
         conn.query("COMMIT").unwrap();
 
-        // the lock moved to another thread: its statements are not the owner's
+        // the lock moved to another thread: that thread is not the one that took it,
+        // so its statements are not the owner's and fold nothing
         let size = wal();
         std::thread::scope(|s| {
-            s.spawn(|| {
+            let moved = lock;
+            let (store, grow) = (&store, &grow);
+            s.spawn(move || {
+                let _held = moved;
                 grow(&store.connection().unwrap(), 400, "other");
             })
             .join()
             .unwrap();
         });
-        assert!(wal() >= size, "a thread that does not hold the lock folded");
-        drop(lock);
+        assert!(wal() >= size, "a thread that did not take the lock folded");
     }
 
     /// A writer waiting for the write lock holds no gate: the fold that used to run
@@ -600,6 +583,103 @@ mod tests {
             waiter.join().unwrap();
         });
         assert!(entered.load(SeqCst));
+    }
+
+    /// A writer that takes the lock the instant the previous holder lets go must
+    /// still find ITSELF recorded as the holder afterwards. Dropping the file lock
+    /// before the mark let this writer mark itself in the gap and then have its mark
+    /// wiped by the previous lock's drop, so it never folded mid-write. The handover
+    /// cannot be paused from a test, so one thread hands the lock over thousands of
+    /// times while another spins on `try_write_lock` and checks its mark after each
+    /// win. Probabilistic: it cannot raise a false alarm, but a clean run is evidence,
+    /// not proof; `WriteLock`'s explicit `Drop` is what makes the order independent of
+    /// field order.
+    #[test]
+    fn a_new_write_lock_holder_is_never_unmarked_by_the_previous_one_dropping() {
+        let (_dir, store) = store();
+        let done = AtomicBool::new(false);
+        let wins = std::sync::atomic::AtomicUsize::new(0);
+        let wrong = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for _ in 0..4000 {
+                    drop(
+                        store
+                            .write_lock_with_timeout(Duration::from_secs(60))
+                            .unwrap(),
+                    );
+                }
+                done.store(true, SeqCst);
+            });
+            s.spawn(|| {
+                while !done.load(SeqCst) {
+                    if let Some(lock) = store.try_write_lock().unwrap() {
+                        wins.fetch_add(1, SeqCst);
+                        // Give a previous holder's drop every chance to run late.
+                        for _ in 0..50 {
+                            std::thread::yield_now();
+                        }
+                        if !store.writer_thread_is_me() {
+                            wrong.fetch_add(1, SeqCst);
+                        }
+                        drop(lock);
+                    }
+                }
+            });
+        });
+        assert!(wins.load(SeqCst) > 0, "the spinner never won the lock");
+        assert_eq!(
+            wrong.load(SeqCst),
+            0,
+            "a writer held the lock without being marked"
+        );
+    }
+
+    /// A mid-write fold that is turned away by a running read is not retried by the
+    /// next statement: each retry would wait for the gate and the turnstile would hold
+    /// new reads back for all of it.
+    #[test]
+    fn a_refused_mid_write_fold_is_not_retried_by_the_next_statement() {
+        let (_dir, store) = store();
+        store.set_mid_write_fold_bytes_for_test(8 * 1024);
+        let _lock = store.write_lock().unwrap();
+        let conn = store.connection().unwrap();
+        // Enough WAL, no hold yet: the statements below would fold at once, so first
+        // pause the fold with a statement-in-flight stand-in that outlasts its wait.
+        let in_flight = store.gate().shared();
+        let t = Instant::now();
+        for i in 0..200 {
+            conn.query(&format!(
+                "CREATE (:Symbol {{id: 'r{i}', name: 'n', kind: 'Function', file: 'f.rs'}})"
+            ))
+            .unwrap();
+            if store.mid_fold_attempts() >= 1 {
+                break;
+            }
+        }
+        assert_eq!(
+            store.mid_fold_attempts(),
+            1,
+            "the large WAL never triggered an attempt"
+        );
+        let first = t.elapsed();
+        // two more statements while it is still being held: no second attempt
+        for i in 0..2 {
+            conn.query(&format!(
+                "CREATE (:Symbol {{id: 'q{i}', name: 'n', kind: 'Function', file: 'f.rs'}})"
+            ))
+            .unwrap();
+        }
+        assert_eq!(
+            store.mid_fold_attempts(),
+            1,
+            "a refused fold was retried at once"
+        );
+        assert!(
+            first < Duration::from_secs(5),
+            "the attempt waited as long as an optional fold ({first:?})"
+        );
+        drop(in_flight);
     }
 
     /// `COPY Folder` failing because a folder already exists is the normal

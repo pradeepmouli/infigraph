@@ -14,11 +14,27 @@ use crate::lockfile::{self, LockFile};
 /// payload (see `crate::lockfile`).
 #[derive(Debug)]
 pub struct WriteLock {
-    _guard: LockFile,
     /// Which thread holds this lock, for the mid-write fold (see
     /// [`GraphStore::fold_if_mid_write_wal_is_large`]). Set by `GraphStore`'s
     /// lock methods; a lock the open path takes is not marked.
+    ///
+    /// DECLARED BEFORE `_guard` on purpose: fields drop in declaration order, so
+    /// the mark is cleared while the file lock is still held. The other way
+    /// round, the next writer could take the lock and mark itself in the gap, and
+    /// this lock's `WriterMark::drop` would then wipe THAT writer's mark, so it
+    /// never folds mid-write (and with lbug's own threshold off, nothing else
+    /// would during a long import).
     _mark: Option<WriterMark>,
+    _guard: LockFile,
+}
+
+impl Drop for WriteLock {
+    /// Clear the mark first, whatever the field order: the file lock is released only
+    /// after this body returns (fields drop afterwards), so no other writer can have
+    /// marked itself yet and this can never wipe a successor's mark.
+    fn drop(&mut self) {
+        self._mark = None;
+    }
 }
 
 /// Clears the store's "this thread holds the write lock" note when the lock goes.
@@ -55,8 +71,8 @@ impl WriteLock {
     fn acquire_with_timeout(lock_path: &Path, timeout: std::time::Duration) -> Result<Self> {
         let guard = lockfile::acquire(lock_path, GRAPH_WRITE_ROLE, timeout)?;
         Ok(Self {
-            _guard: guard,
             _mark: None,
+            _guard: guard,
         })
     }
 
@@ -482,9 +498,10 @@ const CHECKPOINT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const FOLD_GATE_WAIT: std::time::Duration = CHECKPOINT_WAIT;
 
 /// WAL size above which the next write pauses to fold it into the base
-/// image. Belt-and-braces alongside Kuzu's own automatic checkpointing (see
-/// `Database::new`) and the daemon's idle fold: an unbounded WAL is the #100
-/// runaway this codebase already has scars from.
+/// image. With lbug's own threshold fold switched off
+/// ([`CHECKPOINT_THRESHOLD_NEVER`]) this, the mid-write fold
+/// ([`MID_WRITE_FOLD_WAL_BYTES`]) and the daemon's idle fold are what bound the
+/// WAL: an unbounded WAL is the #100 runaway this codebase already has scars from.
 const CHECKPOINT_WAL_BYTES: u64 = 1024 * 1024;
 
 /// A WAL this large, left by a long write that holds the write lock across many
@@ -492,7 +509,10 @@ const CHECKPOINT_WAL_BYTES: u64 = 1024 * 1024;
 /// (16 MiB, `database.h`) before it was raised out of reach.
 const MID_WRITE_FOLD_WAL_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Minimum gap between mid-write fold attempts.
+/// How long a mid-write fold waits for running statements before it stands down.
+const MID_WRITE_FOLD_GATE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Minimum gap between mid-write fold attempts, from the end of the last one.
 const MID_WRITE_FOLD_RETRY_MS: u64 = 2_000;
 
 /// lbug's auto-checkpoint threshold for this store's writer `Database`: 1 TiB,
@@ -833,6 +853,8 @@ pub struct GraphStore {
     /// WAL size at which a long write folds mid-write; [`MID_WRITE_FOLD_WAL_BYTES`]
     /// except in tests.
     mid_write_fold_bytes: std::sync::atomic::AtomicU64,
+    /// Mid-write fold attempts made (tests assert a refused one is not retried at once).
+    mid_fold_attempts: std::sync::atomic::AtomicU64,
 }
 
 /// Why [`GraphStore::checkpoint_now`] did not fold.
@@ -1021,6 +1043,7 @@ impl GraphStore {
             writer_thread: std::sync::Arc::default(),
             last_mid_fold_ms: std::sync::atomic::AtomicU64::new(0),
             mid_write_fold_bytes: std::sync::atomic::AtomicU64::new(MID_WRITE_FOLD_WAL_BYTES),
+            mid_fold_attempts: std::sync::atomic::AtomicU64::new(0),
         };
         let lock = WriteLock::acquire_with_timeout(&store.lock_path, timeout)?;
         store.init_schema(&lock)?;
@@ -1133,6 +1156,7 @@ impl GraphStore {
             writer_thread: std::sync::Arc::default(),
             last_mid_fold_ms: std::sync::atomic::AtomicU64::new(0),
             mid_write_fold_bytes: std::sync::atomic::AtomicU64::new(MID_WRITE_FOLD_WAL_BYTES),
+            mid_fold_attempts: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1538,6 +1562,18 @@ impl GraphStore {
             .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
+    #[cfg(test)]
+    pub(super) fn mid_fold_attempts(&self) -> u64 {
+        self.mid_fold_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the write-lock owner recorded for this store is the calling thread.
+    #[cfg(test)]
+    pub(super) fn writer_thread_is_me(&self) -> bool {
+        *self.writer_thread.lock().unwrap() == Some(std::thread::current().id())
+    }
+
     /// Manual transactions open on this store's connections right now.
     pub(crate) fn open_transactions(&self) -> usize {
         self.open_txs.load(std::sync::atomic::Ordering::SeqCst)
@@ -1572,17 +1608,25 @@ impl GraphStore {
             return;
         }
         // A fold that cannot run (busy, guarded, disabled) is retried at most
-        // every few seconds, not after every statement.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let last = self.last_mid_fold_ms.load(Relaxed);
-        if now.saturating_sub(last) < MID_WRITE_FOLD_RETRY_MS {
+        // every few seconds, not after every statement. The gap is measured from
+        // the END of the last attempt: an attempt can itself wait for the gate, and
+        // a stamp taken before it would already be old when it returned Busy.
+        let now_ms = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        };
+        if now_ms().saturating_sub(self.last_mid_fold_ms.load(Relaxed)) < MID_WRITE_FOLD_RETRY_MS {
             return;
         }
-        self.last_mid_fold_ms.store(now, Relaxed);
-        match self.checkpoint_now(&db_path) {
+        // Its own short wait: a running read that outlasts it turns the fold away
+        // instead of making every following statement wait (the turnstile holds
+        // new reads back while a fold waits).
+        self.mid_fold_attempts.fetch_add(1, Relaxed);
+        let outcome = self.checkpoint_now_waiting(&db_path, MID_WRITE_FOLD_GATE_WAIT);
+        self.last_mid_fold_ms.store(now_ms(), Relaxed);
+        match outcome {
             Ok(()) | Err(FoldError::Disabled(_)) => {}
             Err(e) => eprintln!("warn: {e}"),
         }

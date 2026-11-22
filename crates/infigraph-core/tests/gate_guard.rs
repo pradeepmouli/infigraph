@@ -15,7 +15,7 @@ const ALLOWED: &[(&str, &str)] = &[
     ),
     (
         "infigraph-core/src/graph/session_store.rs",
-        "`sessions.kuzu`, a different `Database` with its own writer",
+        "`sessions.kuzu`, a different `Database`, opened read-only once for the legacy migration (it has no writer)",
     ),
     (
         "infigraph-docs/src/store.rs",
