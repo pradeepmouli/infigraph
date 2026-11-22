@@ -333,6 +333,17 @@ impl GraphBackend for KuzuBackend {
         // Edges into the replaced symbols from files this batch does not
         // re-extract are read now and written back after the rewrite (see
         // `IncomingEdges`). A fresh batch deletes nothing, so it has none.
+        // The COPYs below need the WAL folded first (lbug #1524/#1650). Do it NOW, before
+        // the capture and the delete: a refusal after the delete transaction committed
+        // would leave the batch's rows gone and the captured incoming edges only in
+        // memory, so a retry restores the rows but not those edges. (The fold the first
+        // COPY asks for after the delete can still refuse in a rare case; that is no
+        // worse than any COPY error on this path was before.)
+        if use_csv && !existing_hashes_empty {
+            self.store
+                .fold_before_copy()
+                .map_err(|refusal| anyhow::anyhow!(refusal.message()))?;
+        }
         let incoming = if existing_hashes_empty {
             IncomingEdges::default()
         } else {
@@ -805,5 +816,158 @@ impl KuzuBackend {
         ));
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod copy_refusal_tests {
+    use super::*;
+    use crate::model::{FileExtraction, Relation, RelationKind, Span, Symbol, SymbolKind};
+
+    fn symbol(file: &str, name: &str) -> Symbol {
+        Symbol {
+            scip_id: None,
+            id: format!("{file}::{name}"),
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            span: Span {
+                file: file.to_string(),
+                start_line: 1,
+                start_col: 0,
+                end_line: 2,
+                end_col: 0,
+            },
+            signature_hash: format!("hash_{file}_{name}"),
+            parent: None,
+            language: "python".to_string(),
+            visibility: Some("public".to_string()),
+            docstring: None,
+            complexity: 1,
+            parameters: None,
+            return_type: None,
+        }
+    }
+
+    fn extraction(file: &str, calls: Option<&str>) -> FileExtraction {
+        let f = symbol(file, "f");
+        let relations = calls
+            .map(|target| {
+                vec![Relation {
+                    source_id: f.id.clone(),
+                    target_id: format!("{target}::f"),
+                    kind: RelationKind::Calls,
+                    span: None,
+                    receiver: None,
+                }]
+            })
+            .unwrap_or_default();
+        FileExtraction {
+            file: file.to_string(),
+            language: "python".to_string(),
+            content_hash: format!("h_{file}"),
+            symbols: vec![f],
+            relations,
+            statements: Vec::new(),
+        }
+    }
+
+    fn count(backend: &KuzuBackend, cypher: &str) -> String {
+        let conn = backend.inner().connection().unwrap();
+        let mut r = conn.query(cypher).unwrap();
+        r.next().unwrap()[0].to_string()
+    }
+
+    /// A batch over 100 files into a graph that already holds rows deletes the old rows
+    /// and COPYs the new. If the COPY could not run (the fold it needs first was
+    /// refused), it must say so BEFORE the delete: after a committed delete the batch's
+    /// rows are gone and the captured incoming edges exist only in memory.
+    #[test]
+    fn a_refused_bulk_batch_deletes_nothing_and_keeps_its_incoming_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = KuzuBackend::open(&dir.path().join(crate::graph::names::STEM)).unwrap();
+        let mut first: Vec<FileExtraction> = (0..101)
+            .map(|i| extraction(&format!("pkg/m{i}.py"), None))
+            .collect();
+        // A file the second batch does not re-extract calls into the first file:
+        // an edge INTO a replaced symbol, which only `IncomingEdges` keeps alive.
+        first.push(extraction("other/caller.py", Some("pkg/m0.py")));
+        backend.upsert_files_bulk(&first, true).unwrap();
+        assert_eq!(
+            count(&backend, "MATCH (:Symbol {id: 'other/caller.py::f'})-[r:CALLS]->(:Symbol {id: 'pkg/m0.py::f'}) RETURN count(r)"),
+            "1",
+            "the fixture needs the incoming edge"
+        );
+
+        // The handle's fold is latched (a failed fold earlier): every COPY must refuse.
+        backend.inner().stop_if_committed_but_fold_failed(
+            "Transaction committed successfully, but the post-commit checkpoint failed.",
+        );
+        let second: Vec<FileExtraction> = (0..101)
+            .map(|i| extraction(&format!("pkg/m{i}.py"), None))
+            .collect();
+        let err = backend
+            .upsert_files_bulk(&second, false)
+            .expect_err("a latched handle cannot run the batch's COPYs");
+        assert!(err.to_string().contains("COPY not run"), "{err}");
+
+        assert_eq!(
+            count(
+                &backend,
+                "MATCH (s:Symbol) WHERE s.file STARTS WITH 'pkg/' RETURN count(s)"
+            ),
+            "101",
+            "the refused batch deleted rows"
+        );
+        assert_eq!(
+            count(&backend, "MATCH (:Symbol {id: 'other/caller.py::f'})-[r:CALLS]->(:Symbol {id: 'pkg/m0.py::f'}) RETURN count(r)"),
+            "1",
+            "the incoming edge was lost"
+        );
+    }
+
+    /// A brand-new project's first fold is the one the first COPY asks for, on a schema
+    /// of a few KB. If that fold stamped the growth baseline, the 10x ratio would be
+    /// measured from the empty schema and the first real index would be refused as "44x
+    /// its recorded healthy size". Only a fold that is not a COPY's preflight may stamp;
+    /// the stamp after the bulk write records the real size.
+    #[test]
+    fn the_first_copy_fold_of_a_new_project_does_not_anchor_the_growth_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let ig = dir.path().join(".infigraph");
+        std::fs::create_dir_all(&ig).unwrap();
+        // Floor off, so the ratio bites at test size, as it does on a real project
+        // past the 128 MiB floor.
+        std::fs::write(ig.join("config.toml"), "[graph]\ngrowth_min_bytes = 0\n").unwrap();
+        let backend = KuzuBackend::open(&ig.join(crate::graph::names::STEM)).unwrap();
+        backend
+            .inner()
+            .connection()
+            .unwrap()
+            .query("CREATE (:Symbol {id: 'x', name: 'x', kind: 'Function', file: 'x.py'})")
+            .unwrap(); // a pending WAL, so the fold has work
+
+        backend.inner().fold_before_copy().unwrap();
+        assert!(
+            !crate::graph::store_util::healthy_baseline_recorded(&ig),
+            "a COPY's preflight fold stamped the empty schema as the healthy size"
+        );
+
+        let files: Vec<FileExtraction> = (0..400)
+            .map(|i| extraction(&format!("pkg{}/m{i}.py", i % 10), None))
+            .collect();
+        backend
+            .upsert_files_bulk(&files, true)
+            .expect("the first bulk write of a new project must not be refused");
+        let stamped = std::fs::read_to_string(ig.join(crate::graph::names::HEALTH))
+            .expect("the bulk write records the baseline");
+        let v: serde_json::Value = serde_json::from_str(&stamped).unwrap();
+        let recorded = v["healthy_size_bytes"].as_u64().unwrap();
+        let real = std::fs::metadata(ig.join(crate::graph::names::STEM))
+            .unwrap()
+            .len();
+        assert!(
+            recorded * 2 > real,
+            "the baseline ({recorded}) is far below the graph's real size ({real})"
+        );
     }
 }

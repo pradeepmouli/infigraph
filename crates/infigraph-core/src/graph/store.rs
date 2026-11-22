@@ -857,6 +857,42 @@ pub struct GraphStore {
     mid_fold_attempts: std::sync::atomic::AtomicU64,
 }
 
+/// How long a fold waits for running statements to finish.
+pub(super) enum FoldWait {
+    /// Up to this long, then [`FoldError::Busy`]: an optional fold stands down.
+    Bounded(std::time::Duration),
+    /// As long as it takes: a fold a `COPY FROM` needs first (its own `COMMIT`
+    /// waits the same way). Not `Duration::MAX`, which overflows `Instant + Duration`.
+    Mandatory,
+}
+
+/// Why a `COPY FROM` was not run: the WAL could not be folded first. A node COPY that
+/// fails or rolls back over rows that are not checkpointed loses keys and corrupts
+/// the heap (lbug #1524/#1650), so a COPY with no fold behind it does not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyRefusal {
+    Busy,
+    Guarded,
+    Disabled,
+    Failed,
+}
+
+impl CopyRefusal {
+    /// The error text: FIXED, never built from the fold's own error. A latched handle
+    /// keeps lbug's "post-commit checkpoint failed" message, and
+    /// `is_committed_but_fold_failed` matches that text: embedded here, a COPY that never
+    /// ran would be reported as durable and neither retried nor sent to a fallback.
+    pub(crate) fn message(self) -> String {
+        let category = match self {
+            Self::Busy => "busy",
+            Self::Guarded => "guarded",
+            Self::Disabled => "disabled",
+            Self::Failed => "failed",
+        };
+        format!("COPY not run: the pending WAL could not be folded first ({category}); nothing was written")
+    }
+}
+
 /// Why [`GraphStore::checkpoint_now`] did not fold.
 #[derive(Debug)]
 pub(crate) enum FoldError {
@@ -1339,7 +1375,47 @@ impl GraphStore {
     /// Refuses rather than folds when folding is known to do harm -- see
     /// [`FoldError`] -- so both callers get the same guards (#166).
     fn checkpoint_now(&self, db_path: &Path) -> std::result::Result<(), FoldError> {
-        self.checkpoint_now_waiting(db_path, FOLD_GATE_WAIT)
+        self.checkpoint_now_waiting(db_path, FoldWait::Bounded(FOLD_GATE_WAIT))
+    }
+
+    /// Fold pending WAL rows into the base image before a node/rel `COPY FROM`.
+    ///
+    /// A COPY that fails or rolls back while the table holds rows not yet
+    /// checkpointed loses keys and leaves rolled-back rows behind, and the heap is
+    /// corrupted (lbug #1524/#1650; fixed on lbug main, not in 0.20.4). Folding first
+    /// means a failed COPY finds its rows checkpointed. The one helper for every COPY:
+    /// `GatedConnection::copy_from`, and `upsert_files_bulk`'s preflight (before it
+    /// deletes anything, so a refusal does not land after a committed delete).
+    ///
+    /// A latched handle refuses EVERY `COPY FROM` first, whatever the WAL holds: the
+    /// COPY's commit would force the checkpoint the latch exists to prevent (#166).
+    pub(crate) fn fold_before_copy(&self) -> std::result::Result<(), CopyRefusal> {
+        if self.fold_failure.get().is_some() {
+            eprintln!("warn: COPY refused: this graph handle's fold failed earlier and is latched");
+            return Err(CopyRefusal::Disabled);
+        }
+        if self.db_dir().is_none() {
+            return Ok(()); // in-memory store: no WAL
+        }
+        let db_path = self.db_path().to_path_buf();
+        // Any WAL bytes at all: measured on lbug 0.20.4, the WAL is 0 bytes after a
+        // CHECKPOINT, after a COPY commit and after a failed COPY, and 314 after a one-row
+        // MERGE. Erring toward an extra fold is the safe side.
+        if super::store_util::graph_wal_bytes(&db_path) == 0 {
+            return Ok(());
+        }
+        match self.checkpoint_now_waiting(&db_path, FoldWait::Mandatory) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("warn: COPY refused, the WAL could not be folded first: {e}");
+                Err(match e {
+                    FoldError::Busy(_) => CopyRefusal::Busy,
+                    FoldError::Guarded(_) => CopyRefusal::Guarded,
+                    FoldError::Disabled(_) => CopyRefusal::Disabled,
+                    FoldError::Failed(_) => CopyRefusal::Failed,
+                })
+            }
+        }
     }
 
     /// [`checkpoint_now`](Self::checkpoint_now) with the bound on how long it waits
@@ -1347,7 +1423,7 @@ impl GraphStore {
     pub(super) fn checkpoint_now_waiting(
         &self,
         db_path: &Path,
-        gate_wait: std::time::Duration,
+        gate_wait: FoldWait,
     ) -> std::result::Result<(), FoldError> {
         if let Some(why) = self.fold_failure.get() {
             return Err(FoldError::Disabled(why.clone()));
@@ -1377,11 +1453,19 @@ impl GraphStore {
             )));
         }
         // Optional folds wait for running statements only briefly, then stand down.
-        let Some(_exclusive_gate) = self.gate.try_exclusive_for(gate_wait) else {
-            return Err(FoldError::Busy(anyhow::anyhow!(
-                "statements were still running on this graph after {}s",
-                gate_wait.as_secs()
-            )));
+        let stamps_baseline = matches!(gate_wait, FoldWait::Bounded(_));
+        let _exclusive_gate = match gate_wait {
+            FoldWait::Bounded(wait) => {
+                let Some(held) = self.gate.try_exclusive_for(wait) else {
+                    return Err(FoldError::Busy(anyhow::anyhow!(
+                        "statements were still running on this graph after {wait:?}"
+                    )));
+                };
+                held
+            }
+            // The fold a COPY needs first: the COPY's own COMMIT waits for running
+            // statements without a bound, so this does too.
+            FoldWait::Mandatory => self.gate.exclusive(),
         };
         // Authoritative: with the gate held no statement can start, so a
         // transaction counted now is one that opened while this waited.
@@ -1403,7 +1487,12 @@ impl GraphStore {
         // `stamp_healthy_graph_size`'s own doc asks for exactly this ("only
         // after a *verified* healthy checkpoint"); before explicit
         // checkpoints existed there was no such moment to hook.
-        if let Some(dir) = self.db_dir() {
+        // Only an optional fold stamps. The mandatory one a COPY asks for is, on a new
+        // project, the FIRST fold, run over an empty schema of a few KB: stamping it
+        // would measure the 10x ratio from there and refuse the first real index ("44x
+        // its recorded healthy size"). The stamp after the bulk write records the real
+        // size.
+        if let Some(dir) = self.db_dir().filter(|_| stamps_baseline) {
             super::store_util::stamp_healthy_graph_size_if_unset(dir, db_path);
         }
         Ok(())
@@ -1624,7 +1713,8 @@ impl GraphStore {
         // instead of making every following statement wait (the turnstile holds
         // new reads back while a fold waits).
         self.mid_fold_attempts.fetch_add(1, Relaxed);
-        let outcome = self.checkpoint_now_waiting(&db_path, MID_WRITE_FOLD_GATE_WAIT);
+        let outcome =
+            self.checkpoint_now_waiting(&db_path, FoldWait::Bounded(MID_WRITE_FOLD_GATE_WAIT));
         self.last_mid_fold_ms.store(now_ms(), Relaxed);
         match outcome {
             Ok(()) | Err(FoldError::Disabled(_)) => {}
