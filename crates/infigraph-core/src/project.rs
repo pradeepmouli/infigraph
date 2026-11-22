@@ -10,6 +10,15 @@
 
 use std::path::{Path, PathBuf};
 
+/// Whether `path` is known not to exist: the one test before anything acts on
+/// a project being gone (evicting its registry entry, a daemon leaving its
+/// root). A path that cannot be examined (no permission, an I/O error) is not
+/// known to be gone, unlike with `Path::exists`, which reads every error as
+/// "no".
+pub fn known_missing(path: &Path) -> bool {
+    matches!(path.try_exists(), Ok(false))
+}
+
 /// A `.infigraph/` that belongs to a project rather than to the user.
 ///
 /// The user-level `~/.infigraph/` also holds a `graph`, so a graph alone

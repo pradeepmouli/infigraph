@@ -44,6 +44,16 @@ pub struct RepoEntry {
     pub last_indexed_commit: Option<String>,
 }
 
+impl RepoEntry {
+    /// Whether this entry's directory is known not to exist: the one test
+    /// behind every eviction (`gc`, `worktree clean`, `worktree reconcile`)
+    /// and `doctor`'s report of one. Evicting a project also stops its
+    /// daemon, so an unreadable path must not count.
+    pub fn is_gone(&self) -> bool {
+        crate::project::known_missing(&self.path)
+    }
+}
+
 /// A group of repositories (e.g., microservice architecture).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Group {

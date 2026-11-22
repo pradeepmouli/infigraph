@@ -719,7 +719,7 @@ fn path_identity(dir: &Path) -> Option<PathIdentity> {
 /// the identity captured at startup catches the resurrected root; on
 /// platforms with no identity it degrades to `exists()`.
 fn path_is_gone(root: &Path, original: Option<PathIdentity>) -> bool {
-    if !root.exists() {
+    if crate::project::known_missing(root) {
         return true;
     }
     match (original, path_identity(root)) {
@@ -6198,6 +6198,24 @@ mod root_identity_tests {
         assert!(!path_is_gone(&root, None));
         std::fs::remove_dir_all(&root).unwrap();
         assert!(path_is_gone(&root, None));
+    }
+
+    /// A root that cannot be examined has not been deleted: one permission or
+    /// I/O error on a coordinator tick must not shut the daemon down.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_cannot_be_examined_is_not_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir(&root).unwrap();
+        let started_on = path_identity(&root);
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let gone = path_is_gone(&root, started_on);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(!gone);
     }
 }
 

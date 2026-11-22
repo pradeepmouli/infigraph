@@ -135,3 +135,103 @@ fn find_worktree_drift_flags_removed_worktree_as_teardown_candidate() {
     assert_eq!(drift.teardown_candidates.len(), 1);
     assert_eq!(drift.teardown_candidates[0], wt_path);
 }
+
+/// A project that is not a git repository is in no worktree list, and that
+/// says nothing about whether it exists: `worktree clean --apply` from a repo
+/// evicted a live one and stopped its daemon.
+#[test]
+fn a_live_project_outside_git_is_never_a_teardown_candidate() {
+    let (main, _parent, _wt) = init_repo_with_worktree();
+    let plain = tempfile::tempdir().unwrap();
+    let mut registry = empty_registry();
+    registry
+        .repos
+        .insert("main".to_string(), repo_entry("main", main.path()));
+    registry
+        .repos
+        .insert("plain".to_string(), repo_entry("plain", plain.path()));
+
+    for scope in [Some(main.path()), None] {
+        let drift = find_worktree_drift(&registry, scope);
+        assert!(
+            drift.teardown_candidates.is_empty(),
+            "scope {scope:?}: {:?}",
+            drift.teardown_candidates
+        );
+    }
+}
+
+/// Run from a directory outside any repository, no worktree list is
+/// discovered at all. Every live project used to read as removed (18 of them
+/// on one machine); only the one that is really gone may be a candidate.
+#[test]
+fn a_run_outside_any_repository_tears_down_only_what_is_gone() {
+    let (main, parent, wt_path) = init_repo_with_worktree();
+    let outside = tempfile::tempdir().unwrap();
+    let gone = parent.path().join("deleted-project");
+    let mut registry = empty_registry();
+    registry
+        .repos
+        .insert("main".to_string(), repo_entry("main", main.path()));
+    registry
+        .repos
+        .insert("wt".to_string(), repo_entry("wt", &wt_path));
+    registry
+        .repos
+        .insert("gone".to_string(), repo_entry("gone", &gone));
+
+    let drift = find_worktree_drift(&registry, Some(outside.path()));
+    assert_eq!(drift.teardown_candidates, vec![gone]);
+}
+
+/// A project in a subdirectory of a repository is not a worktree root, so it
+/// is never listed; it is not gone either.
+#[test]
+fn a_project_in_a_subdirectory_of_a_repo_is_not_a_teardown_candidate() {
+    let (main, _parent, _wt) = init_repo_with_worktree();
+    let nested = main.path().join("packages").join("app");
+    std::fs::create_dir_all(&nested).unwrap();
+    let mut registry = empty_registry();
+    registry
+        .repos
+        .insert("main".to_string(), repo_entry("main", main.path()));
+    registry
+        .repos
+        .insert("nested".to_string(), repo_entry("nested", &nested));
+
+    let drift = find_worktree_drift(&registry, Some(main.path()));
+    assert!(
+        drift.teardown_candidates.is_empty(),
+        "{:?}",
+        drift.teardown_candidates
+    );
+}
+
+/// A directory that cannot be examined (no permission on a parent) is not
+/// known to be gone, and eviction stops its daemon, so it is kept.
+#[cfg(unix)]
+#[test]
+fn a_directory_that_cannot_be_examined_is_not_a_teardown_candidate() {
+    use std::os::unix::fs::PermissionsExt;
+    let (main, _parent, _wt) = init_repo_with_worktree();
+    let locked = tempfile::tempdir().unwrap();
+    let project = locked.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let mut registry = empty_registry();
+    registry
+        .repos
+        .insert("main".to_string(), repo_entry("main", main.path()));
+    registry
+        .repos
+        .insert("locked".to_string(), repo_entry("locked", &project));
+
+    std::fs::set_permissions(locked.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+    let drift = find_worktree_drift(&registry, Some(main.path()));
+    std::fs::set_permissions(locked.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(
+        drift.teardown_candidates.is_empty(),
+        "{:?}",
+        drift.teardown_candidates
+    );
+}
