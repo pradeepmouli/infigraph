@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
+use super::gated::GatedConnection;
 use anyhow::Result;
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::DataType;
-use kuzu::Connection;
 
 use super::parquet_loader;
 use super::store::{GraphStore, WriteLock};
@@ -24,7 +24,7 @@ impl GraphStore {
 
     pub fn upsert_folders_bulk_conn(
         &self,
-        conn: &Connection<'_>,
+        conn: &GatedConnection<'_>,
         file_paths: &[&str],
         _witness: &WriteLock,
     ) -> Result<()> {
@@ -207,7 +207,7 @@ impl GraphStore {
 
     pub fn upsert_all_parquet_conn(
         &self,
-        conn: &Connection<'_>,
+        conn: &GatedConnection<'_>,
         extractions: &[FileExtraction],
         _witness: &WriteLock,
     ) -> Result<()> {

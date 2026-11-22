@@ -1,3 +1,4 @@
+use crate::graph::gated::GatedConnection;
 use std::collections::HashMap;
 
 use anyhow::Result;
@@ -116,7 +117,7 @@ pub fn resolve_calls(
 /// Caller must hold WriteLock. Each edge kind is resolved and written to its
 /// own rel table (never CALLS) to keep call-graph semantics unchanged.
 fn resolve_custom_edges(
-    conn: &kuzu::Connection<'_>,
+    conn: &GatedConnection<'_>,
     extractions: &[FileExtraction],
     symbol_map: &HashMap<String, Vec<(String, String, String)>>,
     _witness: &WriteLock,
@@ -200,7 +201,7 @@ fn resolve_custom_edges(
 /// (see graph/schema.rs's ExternalRef comment for why this exists). Caller
 /// must hold WriteLock.
 fn write_external_calls(
-    conn: &kuzu::Connection<'_>,
+    conn: &GatedConnection<'_>,
     external_calls: &[(String, String, String)],
     symbol_map: &HashMap<String, Vec<(String, String, String)>>,
     extractions: &[FileExtraction],
@@ -828,7 +829,7 @@ pub(crate) fn resolve_pairs(
 /// Caller must hold WriteLock.
 fn write_resolved_calls(
     store: &GraphStore,
-    conn: &kuzu::Connection<'_>,
+    conn: &GatedConnection<'_>,
     extractions: &[FileExtraction],
     symbol_map: &HashMap<String, Vec<(String, String, String)>>,
     learned_store: Option<&LearnedStore>,

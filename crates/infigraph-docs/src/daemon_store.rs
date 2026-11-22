@@ -48,7 +48,7 @@ impl DaemonDocStore {
         if infigraph_core::graph::daemon_kuzu_backend::direct_reads_enabled() {
             let store = DocStore::open_for_read(&self.root)?;
             let conn = store.connection()?;
-            let local = infigraph_core::graph::query_exec::LocalExec::new(&conn);
+            let local = infigraph_core::graph::query_exec::LocalExec::for_docs(&conn);
             let exec: &dyn QueryExec = &local;
             f(&DocQuery::new_with(exec))
         } else {

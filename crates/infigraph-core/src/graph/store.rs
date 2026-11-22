@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use super::gated::GatedConnection;
 use anyhow::{Context, Result};
 use kuzu::{Connection, Database, SystemConfig};
 
@@ -13,7 +14,37 @@ use crate::lockfile::{self, LockFile};
 /// payload (see `crate::lockfile`).
 #[derive(Debug)]
 pub struct WriteLock {
+    /// Which thread holds this lock, for the mid-write fold (see
+    /// [`GraphStore::fold_if_mid_write_wal_is_large`]). Set by `GraphStore`'s
+    /// lock methods; a lock the open path takes is not marked.
+    ///
+    /// DECLARED BEFORE `_guard` on purpose: fields drop in declaration order, so
+    /// the mark is cleared while the file lock is still held. The other way
+    /// round, the next writer could take the lock and mark itself in the gap, and
+    /// this lock's `WriterMark::drop` would then wipe THAT writer's mark, so it
+    /// never folds mid-write (and with lbug's own threshold off, nothing else
+    /// would during a long import).
+    _mark: Option<WriterMark>,
     _guard: LockFile,
+}
+
+impl Drop for WriteLock {
+    /// Clear the mark first, whatever the field order: the file lock is released only
+    /// after this body returns (fields drop afterwards), so no other writer can have
+    /// marked itself yet and this can never wipe a successor's mark.
+    fn drop(&mut self) {
+        self._mark = None;
+    }
+}
+
+/// Clears the store's "this thread holds the write lock" note when the lock goes.
+#[derive(Debug)]
+struct WriterMark(std::sync::Arc<std::sync::Mutex<Option<std::thread::ThreadId>>>);
+
+impl Drop for WriterMark {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 /// Role string stamped into the graph write lock's identity payload.
@@ -39,11 +70,19 @@ impl WriteLock {
 
     fn acquire_with_timeout(lock_path: &Path, timeout: std::time::Duration) -> Result<Self> {
         let guard = lockfile::acquire(lock_path, GRAPH_WRITE_ROLE, timeout)?;
-        Ok(Self { _guard: guard })
+        Ok(Self {
+            _mark: None,
+            _guard: guard,
+        })
     }
 
     fn try_acquire(lock_path: &Path) -> Result<Option<Self>> {
-        Ok(lockfile::try_acquire(lock_path, GRAPH_WRITE_ROLE)?.map(|guard| Self { _guard: guard }))
+        Ok(
+            lockfile::try_acquire(lock_path, GRAPH_WRITE_ROLE)?.map(|guard| Self {
+                _guard: guard,
+                _mark: None,
+            }),
+        )
     }
 }
 
@@ -455,11 +494,32 @@ fn checkpoint_lock_path(db_path: &Path) -> PathBuf {
 /// failing, because a wedged writer must not take reads down with it.
 const CHECKPOINT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long an optional fold waits for running statements before standing down.
+const FOLD_GATE_WAIT: std::time::Duration = CHECKPOINT_WAIT;
+
 /// WAL size above which the next write pauses to fold it into the base
-/// image. Belt-and-braces alongside Kuzu's own automatic checkpointing (see
-/// `Database::new`) and the daemon's idle fold: an unbounded WAL is the #100
-/// runaway this codebase already has scars from.
+/// image. With lbug's own threshold fold switched off
+/// ([`CHECKPOINT_THRESHOLD_NEVER`]) this, the mid-write fold
+/// ([`MID_WRITE_FOLD_WAL_BYTES`]) and the daemon's idle fold are what bound the
+/// WAL: an unbounded WAL is the #100 runaway this codebase already has scars from.
 const CHECKPOINT_WAL_BYTES: u64 = 1024 * 1024;
+
+/// A WAL this large, left by a long write that holds the write lock across many
+/// autocommit statements, is folded mid-write. lbug's own threshold was this size
+/// (16 MiB, `database.h`) before it was raised out of reach.
+const MID_WRITE_FOLD_WAL_BYTES: u64 = 16 * 1024 * 1024;
+
+/// How long a mid-write fold waits for running statements before it stands down.
+const MID_WRITE_FOLD_GATE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Minimum gap between mid-write fold attempts, from the end of the last one.
+const MID_WRITE_FOLD_RETRY_MS: u64 = 2_000;
+
+/// lbug's auto-checkpoint threshold for this store's writer `Database`: 1 TiB,
+/// i.e. never. A checkpoint lbug starts inside a commit cannot take the gate, so
+/// the only folds are ours (`checkpoint_now`, and a `COPY FROM`'s forced one, which
+/// `GatedConnection` runs under the exclusive gate).
+const CHECKPOINT_THRESHOLD_NEVER: i64 = 1 << 40;
 
 /// PID currently holding `lock_path`, if that process is still running.
 ///
@@ -776,6 +836,25 @@ pub struct GraphStore {
     /// Why a `CHECKPOINT` on this `Database` failed, once one has (#166).
     /// Latched for the handle's lifetime: see [`FoldError::Disabled`].
     fold_failure: std::sync::OnceLock<String>,
+    /// No checkpoint runs while another statement executes on this `Database`
+    /// (see [`super::gate`]); every connection this store hands out goes through it.
+    gate: super::gate::FoldGate,
+    /// Manual transactions open on this store's connections (a `BEGIN` not yet
+    /// answered by `COMMIT`/`ROLLBACK`/drop). Nonzero means a fold would make
+    /// lbug wait for a write transaction while holding the gate exclusive, and
+    /// a writer's next statement is blocked on the gate: the fold stands down.
+    open_txs: std::sync::atomic::AtomicUsize,
+    /// The thread holding this store's `WriteLock`, if any: only that thread's
+    /// statements may start a mid-write fold, since any other thread may hold a
+    /// transaction this fold would wait on.
+    writer_thread: std::sync::Arc<std::sync::Mutex<Option<std::thread::ThreadId>>>,
+    /// When a mid-write fold was last attempted (unix ms), to rate-limit retries.
+    last_mid_fold_ms: std::sync::atomic::AtomicU64,
+    /// WAL size at which a long write folds mid-write; [`MID_WRITE_FOLD_WAL_BYTES`]
+    /// except in tests.
+    mid_write_fold_bytes: std::sync::atomic::AtomicU64,
+    /// Mid-write fold attempts made (tests assert a refused one is not retried at once).
+    mid_fold_attempts: std::sync::atomic::AtomicU64,
 }
 
 /// Why [`GraphStore::checkpoint_now`] did not fold.
@@ -931,10 +1010,21 @@ impl GraphStore {
                 // So the ladybug#666 race stays open (it is pre-existing, and
                 // tracked separately); losing committed data from readers
                 // would not be.
+                //
+                // What is off is lbug's own THRESHOLD fold: `checkpoint_threshold`
+                // is 1 TiB (`CHECKPOINT_THRESHOLD_NEVER`), because a checkpoint
+                // lbug starts inside a commit cannot take the read/checkpoint gate
+                // (`graph::gate`) and a reader scanning a column while one runs
+                // dies in `optimisticRead`. A write that holds the lock across many
+                // statements folds itself (`fold_if_mid_write_wal_is_large`), a
+                // write path folds a 1 MiB WAL when it takes the lock, the daemon
+                // folds an idle one, and a `COPY FROM`'s forced fold runs under the
+                // exclusive gate (`GatedConnection`).
                 crate::pools::lbug_config(
                     SystemConfig::default()
                         .buffer_pool_size(write_buffer_pool_bytes())
-                        .auto_checkpoint(true),
+                        .auto_checkpoint(true)
+                        .checkpoint_threshold(CHECKPOINT_THRESHOLD_NEVER),
                 ),
             )
             .map_err(|e| anyhow::anyhow!("failed to open kuzu db: {e}"))?
@@ -948,6 +1038,12 @@ impl GraphStore {
             lock_path,
             db_path: path.to_path_buf(),
             fold_failure: std::sync::OnceLock::new(),
+            gate: super::gate::FoldGate::new(),
+            open_txs: std::sync::atomic::AtomicUsize::new(0),
+            writer_thread: std::sync::Arc::default(),
+            last_mid_fold_ms: std::sync::atomic::AtomicU64::new(0),
+            mid_write_fold_bytes: std::sync::atomic::AtomicU64::new(MID_WRITE_FOLD_WAL_BYTES),
+            mid_fold_attempts: std::sync::atomic::AtomicU64::new(0),
         };
         let lock = WriteLock::acquire_with_timeout(&store.lock_path, timeout)?;
         store.init_schema(&lock)?;
@@ -1055,6 +1151,12 @@ impl GraphStore {
             lock_path,
             db_path: path.to_path_buf(),
             fold_failure: std::sync::OnceLock::new(),
+            gate: super::gate::FoldGate::new(),
+            open_txs: std::sync::atomic::AtomicUsize::new(0),
+            writer_thread: std::sync::Arc::default(),
+            last_mid_fold_ms: std::sync::atomic::AtomicU64::new(0),
+            mid_write_fold_bytes: std::sync::atomic::AtomicU64::new(MID_WRITE_FOLD_WAL_BYTES),
+            mid_fold_attempts: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1237,6 +1339,16 @@ impl GraphStore {
     /// Refuses rather than folds when folding is known to do harm -- see
     /// [`FoldError`] -- so both callers get the same guards (#166).
     fn checkpoint_now(&self, db_path: &Path) -> std::result::Result<(), FoldError> {
+        self.checkpoint_now_waiting(db_path, FOLD_GATE_WAIT)
+    }
+
+    /// [`checkpoint_now`](Self::checkpoint_now) with the bound on how long it waits
+    /// for running statements.
+    pub(super) fn checkpoint_now_waiting(
+        &self,
+        db_path: &Path,
+        gate_wait: std::time::Duration,
+    ) -> std::result::Result<(), FoldError> {
         if let Some(why) = self.fold_failure.get() {
             return Err(FoldError::Disabled(why.clone()));
         }
@@ -1257,7 +1369,28 @@ impl GraphStore {
         .map_err(FoldError::Busy)?;
         let _phase = crate::write_phase::enter(&"checkpoint", 0);
         let conn = self.connection().map_err(FoldError::Busy)?;
-        if let Err(e) = conn.query("CHECKPOINT") {
+        // A transaction open on this store means lbug would wait for it (up to 5s)
+        // while a writer's next statement waits on the gate we are about to hold.
+        if self.open_transactions() > 0 {
+            return Err(FoldError::Busy(anyhow::anyhow!(
+                "a transaction is open on this graph"
+            )));
+        }
+        // Optional folds wait for running statements only briefly, then stand down.
+        let Some(_exclusive_gate) = self.gate.try_exclusive_for(gate_wait) else {
+            return Err(FoldError::Busy(anyhow::anyhow!(
+                "statements were still running on this graph after {}s",
+                gate_wait.as_secs()
+            )));
+        };
+        // Authoritative: with the gate held no statement can start, so a
+        // transaction counted now is one that opened while this waited.
+        if self.open_transactions() > 0 {
+            return Err(FoldError::Busy(anyhow::anyhow!(
+                "a transaction opened on this graph while the fold waited"
+            )));
+        }
+        if let Err(e) = conn.raw().query("CHECKPOINT") {
             let why = e.to_string();
             if is_transient_checkpoint_failure(&why) {
                 return Err(FoldError::Busy(anyhow::anyhow!(why)));
@@ -1278,9 +1411,9 @@ impl GraphStore {
 
     /// Checkpoint if the WAL has grown past `CHECKPOINT_WAL_BYTES`.
     ///
-    /// Called before handing out the write lock rather than after releasing
-    /// it: at that moment this thread is about to hold the lock anyway, so no
-    /// other writer is mid-operation, and a failure can still be reported.
+    /// Called right after the write lock is taken and before it is handed out:
+    /// this thread holds the lock, so no other writer is mid-operation (a fold
+    /// waits for write transactions), and a failure can still be reported.
     fn checkpoint_if_wal_large(&self) {
         if self.db_dir().is_none() {
             return; // in-memory store: nothing to fold
@@ -1380,18 +1513,123 @@ impl GraphStore {
     /// Acquire exclusive write lock. Waits up to 30s, returning `Busy` if
     /// still held at expiry.
     pub fn write_lock(&self) -> Result<WriteLock> {
+        // The lock first, then the fold: a fold holds the gate exclusive and lbug
+        // waits (up to 5s) for any write transaction, so it must not run while
+        // another writer, which this lock keeps out, could have one open.
+        let lock = self.mark_writer(WriteLock::acquire(&self.lock_path)?);
         self.checkpoint_if_wal_large();
-        WriteLock::acquire(&self.lock_path)
+        Ok(lock)
     }
 
     /// Acquire the write lock with a caller-chosen wait budget.
     pub fn write_lock_with_timeout(&self, timeout: std::time::Duration) -> Result<WriteLock> {
-        WriteLock::acquire_with_timeout(&self.lock_path, timeout)
+        Ok(self.mark_writer(WriteLock::acquire_with_timeout(&self.lock_path, timeout)?))
     }
 
     /// Try to acquire write lock without blocking. Returns None if already held.
     pub fn try_write_lock(&self) -> Result<Option<WriteLock>> {
-        WriteLock::try_acquire(&self.lock_path)
+        Ok(WriteLock::try_acquire(&self.lock_path)?.map(|lock| self.mark_writer(lock)))
+    }
+
+    fn mark_writer(&self, mut lock: WriteLock) -> WriteLock {
+        *self.writer_thread.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(std::thread::current().id());
+        lock._mark = Some(WriterMark(self.writer_thread.clone()));
+        lock
+    }
+
+    /// The gate every connection of this store goes through.
+    pub(super) fn gate(&self) -> &super::gate::FoldGate {
+        &self.gate
+    }
+
+    /// A manual transaction opened (`true`) or closed (`false`) on one of this
+    /// store's connections.
+    pub(super) fn note_transaction(&self, opened: bool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if opened {
+            self.open_txs.fetch_add(1, SeqCst);
+        } else {
+            self.open_txs.fetch_sub(1, SeqCst);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_mid_write_fold_bytes_for_test(&self, bytes: u64) {
+        self.mid_write_fold_bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
+        self.last_mid_fold_ms
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(super) fn mid_fold_attempts(&self) -> u64 {
+        self.mid_fold_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the write-lock owner recorded for this store is the calling thread.
+    #[cfg(test)]
+    pub(super) fn writer_thread_is_me(&self) -> bool {
+        *self.writer_thread.lock().unwrap() == Some(std::thread::current().id())
+    }
+
+    /// Manual transactions open on this store's connections right now.
+    pub(crate) fn open_transactions(&self) -> usize {
+        self.open_txs.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Fold a WAL that a long write has grown past [`MID_WRITE_FOLD_WAL_BYTES`].
+    ///
+    /// lbug folds at its own threshold inside a commit, which can run beside a
+    /// reader, so this store raises that threshold out of reach (see
+    /// [`CHECKPOINT_THRESHOLD_NEVER`]) and a fold is always ours, under the gate.
+    /// `checkpoint_if_wal_large` only runs when a write path takes the lock, and a
+    /// scip import takes it once and then runs thousands of autocommit
+    /// statements, so the gated connection asks this after each of them.
+    ///
+    /// Only the thread holding the write lock may fold, and only with no manual
+    /// transaction open anywhere on this store: any other thread may hold a write
+    /// transaction the fold would wait on while its next statement waits on the
+    /// gate. A write lock moved to another thread simply never folds here.
+    pub(super) fn fold_if_mid_write_wal_is_large(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.db_dir().is_none() {
+            return;
+        }
+        let me = std::thread::current().id();
+        if *self.writer_thread.lock().unwrap_or_else(|e| e.into_inner()) != Some(me)
+            || self.open_transactions() > 0
+        {
+            return;
+        }
+        let db_path = self.db_path().to_path_buf();
+        if super::store_util::graph_wal_bytes(&db_path) < self.mid_write_fold_bytes.load(Relaxed) {
+            return;
+        }
+        // A fold that cannot run (busy, guarded, disabled) is retried at most
+        // every few seconds, not after every statement. The gap is measured from
+        // the END of the last attempt: an attempt can itself wait for the gate, and
+        // a stamp taken before it would already be old when it returned Busy.
+        let now_ms = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        };
+        if now_ms().saturating_sub(self.last_mid_fold_ms.load(Relaxed)) < MID_WRITE_FOLD_RETRY_MS {
+            return;
+        }
+        // Its own short wait: a running read that outlasts it turns the fold away
+        // instead of making every following statement wait (the turnstile holds
+        // new reads back while a fold waits).
+        self.mid_fold_attempts.fetch_add(1, Relaxed);
+        let outcome = self.checkpoint_now_waiting(&db_path, MID_WRITE_FOLD_GATE_WAIT);
+        self.last_mid_fold_ms.store(now_ms(), Relaxed);
+        match outcome {
+            Ok(()) | Err(FoldError::Disabled(_)) => {}
+            Err(e) => eprintln!("warn: {e}"),
+        }
     }
 
     fn init_schema(&self, _witness: &WriteLock) -> Result<()> {
@@ -1433,7 +1671,7 @@ impl GraphStore {
     /// every call site already holds both by the time its write completes.
     pub fn bump_ast_generation_conn(
         &self,
-        conn: &Connection<'_>,
+        conn: &GatedConnection<'_>,
         _witness: &WriteLock,
     ) -> Result<i64> {
         let generation = bump_ast_generation(conn)?;
@@ -1481,7 +1719,7 @@ impl GraphStore {
     /// `scip_generation == 0` is the "SCIP never ran" sentinel everywhere.
     pub fn stamp_scip_generation_conn(
         &self,
-        conn: &Connection<'_>,
+        conn: &GatedConnection<'_>,
         _witness: &WriteLock,
         enriched_ast_generation: Option<i64>,
     ) -> Result<i64> {
@@ -1507,8 +1745,12 @@ impl GraphStore {
         read_generation_field(self, "scip_generation")
     }
 
-    pub fn connection(&self) -> Result<Connection<'_>> {
-        Connection::new(&self.db).map_err(|e| anyhow::anyhow!("failed to create connection: {e}"))
+    /// The only route to a connection on the code graph: every statement on it goes
+    /// through this store's gate (see [`super::gate`]).
+    pub fn connection(&self) -> Result<GatedConnection<'_>> {
+        let raw = Connection::new(&self.db)
+            .map_err(|e| anyhow::anyhow!("failed to create connection: {e}"))?;
+        Ok(GatedConnection::new(self, raw))
     }
 
     /// Run `f` inside a real transaction: opens one connection, issues
@@ -1522,7 +1764,7 @@ impl GraphStore {
     /// more than the one statement they're attached to) -- passing those
     /// strings to `raw_query` does not get you a transaction. This method is
     /// the real thing.
-    pub fn transaction<T>(&self, f: impl FnOnce(&Connection<'_>) -> Result<T>) -> Result<T> {
+    pub fn transaction<T>(&self, f: impl FnOnce(&GatedConnection<'_>) -> Result<T>) -> Result<T> {
         let conn = self.connection()?;
         conn.query("BEGIN TRANSACTION")
             .map_err(|e| anyhow::anyhow!("failed to begin transaction: {e}"))?;
@@ -1552,7 +1794,7 @@ impl GraphStore {
 
     pub fn remove_file_conn(
         &self,
-        conn: &Connection<'_>,
+        conn: &GatedConnection<'_>,
         file: &str,
         _witness: &WriteLock,
     ) -> Result<()> {
@@ -1663,7 +1905,7 @@ impl std::fmt::Display for GraphStats {
 /// before this shipped: two ast bumps created the row with only
 /// ast_generation set, then the scip write found scip_generation NULL).
 /// `stamp_scip_generation` below initializes both for the same reason.
-fn bump_ast_generation(conn: &Connection) -> Result<i64> {
+fn bump_ast_generation(conn: &GatedConnection) -> Result<i64> {
     write_generation_field(
         conn,
         "ast_generation",
@@ -1676,7 +1918,10 @@ fn bump_ast_generation(conn: &Connection) -> Result<i64> {
 /// comment for the semantics. Computed here rather than in Cypher so the
 /// three clamps (cap at `ast_generation`, never backwards, floor 1) read
 /// as one expression.
-fn stamp_scip_generation(conn: &Connection, enriched_ast_generation: Option<i64>) -> Result<i64> {
+fn stamp_scip_generation(
+    conn: &GatedConnection,
+    enriched_ast_generation: Option<i64>,
+) -> Result<i64> {
     let ast = read_generation_field_conn(conn, "ast_generation")?;
     let scip = read_generation_field_conn(conn, "scip_generation")?;
     let target = enriched_ast_generation
@@ -1698,7 +1943,7 @@ fn stamp_scip_generation(conn: &Connection, enriched_ast_generation: Option<i64>
 /// back `g.<field>`. `field` is always a literal from the two callers
 /// above, never external input, so interpolating it is safe.
 fn write_generation_field(
-    conn: &Connection,
+    conn: &GatedConnection,
     field: &'static str,
     set_clauses: &str,
 ) -> Result<i64> {
@@ -1734,7 +1979,7 @@ fn read_generation_field(store: &GraphStore, field: &'static str) -> Result<i64>
 
 /// `read_generation_field` on an already-open connection (the stamp path
 /// reads both counters on the write connection it is about to write with).
-fn read_generation_field_conn(conn: &Connection, field: &'static str) -> Result<i64> {
+fn read_generation_field_conn(conn: &GatedConnection, field: &'static str) -> Result<i64> {
     Ok(super::queries::GraphQuery::new(conn).generation(field))
 }
 

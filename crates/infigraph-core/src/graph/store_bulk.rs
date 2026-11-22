@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
+use super::gated::GatedConnection;
 use anyhow::{Context, Result};
-use kuzu::Connection;
 
 use super::schema::ensure_custom_edge_table;
 use super::store::{GraphStore, WriteLock};
@@ -13,7 +13,7 @@ impl GraphStore {
     /// Much faster than calling upsert_file_conn_no_delete per file.
     pub fn upsert_all_bulk(
         &self,
-        conn: &Connection<'_>,
+        conn: &GatedConnection<'_>,
         extractions: &[FileExtraction],
         _witness: &WriteLock,
     ) -> Result<()> {

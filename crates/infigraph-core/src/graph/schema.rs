@@ -256,9 +256,9 @@ pub const CREATE_SCHEMA: &[&str] = &[
     "CREATE NODE TABLE IF NOT EXISTS GraphMeta(id STRING, ast_generation INT64, scip_generation INT64, schema_version INT64, PRIMARY KEY(id))",
 ];
 
-use kuzu::Connection;
+use super::gated::GatedConnection;
 
-pub fn ensure_custom_edge_table(conn: &Connection<'_>, edge_name: &str) -> anyhow::Result<()> {
+pub fn ensure_custom_edge_table(conn: &GatedConnection<'_>, edge_name: &str) -> anyhow::Result<()> {
     let ddl = format!(
         "CREATE REL TABLE IF NOT EXISTS {}(FROM Symbol TO Symbol)",
         edge_name

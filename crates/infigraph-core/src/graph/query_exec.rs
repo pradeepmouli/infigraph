@@ -7,6 +7,7 @@
 //! re-implementing those queries for a remote backend would duplicate every
 //! one of them.
 
+use super::gated::GatedConnection;
 use anyhow::Result;
 
 /// Executes a read query and returns its rows as strings.
@@ -29,21 +30,40 @@ impl<T: QueryExec + ?Sized> QueryExec for &T {
 
 /// Runs queries on a Kuzu connection in this process.
 pub struct LocalExec<'a, 'db> {
-    conn: &'a kuzu::Connection<'db>,
+    conn: LocalConn<'a, 'db>,
+}
+
+/// The connection a [`LocalExec`] runs on: the code graph's gated one, or the
+/// document store's own (`docs.kuzu` is a separate `Database` whose readers and
+/// writers exclude each other with `docs-op.lock`, so its checkpoints cannot
+/// overlap a read and it has no gate).
+enum LocalConn<'a, 'db> {
+    Graph(&'a GatedConnection<'db>),
+    Docs(&'a kuzu::Connection<'db>),
 }
 
 impl<'a, 'db> LocalExec<'a, 'db> {
-    pub fn new(conn: &'a kuzu::Connection<'db>) -> Self {
-        Self { conn }
+    pub fn new(conn: &'a GatedConnection<'db>) -> Self {
+        Self {
+            conn: LocalConn::Graph(conn),
+        }
+    }
+
+    /// Over a `docs.kuzu` connection.
+    pub fn for_docs(conn: &'a kuzu::Connection<'db>) -> Self {
+        Self {
+            conn: LocalConn::Docs(conn),
+        }
     }
 }
 
 impl QueryExec for LocalExec<'_, '_> {
     fn query_rows(&self, cypher: &str) -> Result<Vec<Vec<String>>> {
-        let result = self
-            .conn
-            .query(cypher)
-            .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
+        let result = match &self.conn {
+            LocalConn::Graph(c) => c.query(cypher),
+            LocalConn::Docs(c) => c.query(cypher),
+        }
+        .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
         Ok(result
             .map(|row| row.iter().map(|v| v.to_string()).collect())
             .collect())

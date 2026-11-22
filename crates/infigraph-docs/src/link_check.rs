@@ -56,7 +56,7 @@ pub(crate) fn with_docs<T>(
     } else {
         let store = DocStore::open_for_read(root)?;
         let conn = store.connection()?;
-        let local = LocalExec::new(&conn);
+        let local = LocalExec::for_docs(&conn);
         let exec: &dyn QueryExec = &local;
         f(&DocQuery::new_with(exec))
     }

@@ -8,13 +8,32 @@
 //! negative silently reintroduces a direct write, a false positive breaks a
 //! legitimate `MATCH` whose text happens to contain a keyword.
 
+use crate::graph::gated::GatedConnection;
 use anyhow::Result;
+
+/// A connection that can prepare a statement: the code graph's gated one, or a
+/// `docs.kuzu` one (its own `Database`, excluded from writers by `docs-op.lock`).
+pub trait Prepare {
+    fn prepare_statement(&self, cypher: &str) -> Result<kuzu::PreparedStatement, kuzu::Error>;
+}
+
+impl Prepare for GatedConnection<'_> {
+    fn prepare_statement(&self, cypher: &str) -> Result<kuzu::PreparedStatement, kuzu::Error> {
+        self.prepare(cypher)
+    }
+}
+
+impl Prepare for kuzu::Connection<'_> {
+    fn prepare_statement(&self, cypher: &str) -> Result<kuzu::PreparedStatement, kuzu::Error> {
+        self.prepare(cypher)
+    }
+}
 
 /// Prepare `cypher` and return the statement only if the database judges it
 /// read-only.
-pub fn ensure_read_only(conn: &kuzu::Connection, cypher: &str) -> Result<kuzu::PreparedStatement> {
+pub fn ensure_read_only(conn: &impl Prepare, cypher: &str) -> Result<kuzu::PreparedStatement> {
     let stmt = conn
-        .prepare(cypher)
+        .prepare_statement(cypher)
         .map_err(|e| anyhow::anyhow!("failed to prepare query: {e}"))?;
     if !stmt.is_read_only() {
         anyhow::bail!(

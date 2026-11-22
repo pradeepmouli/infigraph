@@ -36,6 +36,7 @@
 //!    bound to, so its members are `file::Const::key`, and a literal nested as
 //!    the value of a key under such wrappers is owned by that key too.
 
+use super::gated::GatedConnection;
 use std::path::Path;
 
 use super::observe::ObservedGraph;
@@ -92,7 +93,7 @@ pub fn outdated_at(root: &Path) -> bool {
 
 /// Stamp the current scheme on a graph with no symbols in it: whatever is
 /// written into it from here on is written under this binary's scheme.
-pub(crate) fn stamp_if_empty(conn: &kuzu::Connection<'_>) -> anyhow::Result<()> {
+pub(crate) fn stamp_if_empty(conn: &GatedConnection<'_>) -> anyhow::Result<()> {
     let exec = LocalExec::new(conn);
     if first_int(&exec, "MATCH (s:Symbol) RETURN count(*)") == Some(0) {
         conn.query(&format!(

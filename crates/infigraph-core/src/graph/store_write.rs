@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
+use super::gated::GatedConnection;
 use anyhow::{Context, Result};
-use kuzu::Connection;
 
 use super::schema::ensure_custom_edge_table;
 use super::store::{GraphStore, WriteLock};
@@ -51,7 +51,7 @@ impl GraphStore {
 
     pub fn upsert_file_conn(
         &self,
-        conn: &Connection<'_>,
+        conn: &GatedConnection<'_>,
         extraction: &FileExtraction,
         witness: &WriteLock,
     ) -> Result<()> {
@@ -77,7 +77,7 @@ impl GraphStore {
 
     pub fn upsert_file_conn_no_delete(
         &self,
-        conn: &Connection<'_>,
+        conn: &GatedConnection<'_>,
         extraction: &FileExtraction,
         _witness: &WriteLock,
     ) -> Result<()> {
@@ -267,7 +267,7 @@ impl GraphStore {
     /// Create Folder nodes for each ancestor directory and wire up
     /// CONTAINS_FOLDER (parent -> child) and CONTAINS_FILE (leaf folder -> file) edges.
     #[allow(dead_code)]
-    fn upsert_folder_hierarchy(&self, conn: &Connection<'_>, file_path: &str) -> Result<()> {
+    fn upsert_folder_hierarchy(&self, conn: &GatedConnection<'_>, file_path: &str) -> Result<()> {
         // Split the file path into components: "src/graph/store.rs" -> ["src", "graph"]
         let parts: Vec<&str> = file_path.rsplitn(2, '/').collect();
         let dir_path = if parts.len() == 2 {

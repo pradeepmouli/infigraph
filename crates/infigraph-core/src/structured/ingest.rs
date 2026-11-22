@@ -1,3 +1,4 @@
+use crate::graph::gated::GatedConnection;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -5,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use super::schema::{escape, format_value, interpolate_template, IngestResult, SchemaMeta};
 
 pub fn ingest_data(
-    conn: &kuzu::Connection<'_>,
+    conn: &GatedConnection<'_>,
     schema: &SchemaMeta,
     data: &[serde_json::Value],
 ) -> Result<IngestResult> {
@@ -132,7 +133,7 @@ pub fn ingest_data(
     })
 }
 
-fn resolve_symbol(conn: &kuzu::Connection<'_>, reference: &str) -> Option<String> {
+fn resolve_symbol(conn: &GatedConnection<'_>, reference: &str) -> Option<String> {
     let esc = reference.replace('\'', "\\'");
     let query = format!(
         "MATCH (s:Symbol) WHERE s.id = '{}' OR s.name = '{}' RETURN s.id LIMIT 1",
@@ -144,7 +145,7 @@ fn resolve_symbol(conn: &kuzu::Connection<'_>, reference: &str) -> Option<String
 }
 
 pub fn ingest_directory(
-    conn: &kuzu::Connection<'_>,
+    conn: &GatedConnection<'_>,
     schema: &SchemaMeta,
     dir_path: &Path,
 ) -> Result<IngestResult> {
@@ -175,7 +176,7 @@ pub fn ingest_directory(
 }
 
 pub fn ingest_file(
-    conn: &kuzu::Connection<'_>,
+    conn: &GatedConnection<'_>,
     schema: &SchemaMeta,
     data_path: &Path,
 ) -> Result<IngestResult> {
