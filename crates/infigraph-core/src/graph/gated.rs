@@ -143,6 +143,12 @@ impl<'a> GatedConnection<'a> {
                     .to_string(),
             ));
         }
+        // Fold the WAL first, so a COPY that fails finds its rows checkpointed (lbug
+        // #1524/#1650). No COPY runs without that: the error is fixed text, never the
+        // fold's own (see `CopyRefusal::message`).
+        if let Err(refusal) = self.store.fold_before_copy() {
+            return Err(Error::FailedQuery(refusal.message()));
+        }
         // The one BEGIN path: the open-transaction count moves while the shared
         // gate is still held, so a fold that takes the gate exclusive reads a count
         // that already includes this transaction (a count raised after the guard was
@@ -196,7 +202,7 @@ impl Drop for GatedConnection<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::store::GraphStore;
+    use crate::graph::store::{FoldWait, GraphStore};
     use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
     use std::time::{Duration, Instant};
 
@@ -326,7 +332,7 @@ mod tests {
         let db = dir.path().join(crate::graph::names::STEM);
         let in_flight = store.gate().shared();
         let started = Instant::now();
-        let r = store.checkpoint_now_waiting(&db, Duration::from_millis(100));
+        let r = store.checkpoint_now_waiting(&db, FoldWait::Bounded(Duration::from_millis(100)));
         assert!(
             matches!(r, Err(crate::graph::store::FoldError::Busy(_))),
             "{r:?}"
@@ -335,7 +341,7 @@ mod tests {
         assert_eq!(store.gate().waiting_exclusive(), 0);
         drop(in_flight);
         assert!(store
-            .checkpoint_now_waiting(&db, Duration::from_secs(5))
+            .checkpoint_now_waiting(&db, FoldWait::Bounded(Duration::from_secs(5)))
             .is_ok());
     }
 
@@ -351,7 +357,7 @@ mod tests {
         writer.query("BEGIN TRANSACTION").unwrap();
         assert_eq!(store.open_transactions(), 1);
         let started = Instant::now();
-        let r = store.checkpoint_now_waiting(&db, Duration::from_secs(30));
+        let r = store.checkpoint_now_waiting(&db, FoldWait::Bounded(Duration::from_secs(30)));
         assert!(
             matches!(r, Err(crate::graph::store::FoldError::Busy(_))),
             "{r:?}"
@@ -369,7 +375,7 @@ mod tests {
         writer.query("COMMIT").unwrap();
         assert_eq!(store.open_transactions(), 0);
         assert!(store
-            .checkpoint_now_waiting(&db, Duration::from_secs(5))
+            .checkpoint_now_waiting(&db, FoldWait::Bounded(Duration::from_secs(5)))
             .is_ok());
     }
 
@@ -740,6 +746,84 @@ mod tests {
             .unwrap();
         let ids: Vec<String> = all.by_ref().map(|row| row[0].to_string()).collect();
         assert_eq!(ids, ["d1", "d2", "d3"], "rows left behind or missing");
+    }
+
+    /// The same failure, through the wrapper's own protection (rows written by UNWIND,
+    /// then a `COPY` repeating one key): the wrapper folds first, so the failed COPY
+    /// finds its rows checkpointed. Several rounds, each with a new unfolded row, and
+    /// the listing is checked after every one. Without the fold-first this loses keys
+    /// (the Folder written by the previous round's MERGE).
+    #[test]
+    fn a_copy_that_repeats_a_key_leaves_unfolded_rows_intact() {
+        let (dir, store) = store();
+        let conn = store.connection().unwrap();
+        let mut expected: Vec<String> = Vec::new();
+        for round in 0..6 {
+            let id = format!("r{round}");
+            conn.query(&format!(
+                "MERGE (d:Folder {{id: '{id}'}}) ON CREATE SET d.name = '{id}', d.path = '{id}'"
+            ))
+            .unwrap();
+            expected.push(id.clone());
+            // repeats the first folder, and brings one new one that must not survive
+            let file = csv(
+                &dir,
+                &format!("f{round}.csv"),
+                &format!("r0,r0,r0\nnew{round},new{round},new{round}\n"),
+            );
+            let err = conn
+                .query(&format!("COPY Folder FROM '{file}'"))
+                .map(|_| ())
+                .expect_err("a repeated key fails the COPY");
+            assert!(
+                err.to_string().contains("duplicated primary key")
+                    || err.to_string().contains("Copy exception"),
+                "{err}"
+            );
+            let mut all = conn
+                .query("MATCH (f:Folder) RETURN f.id ORDER BY f.id")
+                .unwrap();
+            let ids: Vec<String> = all.by_ref().map(|row| row[0].to_string()).collect();
+            let mut want = expected.clone();
+            want.sort();
+            assert_eq!(ids, want, "round {round}: rows lost or left behind");
+        }
+    }
+
+    /// A latched handle refuses every COPY FROM, whatever the WAL holds (an empty WAL
+    /// included: the COPY's commit would force the very checkpoint the latch prevents),
+    /// and the refusal never reads as "committed": its text must not match lbug's
+    /// post-commit marker, or a COPY that never ran would be reported durable and its
+    /// rows neither retried nor sent to the UNWIND fallback.
+    #[test]
+    fn a_latched_handle_refuses_a_copy_and_the_refusal_is_not_a_committed_write() {
+        let (dir, store) = store();
+        let db = dir.path().join(crate::graph::names::STEM);
+        store
+            .checkpoint_now_waiting(&db, FoldWait::Bounded(Duration::from_secs(5)))
+            .unwrap(); // the WAL is now empty
+        store.stop_if_committed_but_fold_failed(
+            "Transaction committed successfully, but the post-commit checkpoint failed. \
+             The committed data is durable and will be recovered on restart",
+        );
+        let file = csv(&dir, "e.csv", "a,b\n");
+        let conn = store.connection().unwrap();
+        let err = conn
+            .query(&format!("COPY CALLS FROM '{file}'"))
+            .map(|_| ())
+            .expect_err("a latched handle refuses");
+        let text = err.to_string();
+        assert!(text.contains("COPY not run"), "{text}");
+        assert!(
+            store.stop_if_committed_but_fold_failed(&text).is_none(),
+            "the refusal matched the committed-but-fold-failed marker: {text}"
+        );
+        assert_eq!(calls(&conn), 0);
+        assert_eq!(
+            store.open_transactions(),
+            0,
+            "the refused COPY left a transaction open"
+        );
     }
 
     /// The commit error of a COPY whose forced fold fails is lbug's, passed through
