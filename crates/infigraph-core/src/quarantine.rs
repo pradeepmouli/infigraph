@@ -167,6 +167,20 @@ pub fn try_recover_by_setting_wal_aside_with(
     match probe(&source) {
         Probe::Opens => return WalRecovery::AlreadyHealthy,
         Probe::Indeterminate => return WalRecovery::Indeterminate,
+        // A checkpoint is in the way. A live holder may be running it, and
+        // its WAL is its committed work: leave it alone. With none, it is a
+        // dead writer's leftover, and the image can only be asked with it set
+        // aside.
+        Probe::WalInTheWay => {
+            if let Some(pid) = crate::graph::other_live_graph_holder(&source) {
+                eprintln!(
+                    "[graph] {} has a checkpoint in progress held by live process {pid}; \
+                     leaving its WAL in place",
+                    source.display()
+                );
+                return WalRecovery::Indeterminate;
+            }
+        }
         Probe::DoesNotOpen | Probe::Unavailable => {}
     }
 
@@ -217,7 +231,9 @@ pub fn try_recover_by_setting_wal_aside_with(
         let _ = std::fs::rename(to, from);
     }
     match verdict {
-        Probe::Indeterminate => WalRecovery::Indeterminate,
+        // With the WAL family set aside, a checkpoint still in the way is
+        // nothing this step can explain: no verdict.
+        Probe::Indeterminate | Probe::WalInTheWay => WalRecovery::Indeterminate,
         Probe::DoesNotOpen | Probe::Unavailable | Probe::Opens => WalRecovery::NotRecoverable,
     }
 }
@@ -661,6 +677,87 @@ mod tests {
         );
         assert!(!verdict.is_usable(), "nor is it proven usable");
         assert!(wal.exists(), "nothing was moved aside");
+    }
+
+    /// A checkpoint in the way with no one holding the graph is a dead
+    /// writer's leftover: it is set aside and the image asked without it
+    /// (wt-2c-census, 2026-11-21, where "undecided" stopped recovery here and
+    /// the daemon refused the graph until a manual rebuild).
+    #[test]
+    fn a_dead_writers_checkpoint_is_set_aside_and_the_graph_recovered() {
+        use crate::probe::Probe;
+        let dir = tempfile::tempdir().unwrap();
+        let stem = crate::graph::names::STEM;
+        let ckpt = dir
+            .path()
+            .join(crate::graph::names::sibling(".wal.checkpoint"));
+        std::fs::write(dir.path().join(stem), b"base").unwrap();
+        std::fs::write(&ckpt, b"checkpoint").unwrap();
+        let calls = std::cell::Cell::new(0usize);
+
+        let verdict = try_recover_by_setting_wal_aside_with(dir.path(), stem, |_| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Probe::WalInTheWay
+            } else {
+                Probe::Opens
+            }
+        });
+
+        assert_eq!(verdict, WalRecovery::Recovered);
+        assert_eq!(calls.get(), 2, "the base was asked without its WAL");
+        assert!(!ckpt.exists(), "the checkpoint was set aside");
+        let evidence = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains("torn-wal"));
+        assert!(evidence, "the checkpoint is kept as evidence");
+    }
+
+    /// A checkpoint in the way while a live process holds the graph may be
+    /// that writer's checkpoint running now. Its WAL is committed work: it is
+    /// left alone, and nothing is decided.
+    #[test]
+    fn a_checkpoint_held_by_a_live_process_is_left_alone() {
+        use crate::probe::Probe;
+        let dir = tempfile::tempdir().unwrap();
+        let stem = crate::graph::names::STEM;
+        let source = dir.path().join(stem);
+        let ckpt = dir
+            .path()
+            .join(crate::graph::names::sibling(".wal.checkpoint"));
+        std::fs::write(&source, b"base").unwrap();
+        std::fs::write(&ckpt, b"checkpoint").unwrap();
+        let mut holder = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let info = crate::lockfile::LockInfo {
+            pid: holder.id(),
+            role: "writer".into(),
+            build_hash: "test".into(),
+            acquired_at: 0,
+            last_heartbeat: 0,
+            holder_started_at: 0,
+        };
+        std::fs::write(
+            crate::graph::db_lock_path(&source),
+            serde_json::to_string(&info).unwrap(),
+        )
+        .unwrap();
+        let calls = std::cell::Cell::new(0usize);
+
+        let verdict = try_recover_by_setting_wal_aside_with(dir.path(), stem, |_| {
+            calls.set(calls.get() + 1);
+            Probe::WalInTheWay
+        });
+        let _ = holder.kill();
+        let _ = holder.wait();
+
+        assert_eq!(verdict, WalRecovery::Indeterminate);
+        assert!(!verdict.permits_quarantine());
+        assert_eq!(calls.get(), 1, "the image was not asked without its WAL");
+        assert!(ckpt.exists(), "a live writer's checkpoint is left in place");
     }
 
     /// The WAL is set aside for the experiment and the answer then comes back

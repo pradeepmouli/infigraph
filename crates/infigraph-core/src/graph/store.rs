@@ -514,6 +514,52 @@ fn live_graph_writer(db_path: &Path, lock_path: &Path) -> Option<u32> {
     live_graph_writer_from(payload_holder, &holders)
 }
 
+/// PID of a live process other than this one that holds the graph at
+/// `db_path`: its lock payload names it, or it has the file open.
+///
+/// Unlike [`live_graph_writer`], a payload naming THIS process does not
+/// count: the read path stamps its own identity into the lock before it asks
+/// whether a dead writer's WAL may be set aside, and must not find itself in
+/// the way. Setting a WAL aside under a live writer would discard its
+/// committed work, so recovery asks this first.
+pub fn other_live_graph_holder(db_path: &Path) -> Option<u32> {
+    let me = std::process::id();
+    let payload_holder = live_lock_holder(&db_lock_path(db_path)).filter(|&pid| pid != me);
+    let holders: Vec<u32> = crate::ps::pids_holding_file(db_path)
+        .into_iter()
+        .chain(lbug_checkpoint_lock_holders(db_path))
+        .filter(|&pid| pid != me && crate::ps::is_infigraph_process(pid))
+        .collect();
+    live_graph_writer_from(payload_holder, &holders)
+}
+
+/// lbug's own checkpoint lock files beside the database at `db_path`. A live
+/// process holding either makes every read-only open fail with "checkpoint
+/// is in progress" (measured with lbug 0.20: an empty leftover file does
+/// not, a held lock on either does), so who has them open is what that error
+/// is about. Not infigraph's `ckpt.lock` ([`checkpoint_lock_path`]).
+pub fn lbug_checkpoint_lock_paths(db_path: &Path) -> [PathBuf; 2] {
+    let db = db_path.display();
+    [
+        PathBuf::from(format!("{db}.checkpoint.intent.lock")),
+        PathBuf::from(format!("{db}.checkpoint.apply.lock")),
+    ]
+}
+
+/// PIDs (any process, this one included) with one of
+/// [`lbug_checkpoint_lock_paths`] open. Best effort, like
+/// `ps::pids_holding_file`: empty means "none seen", never proof of none.
+pub fn lbug_checkpoint_lock_holders(db_path: &Path) -> Vec<u32> {
+    let mut pids: Vec<u32> = lbug_checkpoint_lock_paths(db_path)
+        .iter()
+        .filter(|p| p.exists())
+        .flat_map(|p| crate::ps::pids_holding_file(p))
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
 pub fn unclean_shutdown_wal_holder(db_path: &Path, lock_path: &Path) -> Option<u32> {
     if wal_family_paths(db_path).is_empty() {
         return None;
