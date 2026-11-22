@@ -33,6 +33,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 thiserror = "2"
+# The one place the graph engine's version is written. lbug is a maintained fork of Kuzu
+# (columnar embedded graph DB) published to crates.io, aliased `kuzu` to match the upstream
+# API surface used throughout. Every crate says `kuzu = { workspace = true }`, and
+# `[env] LBUG_VERSION` in .cargo/config.toml must name the same release, because lbug's
+# build script otherwise fetches whatever its prebuilt source calls "latest" and caches it
+# once (crates/infigraph-core/tests/lbug_pin.rs holds all three together).
+kuzu = { package = "lbug", version = "= 0.20.4" }
 
 # lbug (Kuzu graph DB) produces a static library that exceeds the 4 GB PE32
 # limit on Windows when compiled in debug mode (LNK1248).

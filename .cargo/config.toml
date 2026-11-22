@@ -10,6 +10,11 @@
 # here gets the scratch registry too: use the installed binary for real work.
 [env]
 INFIGRAPH_REGISTRY_REAL_HOME_REDIRECT = { value = "target/test-registry-home", relative = true }
+# lbug's build script downloads a prebuilt library. With this unset it asks for the release
+# its source calls "latest" and caches it under the key `latest`, so the library linked
+# depends on the day of the first build on a machine, not on the crate version. It must
+# equal the lbug version in [workspace.dependencies]; tests/lbug_pin.rs fails if not.
+LBUG_VERSION = "0.20.4"
 
 # usearch and lbug both vendor simsimd, causing duplicate symbol errors on Linux
 # where the linker treats them as hard errors. Allow multiple definitions so the
