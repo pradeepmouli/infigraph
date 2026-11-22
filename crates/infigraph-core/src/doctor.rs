@@ -255,7 +255,7 @@ fn check_project_registration(registry: &Registry, project_path: &Path) -> Check
 }
 
 fn check_registered_path_still_exists(entry: &RepoEntry) -> CheckResult {
-    if entry.path.exists() {
+    if !entry.is_gone() {
         CheckResult::pass(
             CATEGORY,
             format!("{}: path exists", entry.name),
@@ -1770,7 +1770,7 @@ pub fn check_worktrees(ctx: &DoctorContext) -> Vec<CheckResult> {
         results.push(CheckResult::warn(
             WORKTREE_CATEGORY,
             format!("{}: removed worktree still registered", path.display()),
-            "git no longer lists this worktree, but it has a registry entry",
+            "its directory is gone and git does not list it, but it has a registry entry",
             format!("run `infigraph worktree teardown {}`", path.display()),
         ));
     }

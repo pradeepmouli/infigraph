@@ -79,7 +79,7 @@ pub fn plan_registry_gc(registry: &Registry, stale_days: Option<u64>, now: Syste
     let mut evictions = Vec::new();
 
     for entry in registry.repos.values() {
-        if !entry.path.exists() {
+        if entry.is_gone() {
             evictions.push(GcCandidate {
                 name: entry.name.clone(),
                 path: entry.path.clone(),
@@ -214,6 +214,22 @@ mod tests {
         assert_eq!(plan.evictions.len(), 1);
         assert_eq!(plan.evictions[0].name, "gone");
         assert_eq!(plan.evictions[0].reason, GcReason::PathMissing);
+    }
+
+    /// A path that cannot be examined is not known to be missing.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_cannot_be_examined_is_not_evicted() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (project, _) = live_project(&tmp, "project");
+        let registry = registry_with(vec![entry("project", project)]);
+
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let plan = plan_registry_gc(&registry, None, SystemTime::now());
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(plan.evictions.is_empty(), "{:?}", plan.evictions);
     }
 
     #[test]

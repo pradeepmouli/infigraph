@@ -202,10 +202,9 @@ pub struct WorktreeDrift {
 /// the repo containing that path is considered; `None` sweeps every repo among the
 /// registered projects (the `--global` case).
 ///
-/// A removed worktree's registry entry can no longer self-report which repo it
-/// belonged to (`git rev-parse` can't run in a directory that no longer exists),
-/// so teardown detection can't always be strictly scope-verified for dead entries
-/// -- see the comment below for how this is handled.
+/// A teardown candidate is an entry whose directory is gone
+/// ([`crate::multi::RepoEntry::is_gone`]), whichever repo it belonged to: once
+/// the directory is gone, `git rev-parse` can no longer say.
 pub fn find_worktree_drift(registry: &Registry, repo_scope: Option<&Path>) -> WorktreeDrift {
     let mut drift = WorktreeDrift::default();
 
@@ -249,27 +248,18 @@ pub fn find_worktree_drift(registry: &Registry, repo_scope: Option<&Path>) -> Wo
         }
     }
 
-    // Teardown candidates: registered paths absent from every discovered repo's
-    // live list. When scoped, entries whose common-dir is still resolvable and
-    // does NOT match the scope are excluded; entries that are unresolvable (the
-    // common case -- the worktree is gone) can't be verified against the scope
-    // and are conservatively included, since the caller (a --path-scoped or
-    // hook-triggered call) already knows which repo it just acted on.
+    // Teardown candidates: registered directories that are gone and that no
+    // discovered repo still lists (a worktree deleted by hand stays listed
+    // until `git worktree prune`). Being absent from a list proves nothing on
+    // its own: a project outside git, one in a subdirectory of a repo, and
+    // every project when this runs outside any repo are all absent and alive.
     let all_live_canon: std::collections::HashSet<PathBuf> = live_by_common
         .values()
         .flatten()
         .map(|p| canonicalize_lenient(p))
         .collect();
-    let scope_common = repo_scope.and_then(|p| git_common_dir(p).ok());
     for entry in registry.repos.values() {
-        if let Some(ref scope) = scope_common {
-            if let Ok(entry_common) = git_common_dir(&entry.path) {
-                if &entry_common != scope {
-                    continue;
-                }
-            }
-        }
-        if !all_live_canon.contains(&canonicalize_lenient(&entry.path)) {
+        if entry.is_gone() && !all_live_canon.contains(&canonicalize_lenient(&entry.path)) {
             drift.teardown_candidates.push(entry.path.clone());
         }
     }
