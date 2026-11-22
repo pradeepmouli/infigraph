@@ -1268,6 +1268,7 @@ fn main() -> Result<()> {
     if infigraph_core::probe::run_if_probe_child() {
         return Ok(());
     }
+    infigraph_core::scip_switch::set_language_names(infigraph_languages::language_names);
 
     // A pre-edit hook runs on every Markdown edit: answer at once, with no
     // update check, no settings validation and no worker thread.

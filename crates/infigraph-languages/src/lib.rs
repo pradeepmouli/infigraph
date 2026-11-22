@@ -186,6 +186,16 @@ const PASCAL_RELATIONS: &str = include_str!("../languages/pascal/relations.scm")
 const VB6_ENTITIES: &str = include_str!("../languages/vb6/entities.scm");
 const VB6_RELATIONS: &str = include_str!("../languages/vb6/relations.scm");
 
+/// The names of every bundled language, as the extractor stores them
+/// (`Symbol.language`): what `[scip] disable` may name besides the languages a
+/// SCIP indexer serves (`infigraph_core::scip_switch::set_language_names`).
+/// Empty if the registry cannot be built.
+pub fn language_names() -> Vec<String> {
+    bundled_registry()
+        .map(|r| r.languages().map(|p| p.name.clone()).collect())
+        .unwrap_or_default()
+}
+
 /// Create a registry with all bundled language packs.
 pub fn bundled_registry() -> Result<LanguageRegistry> {
     let mut registry = LanguageRegistry::new();

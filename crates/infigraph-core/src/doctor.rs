@@ -1693,7 +1693,7 @@ fn check_one_project_scip_languages(project_path: &Path) -> Vec<CheckResult> {
             SCIP_LANGUAGES_CATEGORY,
             label,
             format!(
-                "[scip] disable names no SCIP indexer serves: {}; it disables nothing",
+                "[scip] disable names no language: {}; it disables nothing",
                 unknown.join(", ")
             ),
             format!(
@@ -1711,6 +1711,13 @@ fn check_one_project_scip_languages(project_path: &Path) -> Vec<CheckResult> {
         })
         .collect();
     let mut detail = format!("implicit enrichment skips: {}", names.join(", "));
+    let never = crate::scip_switch::never_enriched_languages(project_path);
+    if !never.is_empty() {
+        detail.push_str(&format!(
+            "; no SCIP indexer serves {}, so it is never enriched either way",
+            never.join(", ")
+        ));
+    }
     for (indexer, tags) in crate::scip::INDEXER_LANGUAGES {
         let off: Vec<&str> = tags
             .iter()
