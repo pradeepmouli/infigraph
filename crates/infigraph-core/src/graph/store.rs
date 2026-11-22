@@ -855,9 +855,6 @@ pub struct GraphStore {
     mid_write_fold_bytes: std::sync::atomic::AtomicU64,
     /// Mid-write fold attempts made (tests assert a refused one is not retried at once).
     mid_fold_attempts: std::sync::atomic::AtomicU64,
-    /// The WAL's size right after this handle's last successful fold: what "nothing
-    /// pending" weighs. Zero until one has run, so the first COPY folds.
-    wal_after_fold: std::sync::atomic::AtomicU64,
 }
 
 /// How long a fold waits for running statements to finish.
@@ -1083,7 +1080,6 @@ impl GraphStore {
             last_mid_fold_ms: std::sync::atomic::AtomicU64::new(0),
             mid_write_fold_bytes: std::sync::atomic::AtomicU64::new(MID_WRITE_FOLD_WAL_BYTES),
             mid_fold_attempts: std::sync::atomic::AtomicU64::new(0),
-            wal_after_fold: std::sync::atomic::AtomicU64::new(0),
         };
         let lock = WriteLock::acquire_with_timeout(&store.lock_path, timeout)?;
         store.init_schema(&lock)?;
@@ -1197,7 +1193,6 @@ impl GraphStore {
             last_mid_fold_ms: std::sync::atomic::AtomicU64::new(0),
             mid_write_fold_bytes: std::sync::atomic::AtomicU64::new(MID_WRITE_FOLD_WAL_BYTES),
             mid_fold_attempts: std::sync::atomic::AtomicU64::new(0),
-            wal_after_fold: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1403,11 +1398,10 @@ impl GraphStore {
             return Ok(()); // in-memory store: no WAL
         }
         let db_path = self.db_path().to_path_buf();
-        let pending = super::store_util::graph_wal_bytes(&db_path)
-            > self
-                .wal_after_fold
-                .load(std::sync::atomic::Ordering::Relaxed);
-        if !pending {
+        // Any WAL bytes at all: measured on lbug 0.20.4, the WAL is 0 bytes after a
+        // CHECKPOINT, after a COPY commit and after a failed COPY, and 314 after a one-row
+        // MERGE. Erring toward an extra fold is the safe side.
+        if super::store_util::graph_wal_bytes(&db_path) == 0 {
             return Ok(());
         }
         match self.checkpoint_now_waiting(&db_path, FoldWait::Mandatory) {
@@ -1459,6 +1453,7 @@ impl GraphStore {
             )));
         }
         // Optional folds wait for running statements only briefly, then stand down.
+        let stamps_baseline = matches!(gate_wait, FoldWait::Bounded(_));
         let _exclusive_gate = match gate_wait {
             FoldWait::Bounded(wait) => {
                 let Some(held) = self.gate.try_exclusive_for(wait) else {
@@ -1492,15 +1487,14 @@ impl GraphStore {
         // `stamp_healthy_graph_size`'s own doc asks for exactly this ("only
         // after a *verified* healthy checkpoint"); before explicit
         // checkpoints existed there was no such moment to hook.
-        if let Some(dir) = self.db_dir() {
+        // Only an optional fold stamps. The mandatory one a COPY asks for is, on a new
+        // project, the FIRST fold, run over an empty schema of a few KB: stamping it
+        // would measure the 10x ratio from there and refuse the first real index ("44x
+        // its recorded healthy size"). The stamp after the bulk write records the real
+        // size.
+        if let Some(dir) = self.db_dir().filter(|_| stamps_baseline) {
             super::store_util::stamp_healthy_graph_size_if_unset(dir, db_path);
         }
-        // What an empty WAL weighs (a header), so `fold_before_copy` can tell "rows
-        // pending" from "nothing pending" by size.
-        self.wal_after_fold.store(
-            super::store_util::graph_wal_bytes(db_path),
-            std::sync::atomic::Ordering::Relaxed,
-        );
         Ok(())
     }
 

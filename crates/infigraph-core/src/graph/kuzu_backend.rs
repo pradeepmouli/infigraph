@@ -924,4 +924,50 @@ mod copy_refusal_tests {
             "the incoming edge was lost"
         );
     }
+
+    /// A brand-new project's first fold is the one the first COPY asks for, on a schema
+    /// of a few KB. If that fold stamped the growth baseline, the 10x ratio would be
+    /// measured from the empty schema and the first real index would be refused as "44x
+    /// its recorded healthy size". Only a fold that is not a COPY's preflight may stamp;
+    /// the stamp after the bulk write records the real size.
+    #[test]
+    fn the_first_copy_fold_of_a_new_project_does_not_anchor_the_growth_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let ig = dir.path().join(".infigraph");
+        std::fs::create_dir_all(&ig).unwrap();
+        // Floor off, so the ratio bites at test size, as it does on a real project
+        // past the 128 MiB floor.
+        std::fs::write(ig.join("config.toml"), "[graph]\ngrowth_min_bytes = 0\n").unwrap();
+        let backend = KuzuBackend::open(&ig.join(crate::graph::names::STEM)).unwrap();
+        backend
+            .inner()
+            .connection()
+            .unwrap()
+            .query("CREATE (:Symbol {id: 'x', name: 'x', kind: 'Function', file: 'x.py'})")
+            .unwrap(); // a pending WAL, so the fold has work
+
+        backend.inner().fold_before_copy().unwrap();
+        assert!(
+            !crate::graph::store_util::healthy_baseline_recorded(&ig),
+            "a COPY's preflight fold stamped the empty schema as the healthy size"
+        );
+
+        let files: Vec<FileExtraction> = (0..400)
+            .map(|i| extraction(&format!("pkg{}/m{i}.py", i % 10), None))
+            .collect();
+        backend
+            .upsert_files_bulk(&files, true)
+            .expect("the first bulk write of a new project must not be refused");
+        let stamped = std::fs::read_to_string(ig.join(crate::graph::names::HEALTH))
+            .expect("the bulk write records the baseline");
+        let v: serde_json::Value = serde_json::from_str(&stamped).unwrap();
+        let recorded = v["healthy_size_bytes"].as_u64().unwrap();
+        let real = std::fs::metadata(ig.join(crate::graph::names::STEM))
+            .unwrap()
+            .len();
+        assert!(
+            recorded * 2 > real,
+            "the baseline ({recorded}) is far below the graph's real size ({real})"
+        );
+    }
 }
