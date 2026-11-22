@@ -710,6 +710,38 @@ mod tests {
         assert_eq!(edges.next().unwrap()[0].to_string(), "3");
     }
 
+    /// lbug #1524/#1650: a node COPY that fails or rolls back while the table holds rows
+    /// not yet checkpointed loses keys, leaves rolled-back rows behind and corrupts the
+    /// heap. `upsert_folders_bulk_conn` fails a `COPY Folder` on purpose on every
+    /// incremental pass (the folders exist) and falls back to UNWIND MERGE, which leaves
+    /// new Folder rows in the WAL: the NEXT pass's failing COPY then runs over rows that
+    /// are not checkpointed. Three passes, each adding a directory, no fold between.
+    #[test]
+    fn a_failed_folder_copy_over_unfolded_rows_loses_and_leaves_nothing() {
+        let (_dir, store) = store();
+        store.upsert_folders_bulk(&["d1/f.rs"]).unwrap(); // COPY succeeds (table empty), commit folds
+        store.upsert_folders_bulk(&["d1/f.rs", "d2/f.rs"]).unwrap(); // COPY fails; MERGE adds d2 (unfolded)
+        store
+            .upsert_folders_bulk(&["d1/f.rs", "d2/f.rs", "d3/f.rs"])
+            .unwrap(); // COPY fails over the unfolded d2
+        let conn = store.connection().unwrap();
+        for id in ["d1", "d2", "d3"] {
+            let mut r = conn
+                .query(&format!("MATCH (f:Folder {{id: '{id}'}}) RETURN count(f)"))
+                .unwrap();
+            assert_eq!(
+                r.next().unwrap()[0].to_string(),
+                "1",
+                "Folder {id} lost or duplicated"
+            );
+        }
+        let mut all = conn
+            .query("MATCH (f:Folder) RETURN f.id ORDER BY f.id")
+            .unwrap();
+        let ids: Vec<String> = all.by_ref().map(|row| row[0].to_string()).collect();
+        assert_eq!(ids, ["d1", "d2", "d3"], "rows left behind or missing");
+    }
+
     /// The commit error of a COPY whose forced fold fails is lbug's, passed through
     /// untouched, so the callers that classify it by text still can.
     #[test]

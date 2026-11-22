@@ -103,12 +103,22 @@ impl GraphStore {
         // re-checked growth between them.
         let mut gate = self.growth_gate(1);
         gate.tick()?;
-        let copy_ok = conn
-            .query(&format!(
-                "COPY Folder FROM '{}'",
-                fwd_slash_path(&folder_pq)
-            ))
-            .is_ok();
+        // COPY only into an EMPTY Folder table (a fresh or full index). Once folders
+        // exist, a COPY of paths that include them fails by design, and a node COPY that
+        // fails while the table holds rows not yet checkpointed loses keys and leaves
+        // rolled-back rows behind (lbug #1524/#1650, heap corruption): the incremental
+        // path is the MERGE one, never a COPY that is expected to fail.
+        let folders_exist = conn
+            .query("MATCH (f:Folder) RETURN f.id LIMIT 1")
+            .map(|mut r| r.next().is_some())
+            .unwrap_or(true);
+        let copy_ok = !folders_exist
+            && conn
+                .query(&format!(
+                    "COPY Folder FROM '{}'",
+                    fwd_slash_path(&folder_pq)
+                ))
+                .is_ok();
 
         if copy_ok {
             // Write edge parquet files and COPY FROM

@@ -1379,8 +1379,7 @@ impl GraphStore {
         // Optional folds wait for running statements only briefly, then stand down.
         let Some(_exclusive_gate) = self.gate.try_exclusive_for(gate_wait) else {
             return Err(FoldError::Busy(anyhow::anyhow!(
-                "statements were still running on this graph after {}s",
-                gate_wait.as_secs()
+                "statements were still running on this graph after {gate_wait:?}"
             )));
         };
         // Authoritative: with the gate held no statement can start, so a
