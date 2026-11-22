@@ -1,3 +1,4 @@
+use crate::graph::gated::GatedConnection;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -107,7 +108,7 @@ type SymbolEdges = HashMap<String, std::collections::HashSet<String>>;
 /// query failure propagates rather than reading as "no edges" -- that would
 /// duplicate every edge, and for CALLS also make every SCIP resolution look
 /// like a correction to learn.
-fn preload_symbol_edges(conn: &kuzu::Connection<'_>, table: &str) -> Result<SymbolEdges> {
+fn preload_symbol_edges(conn: &GatedConnection<'_>, table: &str) -> Result<SymbolEdges> {
     let rows = conn
         .query(&format!(
             "MATCH (a:Symbol)-[:{table}]->(b:Symbol) RETURN a.id, b.id"

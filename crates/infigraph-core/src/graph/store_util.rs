@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use super::gated::GatedConnection;
 use anyhow::Result;
-use kuzu::Connection;
 
 use crate::graph::parquet_loader;
 use crate::graph::store::GraphStore;
@@ -602,7 +602,7 @@ pub(crate) fn resolve_import_candidate<'a>(
 /// 130k-symbol graph (500 pairs x |A| x |B| per chunk).
 pub(crate) fn unwind_edges_from_pairs(
     store: &GraphStore,
-    conn: &Connection,
+    conn: &GatedConnection,
     pairs: &[(&str, &str)],
     rel_type: &str,
     src_label: &str,
@@ -619,7 +619,7 @@ pub(crate) fn unwind_edges_from_pairs(
     // exactly the graph that must not be handed thousands more writes: it
     // grew to 39 GB, 643x its 65 MB baseline, and was quarantined and
     // dropped whole (41 GB) twice in two days. The gate could not be added
-    // by accident, either -- this took only a `&Connection`, so it had no
+    // by accident, either -- this took only a `&GatedConnection`, so it had no
     // way to reach the store the check needs.
     let mut gate = store.growth_gate(1);
     let mut failed = 0usize;
@@ -673,7 +673,7 @@ const MISSING_PK_MARKER: &str = "Unable to find primary key value ";
 ///
 /// One scan of the id column. Only ever called after a COPY has already
 /// failed with a missing endpoint, so the happy path never pays for it.
-fn existing_ids(conn: &Connection, label: &str) -> Result<HashSet<String>> {
+fn existing_ids(conn: &GatedConnection, label: &str) -> Result<HashSet<String>> {
     let result = conn
         .query(&format!("MATCH (n:{label}) RETURN n.id"))
         .map_err(|e| anyhow::anyhow!("failed to read {label} ids: {e}"))?;
@@ -943,7 +943,7 @@ const PAIRS_PER_WRITE: usize = 2000;
 /// chunks. Every per-file and bulk writer of a keyless table calls this rather
 /// than writing its own pair list.
 pub(crate) fn write_absent_edges<S: AsRef<str>, D: AsRef<str>>(
-    conn: &Connection<'_>,
+    conn: &GatedConnection<'_>,
     src_label: &str,
     dst_label: &str,
     rel: &str,
@@ -982,7 +982,7 @@ pub(crate) struct IncomingEdges {
 }
 
 impl IncomingEdges {
-    pub(crate) fn capture(conn: &Connection<'_>, files: &[&str]) -> Result<Self> {
+    pub(crate) fn capture(conn: &GatedConnection<'_>, files: &[&str]) -> Result<Self> {
         if files.is_empty() {
             return Ok(Self::default());
         }
@@ -1015,7 +1015,7 @@ impl IncomingEdges {
 
     /// Writes the captured edges back. Call after the replaced symbols exist
     /// again, in the same transaction as their delete.
-    pub(crate) fn restore(self, conn: &Connection<'_>) -> Result<()> {
+    pub(crate) fn restore(self, conn: &GatedConnection<'_>) -> Result<()> {
         for (table, pairs) in self.saved {
             write_absent_edges(conn, "Symbol", "Symbol", table, &pairs)?;
         }
@@ -1036,7 +1036,7 @@ const EXISTING_SOURCES_PER_QUERY: usize = 1000;
 /// up only the batch's own sources, in chunks, so its cost follows the batch,
 /// not the size of the table.
 pub(crate) fn absent_edges(
-    conn: &Connection<'_>,
+    conn: &GatedConnection<'_>,
     table: &str,
     src_label: &str,
     dst_label: &str,

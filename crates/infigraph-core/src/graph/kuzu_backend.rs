@@ -1,3 +1,4 @@
+use super::gated::GatedConnection;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -777,7 +778,7 @@ impl KuzuBackend {
     /// Delete all graph data for the given files. Caller manages the transaction.
     fn delete_files_data(
         &self,
-        conn: &kuzu::Connection<'_>,
+        conn: &GatedConnection<'_>,
         extractions: &[FileExtraction],
     ) -> Result<()> {
         let file_list: Vec<String> = extractions

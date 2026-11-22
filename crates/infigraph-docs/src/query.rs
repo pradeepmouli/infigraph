@@ -29,7 +29,7 @@ impl<'a, 'db> DocQuery<infigraph_core::graph::query_exec::LocalExec<'a, 'db>> {
     /// Build over a local `docs.kuzu` connection.
     pub fn new(conn: &'a kuzu::Connection<'db>) -> Self {
         Self {
-            exec: infigraph_core::graph::query_exec::LocalExec::new(conn),
+            exec: infigraph_core::graph::query_exec::LocalExec::for_docs(conn),
         }
     }
 }

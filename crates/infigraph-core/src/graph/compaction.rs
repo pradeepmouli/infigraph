@@ -7,10 +7,10 @@
 
 use std::path::Path;
 
+#[cfg(test)]
+use super::gated::GatedConnection;
 use super::query_exec::{LocalExec, QueryExec};
 use super::GraphStore;
-#[cfg(test)]
-use kuzu::Connection;
 
 /// Tables whose page accounting is tracked. Node tables, every one, so a
 /// plain `MATCH (n:Label)` row count is valid for each.
@@ -55,7 +55,7 @@ pub struct TableStats {
 /// and "the engine reshaped its output" are different diagnoses. Callers that
 /// only need a yes/no -- the policy path below -- discard it with `.ok()`.
 #[cfg(test)]
-pub(crate) fn scalar_u64(conn: &Connection<'_>, cypher: &str) -> Result<u64, String> {
+pub(crate) fn scalar_u64(conn: &GatedConnection<'_>, cypher: &str) -> Result<u64, String> {
     scalar_u64_via(&LocalExec::new(conn), cypher)
 }
 

@@ -1,5 +1,5 @@
+use super::gated::GatedConnection;
 use anyhow::Result;
-use kuzu::Connection;
 use serde::Serialize;
 
 use super::test_templates::{test_templates_for, TestTemplate};
@@ -19,7 +19,7 @@ impl<'a, 'db> GraphQuery<crate::graph::query_exec::LocalExec<'a, 'db>> {
     /// Build over a local Kuzu connection. Unchanged signature: every
     /// existing call site keeps working, which is why the executor is owned
     /// and generic rather than a borrowed trait object.
-    pub fn new(conn: &'a Connection<'db>) -> Self {
+    pub fn new(conn: &'a GatedConnection<'db>) -> Self {
         Self {
             exec: crate::graph::query_exec::LocalExec::new(conn),
         }
@@ -1053,7 +1053,7 @@ impl<E: crate::graph::query_exec::QueryExec> GraphQuery<E> {
 /// A free function taking a connection, not a `GraphQuery` method: this is
 /// the only write that ever lived on that type, and `GraphQuery` now runs on
 /// a read-only executor that would refuse it.
-pub fn derive_tested_by_edges(conn: &Connection) -> Result<usize> {
+pub fn derive_tested_by_edges(conn: &GatedConnection) -> Result<usize> {
     let _ = conn.query("MATCH (s:Symbol)-[r:TESTED_BY]->(t:Symbol) DELETE r");
     conn.query(
         "MATCH (t:Symbol)-[:CALLS]->(s:Symbol) \

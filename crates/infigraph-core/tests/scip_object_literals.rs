@@ -133,7 +133,7 @@ struct Snapshot {
     monikers: Vec<String>,
 }
 
-fn snapshot(conn: &kuzu::Connection<'_>) -> Snapshot {
+fn snapshot(conn: &infigraph_core::graph::gated::GatedConnection<'_>) -> Snapshot {
     let strip = |v: &kuzu::Value| v.to_string().trim_matches('"').to_string();
     let rows = |q: &str, sep: &str| -> Vec<String> {
         conn.query(q)
