@@ -120,9 +120,9 @@ pub enum WalRecovery {
     /// outside, ran out of time, failed without a verdict on the image
     /// (see [`crate::probe::Probe`]), or the experiment could not be staged
     /// (a rename refused: nothing was asked of the image). Every WAL
-    /// moved for the experiment is back where it was, except one whose put-back
-    /// rename itself failed: that one stays filed as `torn-wal` evidence and is
-    /// logged by path. The caller MUST NOT
+    /// moved for the experiment is back where it was; if a put-back rename itself
+    /// fails the answer is Indeterminate too (the file stays filed as `torn-wal`
+    /// evidence, logged by path), so nothing quarantines with a WAL out of place. The caller MUST NOT
     /// quarantine and MUST NOT count this as a recovery attempt: it should
     /// report the open as transiently refused and try again later.
     Indeterminate,
@@ -246,6 +246,7 @@ pub fn try_recover_by_setting_wal_aside_with(
             // about the image (permissions or a full disk say nothing about it),
             // so this is no verdict: NotRecoverable would permit a quarantine of a
             // graph that was never examined.
+            // (Indeterminate whether or not every file went back; any that did not is logged.)
             put_back(&moved);
             return WalRecovery::Indeterminate;
         }
@@ -269,7 +270,12 @@ pub fn try_recover_by_setting_wal_aside_with(
     // Not recovered. Put the WAL back first, whatever the answer: a quarantine
     // that follows keeps the complete picture, and an undecided answer must
     // leave the graph exactly as it was found.
-    put_back(&moved);
+    // A WAL that cannot be put back is not "back where it was": whatever the probe said,
+    // a quarantine now would file the graph without its WAL and leave that WAL behind
+    // under another name, so this is no verdict.
+    if !put_back(&moved).is_empty() {
+        return WalRecovery::Indeterminate;
+    }
     match verdict {
         // With the WAL family set aside, a checkpoint still in the way is
         // nothing this step can explain: no verdict.
@@ -1215,5 +1221,39 @@ mod tests {
             "the restorable one is restored"
         );
         assert!(b_to.exists(), "the stuck one stays where it was filed");
+    }
+
+    /// The probe leaves a directory where the WAL belongs while the WAL is filed away, so the
+    /// put-back rename fails; the probe itself says DoesNotOpen, which alone would permit a
+    /// quarantine. With the WAL not where it was, the answer must be no verdict.
+    #[test]
+    fn a_wal_that_cannot_be_put_back_never_permits_quarantine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let graph = dir.join(crate::graph::names::STEM);
+        std::fs::write(&graph, b"image").unwrap();
+        let wal = dir.join(format!("{}.wal", crate::graph::names::STEM));
+        std::fs::write(&wal, b"wal").unwrap();
+        let calls = std::cell::Cell::new(0u32);
+
+        let got = try_recover_by_setting_wal_aside_with(dir, crate::graph::names::STEM, |_| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                std::fs::create_dir(&wal).unwrap();
+            }
+            crate::probe::Probe::DoesNotOpen
+        });
+
+        assert_eq!(calls.get(), 2);
+        assert_eq!(got, WalRecovery::Indeterminate);
+        assert!(!got.permits_quarantine());
+        let filed: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("torn-wal"))
+            .collect();
+        assert_eq!(filed.len(), 1, "the WAL stays filed as evidence: {filed:?}");
+        assert_eq!(std::fs::read(dir.join(&filed[0])).unwrap(), b"wal");
     }
 }
