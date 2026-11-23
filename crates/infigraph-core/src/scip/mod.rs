@@ -840,6 +840,9 @@ fn import_scip_index_unrecorded(
     // it was, silently collapsing every enriched symbol's displayed source
     // to ~1 line).
     let mut enrichments: Vec<(String, String, String)> = Vec::new();
+    // Where each row's entry sits in `enrichments`: one entry per row, the LAST moniker the
+    // pass gives it (a merged declaration has two monikers and one row).
+    let mut enrichment_slot: HashMap<String, usize> = HashMap::new();
     let mut new_symbols: Vec<NewSymbolRow> = Vec::new();
 
     // SCIP moniker -> resolved tree-sitter Symbol.id, built as each definition
@@ -1060,11 +1063,19 @@ fn import_scip_index_unrecorded(
 
             if let Some((matched_start, sid)) = matched {
                 enriched_in_pass.insert((sid.clone(), matched_start), scip_sym.clone());
-                if existing.get(&sid).map(|e| e.enrichment)
-                    != Some(enrichment_hash(&docstring, scip_sym))
-                {
-                    enrichments.push((sid.clone(), docstring.to_string(), scip_sym.clone()));
-                    stats.symbols_enriched += 1;
+                // Not compared with the row's stored value here: each of a merged
+                // declaration's monikers was compared on its own, so the one equal to
+                // the stored value was skipped and the other written, and a replay
+                // wrote the opposite one (954 rows flipped `Name/` and `Name#` on every
+                // import). The last one wins, as it always has on a fresh import, and
+                // that one result is compared once, after the loop.
+                let entry = (sid.clone(), docstring.to_string(), scip_sym.clone());
+                match enrichment_slot.get(&sid) {
+                    Some(&at) => enrichments[at] = entry,
+                    None => {
+                        enrichment_slot.insert(sid.clone(), enrichments.len());
+                        enrichments.push(entry);
+                    }
                 }
                 scip_sym_to_ts_id.insert(metadata::symbol_key(file, scip_sym), sid);
             } else {
@@ -1164,6 +1175,13 @@ fn import_scip_index_unrecorded(
             }
         }
     }
+
+    // A row whose stored docstring and scip_id already equal what the pass last gave it is
+    // left alone (#178): an unchanged index rewrites nothing.
+    enrichments.retain(|(id, doc, scip_id)| {
+        existing.get(id).map(|e| e.enrichment) != Some(enrichment_hash(doc, scip_id))
+    });
+    stats.symbols_enriched += enrichments.len();
 
     clock.lap("pass 1 collect");
 
@@ -4345,6 +4363,86 @@ mod tests {
             twin_callers_graph(("named", "variable"), ("136#1", "variable")),
             want
         );
+    }
+
+    /// A merged declaration (an interface or class and a namespace of one name) has two
+    /// monikers, `Name#` and `Name/`, and one graph row. Each moniker used to be compared on
+    /// its own with the row's value from BEFORE the import, so with the row holding one of
+    /// them only the OTHER was pushed, and every replay wrote the opposite moniker: 954 rows
+    /// on one real graph flipped `Name/` and `Name#` on every import, forever.
+    #[test]
+    fn a_merged_declaration_keeps_one_scip_id_across_replays() {
+        let env = TestEnv::new();
+        env.add_file("test.ts");
+        {
+            let conn = env.store.connection().unwrap();
+            conn.query(
+                "CREATE (:Symbol {id: 'test.ts::Name', name: 'Name', kind: 'class', \
+                 file: 'test.ts', start_line: 1, end_line: 10, signature_hash: '', \
+                 language: 'typescript', visibility: 'public', parent: '', docstring: '', \
+                 complexity: 0, parameters: '', return_type: '', scip_id: ''})",
+            )
+            .unwrap();
+        }
+        let as_type = "scip-test npm test 1.0.0 `test.ts`/Name#".to_string();
+        let as_namespace = "scip-test npm test 1.0.0 `test.ts`/Name/".to_string();
+        let doc = Document {
+            relative_path: "test.ts".to_string(),
+            occurrences: vec![
+                Occurrence {
+                    symbol: as_type.clone(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..ranged(RangeForm::Legacy, 1, 6, 10)
+                },
+                Occurrence {
+                    symbol: as_namespace.clone(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..ranged(RangeForm::Legacy, 6, 10, 14)
+                },
+            ],
+            symbols: vec![
+                SymbolInformation {
+                    symbol: as_type,
+                    ..Default::default()
+                },
+                SymbolInformation {
+                    symbol: as_namespace.clone(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let index = Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let path = env._dir.path().join("index.scip");
+        std::fs::write(&path, index.write_to_bytes().unwrap()).unwrap();
+        let scip_id = |env: &TestEnv| -> String {
+            let conn = env.store.connection().unwrap();
+            let mut r = conn
+                .query("MATCH (s:Symbol {id: 'test.ts::Name'}) RETURN s.scip_id")
+                .unwrap();
+            raw_string(&r.next().unwrap()[0]).to_string()
+        };
+
+        let first = import_scip_index(&path, &env.store, None).unwrap();
+        let after_first = scip_id(&env);
+        assert_eq!(
+            first.symbols_enriched, 1,
+            "one row, enriched once: {first:?}"
+        );
+        for replay in 1..=3 {
+            let stats = import_scip_index(&path, &env.store, None).unwrap();
+            assert_eq!(
+                scip_id(&env),
+                after_first,
+                "replay {replay} changed the scip_id"
+            );
+            assert_eq!(stats.symbols_enriched, 0, "replay {replay} rewrote the row");
+        }
+        // what a fresh import has always stored: the last moniker the pass gave the row
+        assert_eq!(after_first, as_namespace);
     }
 
     /// Two same-named symbols of one span rank equally for a definition that names neither
