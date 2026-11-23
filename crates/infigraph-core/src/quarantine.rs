@@ -120,7 +120,9 @@ pub enum WalRecovery {
     /// outside, ran out of time, failed without a verdict on the image
     /// (see [`crate::probe::Probe`]), or the experiment could not be staged
     /// (a rename refused: nothing was asked of the image). Every WAL
-    /// moved for the experiment is back where it was. The caller MUST NOT
+    /// moved for the experiment is back where it was, except one whose put-back
+    /// rename itself failed: that one stays filed as `torn-wal` evidence and is
+    /// logged by path. The caller MUST NOT
     /// quarantine and MUST NOT count this as a recovery attempt: it should
     /// report the open as transiently refused and try again later.
     Indeterminate,
@@ -138,6 +140,25 @@ impl WalRecovery {
     pub fn is_usable(self) -> bool {
         matches!(self, Self::AlreadyHealthy | Self::Recovered)
     }
+}
+
+/// Return every file moved for the experiment (`(original, filed)` pairs) to where it was,
+/// last moved first. A rename that fails leaves that file filed as evidence under its
+/// `torn-wal` name, so it is logged by path rather than ignored, and returned: the caller's
+/// "everything is back" is then known to be false for exactly those files.
+fn put_back(moved: &[(PathBuf, PathBuf)]) -> Vec<PathBuf> {
+    let mut stuck = Vec::new();
+    for (from, to) in moved.iter().rev() {
+        if let Err(e) = std::fs::rename(to, from) {
+            eprintln!(
+                "[graph] could not put {} back at {}: {e}; it stays filed under the first name",
+                to.display(),
+                from.display()
+            );
+            stuck.push(from.clone());
+        }
+    }
+    stuck
 }
 
 /// [`try_recover_by_setting_wal_aside`] with the probe injected, so tests can
@@ -225,9 +246,7 @@ pub fn try_recover_by_setting_wal_aside_with(
             // about the image (permissions or a full disk say nothing about it),
             // so this is no verdict: NotRecoverable would permit a quarantine of a
             // graph that was never examined.
-            for (from, to) in moved.iter().rev() {
-                let _ = std::fs::rename(to, from);
-            }
+            put_back(&moved);
             return WalRecovery::Indeterminate;
         }
         moved.push((path.clone(), dest));
@@ -250,9 +269,7 @@ pub fn try_recover_by_setting_wal_aside_with(
     // Not recovered. Put the WAL back first, whatever the answer: a quarantine
     // that follows keeps the complete picture, and an undecided answer must
     // leave the graph exactly as it was found.
-    for (from, to) in moved.iter().rev() {
-        let _ = std::fs::rename(to, from);
-    }
+    put_back(&moved);
     match verdict {
         // With the WAL family set aside, a checkpoint still in the way is
         // nothing this step can explain: no verdict.
@@ -1172,5 +1189,31 @@ mod tests {
         assert!(!got.permits_quarantine());
         assert_eq!(std::fs::read(&wal).unwrap(), b"wal");
         assert_eq!(std::fs::read(&graph).unwrap(), b"image");
+    }
+
+    /// A put-back that cannot rename must say which file stays filed, not drop the error.
+    #[test]
+    fn put_back_reports_the_file_it_could_not_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a_from, a_to) = (tmp.path().join("a.wal"), tmp.path().join("a.filed"));
+        let (b_from, b_to) = (tmp.path().join("b.wal"), tmp.path().join("b.filed"));
+        std::fs::write(&a_to, b"a").unwrap();
+        std::fs::write(&b_to, b"b").unwrap();
+        // A directory sits where b belongs: renaming a file onto it fails.
+        std::fs::create_dir(&b_from).unwrap();
+        std::fs::write(b_from.join("occupant"), b"x").unwrap();
+
+        let stuck = put_back(&[
+            (a_from.clone(), a_to.clone()),
+            (b_from.clone(), b_to.clone()),
+        ]);
+
+        assert_eq!(stuck, vec![b_from]);
+        assert_eq!(
+            std::fs::read(&a_from).unwrap(),
+            b"a",
+            "the restorable one is restored"
+        );
+        assert!(b_to.exists(), "the stuck one stays where it was filed");
     }
 }
