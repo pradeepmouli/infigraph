@@ -22,7 +22,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -477,8 +477,10 @@ pub struct Server {
     pub _tmp: tempfile::TempDir,
     pub instances: PathBuf,
     pub child: Child,
-    pub stdin: ChildStdin,
+    pub stdin: Option<ChildStdin>,
     pub replies: Receiver<Value>,
+    /// The read end of the server's stderr, when the test asked for a pipe (`start_supervisor_piped_stderr`).
+    pub stderr: Option<ChildStderr>,
 }
 
 impl Drop for Server {
@@ -500,6 +502,20 @@ pub fn start_supervisor_with(
     args: &[&str],
     extra_env: &[(&str, &str)],
 ) -> Server {
+    spawn_supervisor(program, args, extra_env, Stdio::null())
+}
+
+/// [`start_supervisor`] with the server's stderr a pipe the test holds (`Server::stderr`).
+pub fn start_supervisor_piped_stderr(extra_env: &[(&str, &str)]) -> Server {
+    spawn_supervisor(None, &["--mcp"], extra_env, Stdio::piped())
+}
+
+fn spawn_supervisor(
+    program: Option<&Path>,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+    stderr: Stdio,
+) -> Server {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let startup = root.join("startup");
@@ -516,13 +532,14 @@ pub fn start_supervisor_with(
         .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(stderr);
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
     let mut child = cmd.spawn().expect("spawn infigraph-mcp supervisor");
     let stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take();
     let (tx, replies) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
@@ -538,8 +555,9 @@ pub fn start_supervisor_with(
         _tmp: tmp,
         instances,
         child,
-        stdin,
+        stdin: Some(stdin),
         replies,
+        stderr,
     }
 }
 
@@ -556,8 +574,14 @@ impl Server {
     }
 
     pub fn send(&mut self, msg: Value) {
-        writeln!(self.stdin, "{msg}").unwrap();
-        self.stdin.flush().unwrap();
+        let stdin = self.stdin.as_mut().expect("stdin was closed");
+        writeln!(stdin, "{msg}").unwrap();
+        stdin.flush().unwrap();
+    }
+
+    /// Close the server's stdin: the end of the MCP session.
+    pub fn close_stdin(&mut self) {
+        self.stdin = None;
     }
 
     /// The reply to `id`, within `budget`.

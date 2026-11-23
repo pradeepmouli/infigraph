@@ -12,6 +12,12 @@ fn main() -> Result<()> {
     if infigraph_core::probe::run_if_probe_child() {
         return Ok(());
     }
+    // Before any thread starts, in the supervisor and in the worker alike: every plain `eprintln!` below
+    // this line (and in every crate) writes to a pipe this process owns, never to a client's pipe that may
+    // be closed (`eprintln!` panics on a failed write).
+    if let Err(why) = infigraph_core::proclog::shield_stderr() {
+        mcp_log("WARN", &format!("stderr shield not installed: {why}"));
+    }
     infigraph_core::scip_switch::set_language_names(infigraph_languages::language_names);
 
     let args: Vec<String> = std::env::args().collect();
