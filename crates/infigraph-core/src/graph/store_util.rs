@@ -514,6 +514,10 @@ pub(crate) fn escape(s: &str) -> String {
 /// not the original, when asking whether a write would change a stored value
 /// (#178) -- a multi-line docstring never equals its stored form.
 pub(crate) fn literal_round_trip(s: &str) -> String {
+    // Most ids and names hold none of the three: one scan and a copy, not three replaces.
+    if !s.contains(['\n', '\r', '\t']) {
+        return s.to_owned();
+    }
     s.replace('\n', " ").replace('\r', "").replace('\t', " ")
 }
 
@@ -1125,7 +1129,9 @@ fn existing_edges_unwind(
 /// Every writer of a keyless edge table (CALLS, INHERITS, ...) comes through
 /// here, because such a table has no uniqueness: a COPY or CREATE appends
 /// whatever it is handed, and an edge written twice stays twice. The check
-/// covers the edges already in the graph and repeats inside `pairs`. It looks
+/// covers the edges already in the graph and repeats inside `pairs`; a pair is judged in
+/// the form a writer stores (see [`literal_round_trip`]), and the graph's own edges are
+/// compared as they are read, not folded (see the comment in the body). It looks
 /// up only the batch's own sources, in chunks, so its cost follows the batch,
 /// not the size of the table.
 pub(crate) fn absent_edges(
@@ -1148,10 +1154,26 @@ pub(crate) fn absent_edges(
     for chunk in sources.chunks(EXISTING_SOURCES_PER_QUERY) {
         present.extend(existing_edges_of(conn, table, src_label, dst_label, chunk)?);
     }
-    let mut seen = present;
+    // `escape` folds control whitespace to a space when an id is written, so the pair a writer
+    // stores is the folded one: `line\nbreak` and `line break` are one edge, the one the graph
+    // holds or the one about to be written. `present` is NOT folded, because the graph has no
+    // single stored form: the bulk COPY path stores an id as spelled, so `d\ne` and `d e` can
+    // be two nodes, and folding the stored side would hide the edge to one behind the edge to
+    // the other. A pair is therefore dropped when it is in `present` as spelled, or when its
+    // folded form is, or when its folded form is already queued. The lookup folds the batch's
+    // SOURCES (the literal does), so an edge whose source was stored unfolded is never found;
+    // a target comes back as stored, so a raw one matches. The pairs handed back keep the
+    // spelling they came in with.
+    let mut queued: HashSet<(String, String)> = HashSet::new();
     Ok(pairs
         .into_iter()
-        .filter(|pair| seen.insert(pair.clone()))
+        .filter(|pair| {
+            if present.contains(pair) {
+                return false;
+            }
+            let stored = (literal_round_trip(&pair.0), literal_round_trip(&pair.1));
+            !present.contains(&stored) && queued.insert(stored)
+        })
         .collect())
 }
 
@@ -1650,6 +1672,183 @@ mod tests {
         assert!(
             fresh.is_empty(),
             "every edge exists, so none is absent: {fresh:?}"
+        );
+    }
+
+    /// `escape` folds control whitespace to a space, so an id with a newline or tab is STORED
+    /// as its folded form. `absent_edges` must judge a pair in that stored form: an edge
+    /// written once for `line\nbreak` is the edge for `line break`, and asking again with
+    /// either spelling must not offer it a second time (a keyless edge table would keep both).
+    #[test]
+    fn a_pair_with_a_newline_or_tab_is_compared_in_its_stored_form() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            super::super::GraphStore::open(&tmp.path().join(crate::graph::names::STEM)).unwrap();
+        {
+            let conn = store.connection().unwrap();
+            for id in ["line break", "a b tab", "plain"] {
+                conn.query(&format!(
+                    "CREATE (s:Symbol {{id: '{id}', name: 'n', kind: 'Function', file: 'a.py'}})"
+                ))
+                .unwrap();
+            }
+        }
+        let conn = store.connection().unwrap();
+        // written once, named with the raw characters
+        super::write_absent_edges(
+            &conn,
+            "Symbol",
+            "Symbol",
+            "CALLS",
+            &[("line\nbreak", "a b\ttab")],
+        )
+        .unwrap();
+        assert_eq!(calls_edge_count(&store), 1);
+
+        let again: Vec<(String, String)> = vec![
+            ("line\nbreak".into(), "a b\ttab".into()),
+            ("line break".into(), "a b tab".into()),
+            ("line\nbreak".into(), "plain".into()),
+            ("line break".into(), "plain".into()),
+        ];
+        let fresh = super::absent_edges(&conn, "CALLS", "Symbol", "Symbol", again).unwrap();
+        assert_eq!(
+            fresh,
+            vec![("line\nbreak".to_string(), "plain".to_string())],
+            "the written edge is present in either spelling, and the two spellings of the new \
+             one are one edge"
+        );
+
+        // and through the real writer: both spellings of the new edge, offered together,
+        // leave exactly one new row, and offering all four again adds nothing
+        let all = [
+            ("line\nbreak", "a b\ttab"),
+            ("line break", "a b tab"),
+            ("line\nbreak", "plain"),
+            ("line break", "plain"),
+        ];
+        super::write_absent_edges(&conn, "Symbol", "Symbol", "CALLS", &all).unwrap();
+        assert_eq!(
+            calls_edge_count(&store),
+            2,
+            "one written edge and one new edge"
+        );
+        super::write_absent_edges(&conn, "Symbol", "Symbol", "CALLS", &all).unwrap();
+        assert_eq!(calls_edge_count(&store), 2, "a replay writes nothing");
+    }
+
+    /// A graph whose nodes came through the bulk COPY path, which stores an id exactly as it
+    /// is spelled (`upsert_all_parquet_conn` does not fold), with one CALLS edge per
+    /// `(source, target)` of `calls`. Every listed id is a Function of `a.py`.
+    fn bulk_graph(
+        ids: &[&str],
+        calls: &[(&str, &str)],
+    ) -> (tempfile::TempDir, super::super::GraphStore) {
+        use crate::model::{FileExtraction, Relation, RelationKind, Span, Symbol, SymbolKind};
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            super::super::GraphStore::open(&tmp.path().join(crate::graph::names::STEM)).unwrap();
+        let symbol = |id: &str| Symbol {
+            scip_id: None,
+            id: id.to_string(),
+            name: "n".to_string(),
+            kind: SymbolKind::Function,
+            span: Span {
+                file: "a.py".to_string(),
+                start_line: 1,
+                start_col: 0,
+                end_line: 2,
+                end_col: 0,
+            },
+            signature_hash: format!("hash_{id}"),
+            parent: None,
+            language: "python".to_string(),
+            visibility: None,
+            docstring: None,
+            complexity: 1,
+            parameters: None,
+            return_type: None,
+        };
+        store
+            .upsert_all_parquet(&[FileExtraction {
+                file: "a.py".to_string(),
+                language: "python".to_string(),
+                content_hash: "h".to_string(),
+                symbols: ids.iter().map(|id| symbol(id)).collect(),
+                relations: calls
+                    .iter()
+                    .map(|(src, dst)| Relation {
+                        source_id: src.to_string(),
+                        target_id: dst.to_string(),
+                        kind: RelationKind::Calls,
+                        span: None,
+                        receiver: None,
+                    })
+                    .collect(),
+                statements: vec![],
+            }])
+            .unwrap();
+        (tmp, store)
+    }
+
+    /// The bulk COPY path can store `d\ne` raw beside a distinct node `d e`. A stored edge to
+    /// the raw one is not the edge to the folded one, so a new pair naming `d e` is absent
+    /// and must be written, and written once.
+    #[test]
+    fn an_edge_to_a_raw_stored_target_does_not_hide_the_edge_to_its_folded_twin() {
+        let (_tmp, store) = bulk_graph(&["src", "d\ne", "d e"], &[("src", "d\ne")]);
+        assert_eq!(
+            calls_edge_count(&store),
+            1,
+            "the raw edge came through the COPY"
+        );
+        let conn = store.connection().unwrap();
+
+        let fresh = super::absent_edges(
+            &conn,
+            "CALLS",
+            "Symbol",
+            "Symbol",
+            vec![("src".into(), "d e".into())],
+        )
+        .unwrap();
+        assert_eq!(fresh, vec![("src".to_string(), "d e".to_string())]);
+
+        super::write_absent_edges(&conn, "Symbol", "Symbol", "CALLS", &[("src", "d e")]).unwrap();
+        assert_eq!(
+            calls_edge_count(&store),
+            2,
+            "the folded twin got its own edge"
+        );
+        super::write_absent_edges(&conn, "Symbol", "Symbol", "CALLS", &[("src", "d e")]).unwrap();
+        assert_eq!(calls_edge_count(&store), 2, "a replay adds nothing");
+    }
+
+    /// The limit of the stored-form lookup, as it is today: the existing edges are found by
+    /// the batch's sources folded (the literal folds), so an edge whose SOURCE the bulk COPY
+    /// stored raw is never found, and its pair is offered again. A raw TARGET is found,
+    /// because the rows come back as stored. Making the bulk writer fold would change an id
+    /// (an `ID_SCHEME` bump), which is not this function's call.
+    #[test]
+    fn a_raw_stored_source_is_not_found_by_its_edges_but_a_raw_target_is() {
+        let (_tmp, store) = bulk_graph(
+            &["r\nsrc", "t", "src", "d\ne"],
+            &[("r\nsrc", "t"), ("src", "d\ne")],
+        );
+        assert_eq!(calls_edge_count(&store), 2);
+        let conn = store.connection().unwrap();
+        let fresh = super::absent_edges(
+            &conn,
+            "CALLS",
+            "Symbol",
+            "Symbol",
+            vec![("r\nsrc".into(), "t".into()), ("src".into(), "d\ne".into())],
+        )
+        .unwrap();
+        assert_eq!(
+            fresh,
+            vec![("r\nsrc".to_string(), "t".to_string())],
+            "the raw target's edge is recognised; the raw source's edge is not (known limit)"
         );
     }
 
