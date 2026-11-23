@@ -821,9 +821,80 @@ pub fn non_corruption_open_context(err: &anyhow::Error, db_path: &Path) -> Strin
     }
 }
 
+/// Read-write `Database`s this process holds on each graph file, for [`rw_database_stats`]. A
+/// process holds exactly one per file (#149): a second handle cannot see the first's uncommitted
+/// WAL, and a checkpoint one makes is invisible to the other, whose next scan can read a torn
+/// view of the file (a watcher with two of them died in `optimisticRead`). The counts are the
+/// invariant made observable, for the tests that guard it.
+static RW_DATABASES: std::sync::Mutex<Option<HashMap<PathBuf, RwDatabaseStats>>> =
+    std::sync::Mutex::new(None);
+
+/// What this process has done with read-write `Database`s on one graph file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RwDatabaseStats {
+    /// Open now.
+    pub open_now: usize,
+    /// The most that were open at once.
+    pub most_at_once: usize,
+    /// Opened in all, closed ones included.
+    pub opened: usize,
+}
+
+fn rw_database_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// This process's read-write `Database` counts for the graph file at `path`; all zero for a file
+/// it never opened for writing.
+pub fn rw_database_stats(path: &Path) -> RwDatabaseStats {
+    let guard = RW_DATABASES.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .and_then(|m| m.get(&rw_database_key(path)).copied())
+        .unwrap_or_default()
+}
+
+fn note_rw_database_opened(path: &Path) -> PathBuf {
+    let key = rw_database_key(path);
+    let mut guard = RW_DATABASES.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = guard
+        .get_or_insert_with(HashMap::new)
+        .entry(key.clone())
+        .or_default();
+    entry.open_now += 1;
+    entry.opened += 1;
+    entry.most_at_once = entry.most_at_once.max(entry.open_now);
+    key
+}
+
+/// One read-write `Database` counted in [`rw_database_stats`] for as long as it lives. It is a
+/// FIELD of [`GraphStore`], declared right after `db`, because fields drop in declaration order:
+/// the count falls only after the `Database` has closed, close-time checkpoint included, which is
+/// the window the invariant is about. A `Drop` impl on the store itself would run before any
+/// field.
+struct RwDatabaseGuard(PathBuf);
+
+impl RwDatabaseGuard {
+    fn new(path: &Path) -> Self {
+        Self(note_rw_database_opened(path))
+    }
+}
+
+impl Drop for RwDatabaseGuard {
+    fn drop(&mut self) {
+        let mut guard = RW_DATABASES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = guard.as_mut().and_then(|m| m.get_mut(&self.0)) {
+            entry.open_now = entry.open_now.saturating_sub(1);
+        }
+    }
+}
+
 /// Persistent graph store backed by Kuzu.
 pub struct GraphStore {
     db: Database,
+    /// Counts this store in [`rw_database_stats`] while its `Database` is open; `None` for a
+    /// read-only one. Must stay directly after `db` (see [`RwDatabaseGuard`]).
+    _rw_guard: Option<RwDatabaseGuard>,
     lock_path: PathBuf,
     /// This store's own database file. NOT derivable from `lock_path`:
     /// `db_lock_path("graph.rebuilding")` deliberately resolves to the same
@@ -1071,6 +1142,7 @@ impl GraphStore {
         refuse_newer_schema(&db, path)?;
         let store = Self {
             db,
+            _rw_guard: Some(RwDatabaseGuard::new(path)),
             lock_path,
             db_path: path.to_path_buf(),
             fold_failure: std::sync::OnceLock::new(),
@@ -1184,6 +1256,7 @@ impl GraphStore {
         refuse_newer_schema(&db, path)?;
         Ok(Self {
             db,
+            _rw_guard: None,
             lock_path,
             db_path: path.to_path_buf(),
             fold_failure: std::sync::OnceLock::new(),

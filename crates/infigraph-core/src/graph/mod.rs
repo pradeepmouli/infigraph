@@ -57,10 +57,10 @@ pub use store::{
     is_storage_version_mismatch_error, is_transient_open_error, is_transient_wal_open_race_error,
     is_undecided_open, lbug_checkpoint_lock_holders, lbug_checkpoint_lock_paths,
     lock_contention_context, non_corruption_open_context, open_failure_is_not_a_fault,
-    open_failure_is_not_corruption, other_live_graph_holder, remove_wal_family,
+    open_failure_is_not_corruption, other_live_graph_holder, remove_wal_family, rw_database_stats,
     storage_version_mismatch_context, unclean_shutdown_wal_holder, validate_db_file,
-    wal_family_paths, DegradeReason, GraphCorruption, GraphStats, GraphStore, UndecidedOpen,
-    WriteLock,
+    wal_family_paths, DegradeReason, GraphCorruption, GraphStats, GraphStore, RwDatabaseStats,
+    UndecidedOpen, WriteLock,
 };
 pub use store_util::stamp_healthy_graph_size;
 pub use test_templates::{test_templates_for, TestTemplate};

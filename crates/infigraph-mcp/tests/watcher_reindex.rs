@@ -7,6 +7,7 @@ use infigraph_mcp::tools::docs::{
     auto_start_doc_watch, init_doc_watchers, is_doc_watching, tool_index_docs, tool_search_docs,
     tool_watch_docs, DOC_WATCHERS,
 };
+use infigraph_mcp::tools::graph::tool_get_symbols_in_file;
 use infigraph_mcp::tools::helpers::open_prism;
 use infigraph_mcp::tools::index::tool_index_project;
 use infigraph_mcp::tools::search::{tool_search, tool_search_symbols};
@@ -710,19 +711,20 @@ fn test_code_watcher_grammar_plugin_extensions() {
     }
 }
 
-/// Cross-file CALLS: modify a function called from another file, verify auto_resolve
-/// re-resolves the CALLS edge so search still finds the caller relationship.
-#[test]
-fn test_code_watcher_cross_file_auto_resolve() {
-    let _guard = WATCHER_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _cleanup = WatcherCleanup;
-    stop_all_watchers();
+/// What the auto-resolve scenarios share: index a two-file project, watch it with
+/// `auto_resolve`, add a function to `lib.py`, and wait until the watcher has done its
+/// targeted reindex AND its embeddings update for that edit. Returns the project root, held
+/// by the caller's guard, so a test can ask what the process opened meanwhile.
+///
+/// The wait is on the graph and on the watcher's own output, never on `tool_search`: that tool
+/// also matches file text, so it saw `extra_resolved_func` the moment `lib.py` was written and
+/// the test ended before the watcher had reindexed anything (68 of 82 runs never reached the
+/// path they were meant to cover).
+fn auto_resolve_edit_reindexed() -> (support::TestProject, String, bool) {
     init_watchers();
 
     // Two Python files with a cross-file call: main.py calls lib.py's helper
-    let (_dir, path) = make_project(&[
+    let (dir, path) = make_project(&[
         ("lib.py", "def cross_file_helper(): return 'original'\n"),
         (
             "main.py",
@@ -749,6 +751,16 @@ fn test_code_watcher_cross_file_auto_resolve() {
     }))
     .unwrap();
 
+    let embeddings = std::path::PathBuf::from(&path)
+        .join(".infigraph")
+        .join("embeddings.bin");
+    let stamp = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .ok()
+            .map(|m| (m.len(), m.modified().ok()))
+    };
+    let embeddings_before = stamp(&embeddings);
+
     // Modify lib.py — rename the function (simulates cross-file impact)
     std::thread::sleep(Duration::from_millis(500));
     std::fs::write(
@@ -757,20 +769,63 @@ fn test_code_watcher_cross_file_auto_resolve() {
     )
     .unwrap();
 
-    // Watcher with auto_resolve should reindex + re-resolve
+    // Watcher with auto_resolve should reindex + re-resolve, and then update the embeddings
+    // for the files it reindexed: the last step of its work on this edit.
     let found = poll_until(
         || {
-            tool_search(&json!({"path": &path, "query": "extra_resolved_func"}))
+            tool_get_symbols_in_file(&json!({"path": &path, "file": "lib.py"}))
                 .map(|r| r.contains("extra_resolved_func"))
                 .unwrap_or(false)
+                && stamp(&embeddings) != embeddings_before
         },
         support::WATCH_EVENT_BUDGET,
-        "extra_resolved_func should be searchable after auto-resolve reindex",
+        "extra_resolved_func should be in the graph, and its embeddings written, after the auto-resolve reindex",
     );
+    (dir, path, found)
+}
+
+#[test]
+fn test_code_watcher_cross_file_auto_resolve() {
+    let _guard = WATCHER_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _cleanup = WatcherCleanup;
+    stop_all_watchers();
+
+    let (_dir, _path, found) = auto_resolve_edit_reindexed();
 
     assert!(
         found,
         "auto_resolve watcher should reindex cross-file changes"
+    );
+}
+
+/// A process holds exactly one read-write `Database` per graph file (#149). The auto-resolve
+/// handler used to open a `CodeIndex` of its own beside the coordinator's held one, wrote and
+/// checkpointed through it, and dropped it; the coordinator's next scan on its older handle
+/// then died in `optimisticRead` about half the runs (a NULL string-data pointer in
+/// `DictionaryColumn::scan`). So: across a watcher reindex, never two at once.
+#[test]
+fn auto_resolve_watcher_holds_one_read_write_database() {
+    let _guard = WATCHER_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _cleanup = WatcherCleanup;
+    stop_all_watchers();
+
+    let (_dir, path, found) = auto_resolve_edit_reindexed();
+    assert!(found, "the watcher never finished its reindex of the edit");
+    stop_all_watchers();
+
+    let graph = std::path::PathBuf::from(&path)
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
+    let stats = infigraph_core::graph::rw_database_stats(&graph);
+    assert_eq!(
+        stats.most_at_once,
+        1,
+        "at most one read-write Database on {} at a time ({stats:?})",
+        graph.display()
     );
 }
 

@@ -29,12 +29,70 @@ crate::settings! {
 }
 
 /// A single file-change event emitted by the watcher.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WatchEvent {
     pub kind: WatchEventKind,
     pub path: PathBuf,
     /// True if this file has cross-file CALLS edges — full reindex needed to re-resolve them.
     pub has_cross_file_calls: bool,
+    /// The coordinator's own graph handle, lent to the handler on the events the coordinator
+    /// raises from its loop thread (`Some`); `None` on those raised elsewhere (the file-event
+    /// producer). A handler that has to touch the graph in answer to an event uses this one,
+    /// never a `CodeIndex` of its own: a process holds exactly one `Database` per graph file
+    /// (#149).
+    pub held: Option<HeldStore>,
+}
+
+/// The write coordinator's graph handle, lent to an event handler for the length of its call.
+///
+/// A handler borrows the store ([`index`](Self::index)) and cannot clone it out, and must not
+/// keep the event, or a clone of it, past its call. A kept one pins the old `Database` across a
+/// poison and reopen: the coordinator waits for the retired store's last holder before it opens
+/// the next (`RETIRED_STORE_WAIT`), so retention stalls that reopen rather than corrupting
+/// anything.
+///
+/// A handler whose write to the graph failed says so with [`report_failed`](Self::report_failed);
+/// the coordinator then drops the held handle and reopens it, as it does for a failed drain, and
+/// raises no further event of that batch.
+#[derive(Clone)]
+pub struct HeldStore {
+    index: Arc<CodeIndex>,
+    failed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl HeldStore {
+    pub(crate) fn new(index: Arc<CodeIndex>) -> Self {
+        Self {
+            index,
+            failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// The coordinator's store, for the length of the handler's call.
+    pub fn index(&self) -> &CodeIndex {
+        &self.index
+    }
+
+    /// The handler's write to the graph failed: the coordinator treats its handle as suspect.
+    pub fn report_failed(&self) {
+        self.failed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a handler reported a failure since the last call, and forgets it.
+    pub(crate) fn take_failed(&self) -> bool {
+        self.failed.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl std::fmt::Debug for WatchEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WatchEvent")
+            .field("kind", &self.kind)
+            .field("path", &self.path)
+            .field("has_cross_file_calls", &self.has_cross_file_calls)
+            .field("held", &self.held.as_ref().map(|_| "<held store>"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,7 +267,6 @@ where
     let prefix = log_prefix.to_string();
     let factory: Arc<dyn Fn() -> Result<crate::lang::LanguageRegistry> + Send + Sync> =
         Arc::new(make_registry);
-    let factory_for_event = Arc::clone(&factory);
     watch_project(root, move || factory(), debounce_ms, stop_rx, {
         move |evt: WatchEvent| {
             match evt.kind {
@@ -225,75 +282,82 @@ where
             }
             if evt.has_cross_file_calls {
                 eprintln!("[watch {prefix}] {evt}");
-                if let Ok(reg) = factory_for_event() {
-                    if let Ok(mut p) = CodeIndex::open(&root_owned, reg) {
-                        if p.init().is_ok() {
-                            let changed_rel = evt
-                                .path
-                                .strip_prefix(&root_owned)
-                                .map(|r| r.to_string_lossy().replace('\\', "/"))
-                                .unwrap_or_else(|_| evt.path.to_string_lossy().replace('\\', "/"));
-                            let mut affected_files = vec![evt.path.clone()];
+                // The coordinator's own store, handed over with the event. It runs on the
+                // coordinator's loop thread, so the targeted reindex, the re-resolution and
+                // the embeddings update all go through the one `Database` this process
+                // holds on the graph file. Opening a second `CodeIndex` here put a second
+                // read-write `Database` beside it (#149): its writes and checkpoints were
+                // invisible to the held one, whose next scan could read a torn view of
+                // the file.
+                let Some(held) = evt.held.as_ref() else {
+                    eprintln!(
+                        "[watch {prefix}] cross-file calls affected but the event carried no \
+                         store -- skipping the targeted reindex"
+                    );
+                    return;
+                };
+                let p = held.index();
+                let changed_rel = evt
+                    .path
+                    .strip_prefix(&root_owned)
+                    .map(|r| r.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| evt.path.to_string_lossy().replace('\\', "/"));
+                let mut affected_files = vec![evt.path.clone()];
 
-                            if let Some(backend) = p.backend() {
-                                let deps = get_cross_file_dependents(backend, &changed_rel);
-                                for dep_rel in deps {
-                                    let dep_abs = root_owned.join(&dep_rel);
-                                    if dep_abs.exists() {
-                                        affected_files.push(dep_abs);
-                                    }
-                                }
-                            }
+                if let Some(backend) = p.backend() {
+                    let deps = get_cross_file_dependents(backend, &changed_rel);
+                    for dep_rel in deps {
+                        let dep_abs = root_owned.join(&dep_rel);
+                        if dep_abs.exists() {
+                            affected_files.push(dep_abs);
+                        }
+                    }
+                }
 
-                            match p.index_files(&affected_files) {
-                                Ok(r) => {
-                                    eprintln!(
-                                        "[watch {prefix}] targeted reindex: {}/{} affected files",
-                                        r.indexed_files, r.total_files
-                                    );
+                match p.index_files(&affected_files) {
+                    Ok(r) => {
+                        eprintln!(
+                            "[watch {prefix}] targeted reindex: {}/{} affected files",
+                            r.indexed_files, r.total_files
+                        );
 
-                                    if let Some(backend) = p.backend() {
-                                        let file_strs: Vec<String> =
-                                            r.extractions.iter().map(|e| e.file.clone()).collect();
-                                        match backend.re_resolve_for_files(
-                                            &file_strs,
-                                            &r.extractions,
-                                            None,
-                                        ) {
-                                            Ok(stats) => {
-                                                eprintln!("[watch {prefix}] re-resolved: {stats}")
-                                            }
-                                            Err(e) => {
-                                                eprintln!("[watch {prefix}] re-resolve failed: {e}")
-                                            }
-                                        }
-
-                                        let changed: Vec<&str> =
-                                            r.extractions.iter().map(|e| e.file.as_str()).collect();
-                                        if let Some(eb) = p.backend() {
-                                            match crate::embed::update_embeddings_routed(
-                                                eb,
-                                                &root_owned,
-                                                &changed,
-                                            ) {
-                                                Ok(n) => {
-                                                    eprintln!(
-                                                        "[watch {prefix}] updated {n} embeddings"
-                                                    )
-                                                }
-                                                Err(e) => eprintln!(
-                                                    "[watch {prefix}] embedding update failed: {e}"
-                                                ),
-                                            }
-                                        }
-                                    }
+                        if let Some(backend) = p.backend() {
+                            let file_strs: Vec<String> =
+                                r.extractions.iter().map(|e| e.file.clone()).collect();
+                            match backend.re_resolve_for_files(&file_strs, &r.extractions, None) {
+                                Ok(stats) => {
+                                    eprintln!("[watch {prefix}] re-resolved: {stats}")
                                 }
                                 Err(e) => {
-                                    eprintln!("[watch {prefix}] targeted reindex failed: {e}")
+                                    eprintln!("[watch {prefix}] re-resolve failed: {e}");
+                                    held.report_failed();
+                                    // The handle is suspect now: no embeddings update through it.
+                                    eprintln!(
+                                        "[watch {prefix}] embeddings update skipped after the failed re-resolution"
+                                    );
+                                    return;
                                 }
                             }
-                            // p drops here, releasing the DB lock
+
+                            let changed: Vec<&str> =
+                                r.extractions.iter().map(|e| e.file.as_str()).collect();
+                            match crate::embed::update_embeddings_routed(
+                                backend,
+                                &root_owned,
+                                &changed,
+                            ) {
+                                Ok(n) => {
+                                    eprintln!("[watch {prefix}] updated {n} embeddings")
+                                }
+                                Err(e) => {
+                                    eprintln!("[watch {prefix}] embedding update failed: {e}")
+                                }
+                            }
                         }
+                    }
+                    Err(e) => {
+                        eprintln!("[watch {prefix}] targeted reindex failed: {e}");
+                        held.report_failed();
                     }
                 }
             } else {
@@ -626,7 +690,9 @@ mod tests {
         std::fs::write(&file_path, "v1").unwrap();
         let probe = raw_root.join("probe.txt");
 
-        let events: Arc<Mutex<Vec<WatchEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        // Only the paths: an event carries the coordinator's store (`WatchEvent::held`), and one
+        // kept past its call would pin it across a reopen.
+        let events: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
         let events_clone = Arc::clone(&events);
         let (stop_tx, stop_rx) = mpsc::channel();
 
@@ -636,7 +702,7 @@ mod tests {
                 || Ok(crate::lang::LanguageRegistry::new()),
                 50,
                 stop_rx,
-                move |evt| events_clone.lock().unwrap().push(evt),
+                move |evt| events_clone.lock().unwrap().push(evt.path),
             )
         });
 
@@ -672,7 +738,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|e| e.path.ends_with("watched.txt"))
+                .any(|p| p.ends_with("watched.txt"))
             {
                 seen = true;
                 break;

@@ -1617,6 +1617,12 @@ where
                             .map(|e| e.file.clone())
                             .collect::<Vec<String>>(),
                     );
+                    // One lent handle for the batch. A handler whose write failed says so, and
+                    // the rest of the batch is not handed a store we now suspect: it is dropped
+                    // and reopened as a failed drain's is, and the embeddings update below,
+                    // which would read it, is skipped.
+                    let held = crate::watch::HeldStore::new(Arc::clone(&prism));
+                    let mut handler_failed = false;
                     for extraction in &outcome.extractions {
                         let cross = has_cross_file_calls(&prism, &extraction.file);
                         let abs_path = root.join(&extraction.file);
@@ -1624,7 +1630,17 @@ where
                             kind: WatchEventKind::Modified,
                             path: abs_path,
                             has_cross_file_calls: cross,
+                            held: Some(held.clone()),
                         });
+                        if held.take_failed() {
+                            handler_failed = true;
+                            break;
+                        }
+                    }
+                    drop(held);
+                    if handler_failed {
+                        embed_after_drain = None;
+                        poison_watch_db(&mut held_prism);
                     }
                 }
                 // A preflight declined this write before it reached the
@@ -1918,15 +1934,27 @@ where
                 scip_embeddings_pending_since = Some(std::time::Instant::now());
             }
 
+            let mut handler_failed = false;
             if let Some(prism) = held_prism.as_ref() {
+                let held = crate::watch::HeldStore::new(Arc::clone(prism));
                 for file in &touched_files {
                     let cross = has_cross_file_calls(prism, file);
                     on_event_shared(WatchEvent {
                         kind: WatchEventKind::Modified,
                         path: root.join(file),
                         has_cross_file_calls: cross,
+                        held: Some(held.clone()),
                     });
+                    if held.take_failed() {
+                        handler_failed = true;
+                        break;
+                    }
                 }
+            }
+            if handler_failed {
+                // The borrow of `held_prism` above has ended; the reconcile below finds no
+                // store and puts itself back to retry once the next one is open.
+                poison_watch_db(&mut held_prism);
             }
         }
         if scip_embeddings_due(
@@ -1934,7 +1962,11 @@ where
             scip_import_in_flight.is_some(),
         ) {
             scip_embeddings_pending_since = None;
-            reconcile_embeddings_after_scip(root, &held_prism);
+            if !reconcile_embeddings_after_scip(root, &held_prism) {
+                // No store open (a failed handler's was just dropped): try again after the
+                // next settle, when the loop has reopened it.
+                scip_embeddings_pending_since = Some(std::time::Instant::now());
+            }
         }
         if docs_write_in_flight
             .as_ref()
@@ -2445,7 +2477,7 @@ where
     // Imports whose embeddings were still waiting to settle are reconciled
     // now rather than left for the next daemon to find stale.
     if scip_embeddings_pending_since.take().is_some() {
-        reconcile_embeddings_after_scip(root, &held_prism);
+        let _ = reconcile_embeddings_after_scip(root, &held_prism);
     }
     // A docs index that started gets `DOCS_WRITE_STOP_GRACE` to finish and
     // answer its client (#204 D3: started work is never cancelled). It cannot
@@ -3643,9 +3675,12 @@ fn finish_scip_import(
 
 /// Reconciles embeddings with the symbols a SCIP enrichment added or enriched,
 /// once its imports have settled (`SCIP_EMBED_SETTLE`).
-fn reconcile_embeddings_after_scip(root: &Path, held: &HeldPrism) {
+///
+/// Returns `false`, having done nothing, when no store is open to reconcile through; it never
+/// opens one itself.
+fn reconcile_embeddings_after_scip(root: &Path, held: &HeldPrism) -> bool {
     let Some(backend) = held.as_ref().and_then(|prism| prism.backend()) else {
-        return;
+        return false;
     };
     // `update_embeddings` returns the total embedding count on disk after
     // reconciling, not how many it re-embedded (unchanged inputs are skipped
@@ -3657,6 +3692,7 @@ fn reconcile_embeddings_after_scip(root: &Path, held: &HeldPrism) {
         Ok(_) => {}
         Err(e) => eprintln!("[daemon] scip-import: embedding update failed: {e}"),
     }
+    true
 }
 
 /// Give one rebuild's result to every client waiting on it (#164).
