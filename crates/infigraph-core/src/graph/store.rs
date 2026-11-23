@@ -28,6 +28,17 @@ pub struct WriteLock {
     _guard: LockFile,
 }
 
+impl Drop for GraphStore {
+    fn drop(&mut self) {
+        if let Some(key) = self.rw_key.take() {
+            let mut guard = RW_DATABASES.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = guard.as_mut().and_then(|m| m.get_mut(&key)) {
+                entry.0 = entry.0.saturating_sub(1);
+            }
+        }
+    }
+}
+
 impl Drop for WriteLock {
     /// Clear the mark first, whatever the field order: the file lock is released only
     /// after this body returns (fields drop afterwards), so no other writer can have
@@ -822,7 +833,43 @@ pub fn non_corruption_open_context(err: &anyhow::Error, db_path: &Path) -> Strin
 }
 
 /// Persistent graph store backed by Kuzu.
+/// Read-write `Database`s this process holds on each graph file: `(open now, most ever open at
+/// once)`. A process holds exactly one per file (#149): a second handle cannot see the first's
+/// uncommitted WAL, and a checkpoint one makes is invisible to the other, whose next scan can read
+/// a torn view of the file (a watcher with two of them died in `optimisticRead`). The count is
+/// the invariant made observable, for the test that guards it.
+static RW_DATABASES: std::sync::Mutex<Option<HashMap<PathBuf, (usize, usize)>>> =
+    std::sync::Mutex::new(None);
+
+fn rw_database_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// `(open now, most ever open at once)` read-write `Database`s of this process on the graph file
+/// at `path`. `(0, 0)` for a file this process never opened for writing.
+pub fn rw_database_stats(path: &Path) -> (usize, usize) {
+    let guard = RW_DATABASES.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .and_then(|m| m.get(&rw_database_key(path)).copied())
+        .unwrap_or((0, 0))
+}
+
+fn note_rw_database_opened(path: &Path) -> PathBuf {
+    let key = rw_database_key(path);
+    let mut guard = RW_DATABASES.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = guard
+        .get_or_insert_with(HashMap::new)
+        .entry(key.clone())
+        .or_insert((0, 0));
+    entry.0 += 1;
+    entry.1 = entry.1.max(entry.0);
+    key
+}
+
 pub struct GraphStore {
+    /// The key this store is counted under in [`rw_database_stats`]; `None` for a read-only one.
+    rw_key: Option<PathBuf>,
     db: Database,
     lock_path: PathBuf,
     /// This store's own database file. NOT derivable from `lock_path`:
@@ -1070,6 +1117,7 @@ impl GraphStore {
         }
         refuse_newer_schema(&db, path)?;
         let store = Self {
+            rw_key: Some(note_rw_database_opened(path)),
             db,
             lock_path,
             db_path: path.to_path_buf(),
@@ -1183,6 +1231,7 @@ impl GraphStore {
         })?;
         refuse_newer_schema(&db, path)?;
         Ok(Self {
+            rw_key: None,
             db,
             lock_path,
             db_path: path.to_path_buf(),

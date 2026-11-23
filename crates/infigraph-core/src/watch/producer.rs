@@ -186,6 +186,7 @@ pub async fn run_producer(
                     kind: WatchEventKind::WatcherDied,
                     path: root.clone(),
                     has_cross_file_calls: false,
+                    index: None,
                 },
             );
             return;
@@ -417,6 +418,7 @@ pub async fn run_producer(
                                     kind: WatchEventKind::WatcherDied,
                                     path: root.clone(),
                                     has_cross_file_calls: false,
+                                    index: None,
                                 },
                             );
                             break;
@@ -447,6 +449,7 @@ pub async fn run_producer(
                                         kind: WatchEventKind::WatcherRestarted,
                                         path: root.clone(),
                                         has_cross_file_calls: false,
+                                        index: None,
                                     },
                                 );
                             }
@@ -458,6 +461,7 @@ pub async fn run_producer(
                                         kind: WatchEventKind::WatcherDied,
                                         path: root.clone(),
                                         has_cross_file_calls: false,
+                                        index: None,
                                     },
                                 );
                                 break;

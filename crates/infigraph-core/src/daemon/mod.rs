@@ -1624,6 +1624,7 @@ where
                             kind: WatchEventKind::Modified,
                             path: abs_path,
                             has_cross_file_calls: cross,
+                            index: Some(Arc::clone(&prism)),
                         });
                     }
                 }
@@ -1925,6 +1926,7 @@ where
                         kind: WatchEventKind::Modified,
                         path: root.join(file),
                         has_cross_file_calls: cross,
+                        index: Some(Arc::clone(prism)),
                     });
                 }
             }
