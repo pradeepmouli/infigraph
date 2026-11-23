@@ -120,7 +120,9 @@ pub enum WalRecovery {
     /// outside, ran out of time, failed without a verdict on the image
     /// (see [`crate::probe::Probe`]), or the experiment could not be staged
     /// (a rename refused: nothing was asked of the image). Every WAL
-    /// moved for the experiment is back where it was. The caller MUST NOT
+    /// moved for the experiment is back where it was; if a put-back rename itself
+    /// fails the answer is Indeterminate too (the file stays filed as `torn-wal`
+    /// evidence, logged by path), so nothing quarantines with a WAL out of place. The caller MUST NOT
     /// quarantine and MUST NOT count this as a recovery attempt: it should
     /// report the open as transiently refused and try again later.
     Indeterminate,
@@ -138,6 +140,25 @@ impl WalRecovery {
     pub fn is_usable(self) -> bool {
         matches!(self, Self::AlreadyHealthy | Self::Recovered)
     }
+}
+
+/// Return every file moved for the experiment (`(original, filed)` pairs) to where it was,
+/// last moved first. A rename that fails leaves that file filed as evidence under its
+/// `torn-wal` name, so it is logged by path rather than ignored, and returned: the caller's
+/// "everything is back" is then known to be false for exactly those files.
+fn put_back(moved: &[(PathBuf, PathBuf)]) -> Vec<PathBuf> {
+    let mut stuck = Vec::new();
+    for (from, to) in moved.iter().rev() {
+        if let Err(e) = std::fs::rename(to, from) {
+            eprintln!(
+                "[graph] could not put {} back at {}: {e}; it stays filed under the first name",
+                to.display(),
+                from.display()
+            );
+            stuck.push(from.clone());
+        }
+    }
+    stuck
 }
 
 /// [`try_recover_by_setting_wal_aside`] with the probe injected, so tests can
@@ -225,9 +246,8 @@ pub fn try_recover_by_setting_wal_aside_with(
             // about the image (permissions or a full disk say nothing about it),
             // so this is no verdict: NotRecoverable would permit a quarantine of a
             // graph that was never examined.
-            for (from, to) in moved.iter().rev() {
-                let _ = std::fs::rename(to, from);
-            }
+            // (Indeterminate whether or not every file went back; any that did not is logged.)
+            put_back(&moved);
             return WalRecovery::Indeterminate;
         }
         moved.push((path.clone(), dest));
@@ -250,8 +270,11 @@ pub fn try_recover_by_setting_wal_aside_with(
     // Not recovered. Put the WAL back first, whatever the answer: a quarantine
     // that follows keeps the complete picture, and an undecided answer must
     // leave the graph exactly as it was found.
-    for (from, to) in moved.iter().rev() {
-        let _ = std::fs::rename(to, from);
+    // A WAL that cannot be put back is not "back where it was": whatever the probe said,
+    // a quarantine now would file the graph without its WAL and leave that WAL behind
+    // under another name, so this is no verdict.
+    if !put_back(&moved).is_empty() {
+        return WalRecovery::Indeterminate;
     }
     match verdict {
         // With the WAL family set aside, a checkpoint still in the way is
@@ -1172,5 +1195,65 @@ mod tests {
         assert!(!got.permits_quarantine());
         assert_eq!(std::fs::read(&wal).unwrap(), b"wal");
         assert_eq!(std::fs::read(&graph).unwrap(), b"image");
+    }
+
+    /// A put-back that cannot rename must say which file stays filed, not drop the error.
+    #[test]
+    fn put_back_reports_the_file_it_could_not_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a_from, a_to) = (tmp.path().join("a.wal"), tmp.path().join("a.filed"));
+        let (b_from, b_to) = (tmp.path().join("b.wal"), tmp.path().join("b.filed"));
+        std::fs::write(&a_to, b"a").unwrap();
+        std::fs::write(&b_to, b"b").unwrap();
+        // A directory sits where b belongs: renaming a file onto it fails.
+        std::fs::create_dir(&b_from).unwrap();
+        std::fs::write(b_from.join("occupant"), b"x").unwrap();
+
+        let stuck = put_back(&[
+            (a_from.clone(), a_to.clone()),
+            (b_from.clone(), b_to.clone()),
+        ]);
+
+        assert_eq!(stuck, vec![b_from]);
+        assert_eq!(
+            std::fs::read(&a_from).unwrap(),
+            b"a",
+            "the restorable one is restored"
+        );
+        assert!(b_to.exists(), "the stuck one stays where it was filed");
+    }
+
+    /// The probe leaves a directory where the WAL belongs while the WAL is filed away, so the
+    /// put-back rename fails; the probe itself says DoesNotOpen, which alone would permit a
+    /// quarantine. With the WAL not where it was, the answer must be no verdict.
+    #[test]
+    fn a_wal_that_cannot_be_put_back_never_permits_quarantine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let graph = dir.join(crate::graph::names::STEM);
+        std::fs::write(&graph, b"image").unwrap();
+        let wal = dir.join(format!("{}.wal", crate::graph::names::STEM));
+        std::fs::write(&wal, b"wal").unwrap();
+        let calls = std::cell::Cell::new(0u32);
+
+        let got = try_recover_by_setting_wal_aside_with(dir, crate::graph::names::STEM, |_| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                std::fs::create_dir(&wal).unwrap();
+            }
+            crate::probe::Probe::DoesNotOpen
+        });
+
+        assert_eq!(calls.get(), 2);
+        assert_eq!(got, WalRecovery::Indeterminate);
+        assert!(!got.permits_quarantine());
+        let filed: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("torn-wal"))
+            .collect();
+        assert_eq!(filed.len(), 1, "the WAL stays filed as evidence: {filed:?}");
+        assert_eq!(std::fs::read(dir.join(&filed[0])).unwrap(), b"wal");
     }
 }
