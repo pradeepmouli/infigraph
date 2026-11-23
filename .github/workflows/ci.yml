@@ -161,8 +161,11 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           git worktree add --detach ../previous "${{ steps.prev.outputs.sha }}"
-          cargo build --release -p infigraph-cli --manifest-path ../previous/Cargo.toml \
-            --target-dir ../previous-target
+          # From the previous release's own directory: cargo reads .cargo/config.toml
+          # (including [env] LBUG_VERSION) from where it runs, not from the manifest
+          # it builds, and HEAD's pin must not reach the old release's build.
+          (cd ../previous && cargo build --release -p infigraph-cli \
+            --target-dir ../previous-target)
           mkdir -p old-bin
           cp ../previous-target/release/infigraph old-bin/infigraph
       - name: Save the previous release's binary
