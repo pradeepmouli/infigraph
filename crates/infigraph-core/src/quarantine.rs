@@ -117,8 +117,9 @@ pub enum WalRecovery {
     /// picture for diagnosis.
     NotRecoverable,
     /// Nothing was decided: the probe could not start, was killed from
-    /// outside, ran out of time, or failed without a verdict on the image
-    /// (see [`crate::probe::Probe`]). Every WAL
+    /// outside, ran out of time, failed without a verdict on the image
+    /// (see [`crate::probe::Probe`]), or the experiment could not be staged
+    /// (a rename refused: nothing was asked of the image). Every WAL
     /// moved for the experiment is back where it was. The caller MUST NOT
     /// quarantine and MUST NOT count this as a recovery attempt: it should
     /// report the open as transiently refused and try again later.
@@ -220,11 +221,14 @@ pub fn try_recover_by_setting_wal_aside_with(
         let dest = crate::probe::torn_wal_path(infigraph_dir, graph_name, &suffix, ts);
         if std::fs::rename(path, &dest).is_err() {
             // Could not stage the experiment cleanly -- undo and decline
-            // rather than leave the WAL family half-moved.
+            // rather than leave the WAL family half-moved. Nothing was learned
+            // about the image (permissions or a full disk say nothing about it),
+            // so this is no verdict: NotRecoverable would permit a quarantine of a
+            // graph that was never examined.
             for (from, to) in moved.iter().rev() {
                 let _ = std::fs::rename(to, from);
             }
-            return WalRecovery::NotRecoverable;
+            return WalRecovery::Indeterminate;
         }
         moved.push((path.clone(), dest));
     }
@@ -1139,5 +1143,34 @@ mod tests {
             );
             assert!(filed(tmp.path()).is_empty());
         }
+    }
+
+    /// A failed `rename` while staging says nothing about the image: it must not read as
+    /// "not recoverable", which permits quarantine.
+    #[cfg(unix)]
+    #[test]
+    fn a_staging_rename_that_fails_is_no_verdict_and_leaves_everything_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let graph = dir.join(crate::graph::names::STEM);
+        std::fs::write(&graph, b"image").unwrap();
+        let wal = dir.join(format!("{}.wal", crate::graph::names::STEM));
+        std::fs::write(&wal, b"wal").unwrap();
+        // A directory that cannot be written refuses every rename inside it.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::File::create(dir.join("probe-writable")).is_ok() {
+            // Running as a user the mode does not bind (root): nothing to test here.
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let got = try_recover_by_setting_wal_aside_with(dir, crate::graph::names::STEM, |_| {
+            crate::probe::Probe::DoesNotOpen
+        });
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(got, WalRecovery::Indeterminate);
+        assert!(!got.permits_quarantine());
+        assert_eq!(std::fs::read(&wal).unwrap(), b"wal");
+        assert_eq!(std::fs::read(&graph).unwrap(), b"image");
     }
 }
