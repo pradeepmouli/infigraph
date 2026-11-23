@@ -331,6 +331,11 @@ where
                                 Err(e) => {
                                     eprintln!("[watch {prefix}] re-resolve failed: {e}");
                                     held.report_failed();
+                                    // The handle is suspect now: no embeddings update through it.
+                                    eprintln!(
+                                        "[watch {prefix}] embeddings update skipped after the failed re-resolution"
+                                    );
+                                    return;
                                 }
                             }
 
