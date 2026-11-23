@@ -71,3 +71,28 @@ fn no_crate_states_its_own_lbug_version() {
         }
     }
 }
+
+/// Cargo reads `.cargo/config.toml` from the directory it runs in, not from the manifest it
+/// builds. The upgrade job builds the previous release from a worktree; run from HEAD's
+/// directory (`--manifest-path ../previous/Cargo.toml`) it would hand HEAD's
+/// `[env] LBUG_VERSION` to the old release's lbug build script, so once the old tag
+/// downloads a prebuilt library the "previous" binary would link HEAD's.
+#[test]
+fn the_upgrade_job_builds_the_previous_release_from_its_own_directory() {
+    let ci = std::fs::read_to_string(workspace_root().join(".github/workflows/ci.yml")).unwrap();
+    let step = ci
+        .split("- name: Build the previous release")
+        .nth(1)
+        .expect("ci.yml has no 'Build the previous release' step")
+        .split("\n      - name:")
+        .next()
+        .unwrap();
+    assert!(
+        step.contains("cd ../previous"),
+        "build the previous release from ../previous so HEAD's .cargo/config.toml does not apply:\n{step}"
+    );
+    assert!(
+        !step.contains("--manifest-path"),
+        "--manifest-path leaves cargo reading HEAD's config:\n{step}"
+    );
+}
