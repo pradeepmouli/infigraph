@@ -526,8 +526,10 @@ pub fn discard_if_rejected(path: &Path) -> Option<ScipRejected> {
 /// the symbols themselves, never by row order, or the edges an import writes differ with it.
 /// The order is: the smallest span (lines); then real code before the rest (a function,
 /// method, test, class, struct or module, as `metadata::is_container` says, before a
-/// variable, property or interface that happens to share its span); then a named symbol
-/// before a numeric literal member (`136`, `136#1`); then the earlier start line; then the id.
+/// variable, property or interface that happens to share its span; and among real code the
+/// more deeply nested id first, so a member beats the owner that shares its span); then a
+/// named symbol before a numeric literal member (`136`, `136#1`); then the earlier start
+/// line; then the id.
 /// `kind_of` gives a symbol's kind by id; an id it does not know ranks with the rest.
 fn sort_for_containment<'a>(
     symbols: &mut [(u32, u32, String)],
@@ -540,9 +542,18 @@ fn sort_for_containment<'a>(
             let base = name.split('#').next().unwrap_or(name);
             !base.is_empty() && base.bytes().all(|b| b.is_ascii_digit())
         };
+        // Among real code, the more deeply nested id first: a class that shares its exact
+        // span with its own member (`A` over `A::m`) must not be credited with the member's
+        // reference. Other kinds all rank equal here.
+        let nesting = if real_code {
+            -(id.matches("::").count() as i64)
+        } else {
+            0
+        };
         (
             *end as i64 - *start as i64,
             !real_code,
+            nesting,
             numeric,
             *start,
             id.clone(),
@@ -4309,6 +4320,16 @@ mod tests {
             twin_callers_graph(("z_fn", "function"), ("a_var", "variable")),
             want
         );
+    }
+
+    /// A class whose span is exactly its member's must not take the member's reference: "A"
+    /// sorts before "A::m" as a string, so a bare id tie would credit the owner.
+    #[test]
+    fn a_member_beats_the_owner_that_shares_its_span_whatever_the_row_order() {
+        let want: std::collections::BTreeSet<(String, String)> =
+            [("test.ts::A::m".to_string(), "test.ts::target".to_string())].into();
+        assert_eq!(twin_callers_graph(("A", "class"), ("A::m", "method")), want);
+        assert_eq!(twin_callers_graph(("A::m", "method"), ("A", "class")), want);
     }
 
     /// "136" sorts before "named" as a string; the named variable must still win.
