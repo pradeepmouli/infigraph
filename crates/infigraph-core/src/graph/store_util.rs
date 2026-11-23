@@ -1556,8 +1556,6 @@ mod tests {
         );
     }
 
-    /// The lookup form changed from `WHERE a.id IN [...]` to `UNWIND ... {id: x}`. The two
-    /// must return the same rows, including for ids that need escaping in the literal.
     /// A batch of any size finds its existing edges, on either side of the cutover.
     #[test]
     fn absent_edges_drops_existing_edges_below_and_above_the_unwind_cutover() {
@@ -1583,6 +1581,8 @@ mod tests {
         }
     }
 
+    /// The lookup form changed from `WHERE a.id IN [...]` to `UNWIND ... {id: x}`. The two
+    /// must return the same rows, including for ids that need escaping in the literal.
     #[test]
     fn the_unwind_lookup_returns_what_the_in_list_lookup_returned() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1628,41 +1628,24 @@ mod tests {
         super::write_absent_edges(&conn, "Symbol", "Symbol", "CALLS", &refs).unwrap();
 
         let sources: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
-        let literal: Vec<String> = sources
-            .iter()
-            .map(|s| format!("'{}'", super::escape(s)))
-            .collect();
-        let old: std::collections::BTreeSet<(String, String)> = conn
-            .query(&format!(
-                "MATCH (a:Symbol)-[:CALLS]->(b:Symbol) WHERE a.id IN [{}] RETURN a.id, b.id",
-                literal.join(", ")
-            ))
-            .unwrap()
-            .map(|r| {
-                (
-                    super::raw_string(&r[0]).to_string(),
-                    super::raw_string(&r[1]).to_string(),
-                )
-            })
-            .collect();
-        let new: std::collections::BTreeSet<(String, String)> =
-            super::existing_edges_unwind(&conn, "CALLS", "Symbol", "Symbol", &sources)
-                .unwrap()
-                .into_iter()
-                .collect();
         let in_list: std::collections::BTreeSet<(String, String)> =
             super::existing_edges_in_list(&conn, "CALLS", "Symbol", "Symbol", &sources)
                 .unwrap()
                 .into_iter()
                 .collect();
-        assert_eq!(in_list, old, "the IN-list helper is the old query");
+        let unwind: std::collections::BTreeSet<(String, String)> =
+            super::existing_edges_unwind(&conn, "CALLS", "Symbol", "Symbol", &sources)
+                .unwrap()
+                .into_iter()
+                .collect();
 
+        // not two empty results: the IN-list form finds every edge written above
         assert_eq!(
-            old.len(),
+            in_list.len(),
             ids.len(),
-            "the old form finds every edge: {old:?}"
+            "the IN-list form finds every edge: {in_list:?}"
         );
-        assert_eq!(new, old);
+        assert_eq!(unwind, in_list);
         let fresh = super::absent_edges(&conn, "CALLS", "Symbol", "Symbol", pairs).unwrap();
         assert!(
             fresh.is_empty(),
