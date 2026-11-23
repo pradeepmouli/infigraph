@@ -509,22 +509,10 @@ fn mcp_log(level: &str, msg: &str) {
 }
 
 fn install_panic_hook() {
-    std::panic::set_hook(Box::new(|info| {
-        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
-            s.to_string()
-        } else if let Some(s) = info.payload().downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "unknown panic".to_string()
-        };
-        let location = info
-            .location()
-            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-            .unwrap_or_else(|| "unknown".to_string());
-        let bt = std::backtrace::Backtrace::force_capture();
-        mcp_log("PANIC", &format!("{payload} at {location}\n{bt}"));
-        eprintln!("PANIC: {payload} at {location}");
-    }));
+    infigraph_core::proclog::install_panic_hook(|desc, bt| {
+        mcp_log("PANIC", &format!("{desc}\n{bt}"));
+        infigraph_core::proclog::stderr_line(&format!("PANIC: {desc}"));
+    });
 }
 
 fn ui_enabled_from(args: &[String]) -> bool {

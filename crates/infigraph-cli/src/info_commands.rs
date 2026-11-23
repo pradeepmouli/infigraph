@@ -352,23 +352,12 @@ fn watchdog_should_defer(
 /// the missing half. `eprintln!` is deliberate, not a shortcut: this
 /// process's stderr is already redirected to `daemon.log` by
 /// `build_daemon_command`, so a second explicit file write would just
-/// double every line.
+/// double every line. Written through `proclog::stderr_line`, which ignores a failed write: a
+/// hook that panics aborts the process.
 fn install_daemon_panic_hook() {
-    std::panic::set_hook(Box::new(|info| {
-        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
-            s.to_string()
-        } else if let Some(s) = info.payload().downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "unknown panic".to_string()
-        };
-        let location = info
-            .location()
-            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-            .unwrap_or_else(|| "unknown".to_string());
-        let bt = std::backtrace::Backtrace::force_capture();
-        eprintln!("[daemon] PANIC: {payload} at {location}\n{bt}");
-    }));
+    infigraph_core::proclog::install_panic_hook(|desc, bt| {
+        infigraph_core::proclog::stderr_line(&format!("[daemon] PANIC: {desc}\n{bt}"));
+    });
 }
 
 pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
