@@ -1027,11 +1027,16 @@ impl IncomingEdges {
 const EXISTING_SOURCES_PER_QUERY: usize = 1000;
 
 /// From this many sources a chunk is looked up with [`existing_edges_unwind`]; below it
-/// with [`existing_edges_in_list`]. Measured read-only on a 498,436-symbol graph, median of
-/// 5 (CALLS, READS and REFERENCES agree): the IN-list form costs 5 ms for 1 source, 8 ms
-/// for 10, 34 ms for 100 and 285-288 ms for 1,000; the UNWIND form costs a flat 25-35 ms
-/// for 1, 10 and 100 sources, and 38-44 ms for 1,000. They cross at about 100, and an
-/// incremental one-file index asks about a handful of sources per edge table.
+/// with [`existing_edges_in_list`].
+///
+/// 100 is a crossover MEASURED on one graph, not a property of the query forms. Read-only
+/// on one 498,436-symbol graph (the rule-library snapshot), median of 5, CALLS, READS and
+/// REFERENCES alike: the IN-list form costs 5 ms for 1 source, 8 ms for 10, 34 ms for 100
+/// and 285-288 ms for 1,000; the UNWIND form costs a flat 25-35 ms for 1, 10 and 100
+/// sources, and 38-44 ms for 1,000. An incremental one-file index asks about a handful of
+/// sources per edge table. A different engine version or a graph of a very different size
+/// or shape could move the crossover; re-measure both forms at 1, 10, 100 and 1,000
+/// sources before changing this number.
 const UNWIND_FROM_SOURCES: usize = 100;
 
 /// The edges of `table` that start at one of `sources`, as `(source id, target id)`.
