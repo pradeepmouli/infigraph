@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 mod support;
 
-use support::{registered_worker, start_supervisor_piped_stderr, Server};
+use support::{registered_worker, start_supervisor_stderr, Server, Transport};
+
+const TRANSPORTS: [Transport; 2] = [Transport::Pipe, Transport::Socket];
 
 /// Kill `pid` with SIGSEGV as a memory fault would; see `crash_recovery_scope.rs` for why one signal is not
 /// enough (std's stack-overflow handler swallows the first).
@@ -63,14 +65,22 @@ fn worker_other_than(instances: &std::path::Path, not: u32) -> Option<u32> {
 
 #[test]
 fn a_supervisor_whose_stderr_reader_is_gone_survives_restarting_a_crashed_worker() {
-    let mut s = start_supervisor_piped_stderr(&[]);
-    drop(s.stderr.take());
-    crash_and_serve(&mut s);
+    for transport in TRANSPORTS {
+        let mut s = start_supervisor_stderr(transport, &[]);
+        drop(s.stderr.take());
+        crash_and_serve(&mut s);
+    }
 }
 
 #[test]
 fn a_client_that_keeps_reading_still_receives_the_supervisors_notice() {
-    let mut s = start_supervisor_piped_stderr(&[]);
+    for transport in TRANSPORTS {
+        keeps_reading(transport);
+    }
+}
+
+fn keeps_reading(transport: Transport) {
+    let mut s = start_supervisor_stderr(transport, &[]);
     let seen = Arc::new(Mutex::new(String::new()));
     let sink = Arc::clone(&seen);
     let mut pipe = s.stderr.take().unwrap();
@@ -90,7 +100,7 @@ fn a_client_that_keeps_reading_still_receives_the_supervisors_notice() {
     while !seen.lock().unwrap().contains("worker crashed") {
         assert!(
             Instant::now() < until,
-            "the restart notice never reached the client:\n{}",
+            "the restart notice never reached the client ({transport:?}):\n{}",
             seen.lock().unwrap()
         );
         std::thread::sleep(Duration::from_millis(50));
@@ -99,17 +109,25 @@ fn a_client_that_keeps_reading_still_receives_the_supervisors_notice() {
 
 #[test]
 fn a_client_that_never_reads_cannot_stall_a_request() {
-    let mut s = start_supervisor_piped_stderr(&[]);
-    // Held open, never read.
-    let _unread = s.stderr.take().unwrap();
-    crash_and_serve(&mut s);
+    for transport in TRANSPORTS {
+        let mut s = start_supervisor_stderr(transport, &[]);
+        // Held open, never read.
+        let _unread = s.stderr.take().unwrap();
+        crash_and_serve(&mut s);
+    }
 }
 
 /// Closing the server's stdin ends it; its stderr must then reach end-of-file for the client, even though the
 /// worker (a child of the supervisor) is the last to leave.
 #[test]
 fn the_clients_stderr_reaches_end_of_file_once_the_server_exits() {
-    let mut s = start_supervisor_piped_stderr(&[]);
+    for transport in TRANSPORTS {
+        eof_once_the_server_exits(transport);
+    }
+}
+
+fn eof_once_the_server_exits(transport: Transport) {
+    let mut s = start_supervisor_stderr(transport, &[]);
     let mut pipe = s.stderr.take().unwrap();
     let reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
@@ -132,6 +150,6 @@ fn the_clients_stderr_reaches_end_of_file_once_the_server_exits() {
     let eof = reader.join().unwrap();
     assert!(
         eof.saturating_duration_since(exited) < Duration::from_secs(5),
-        "the client's stderr stayed open after the supervisor exited"
+        "the client's {transport:?} stayed open after the supervisor exited"
     );
 }

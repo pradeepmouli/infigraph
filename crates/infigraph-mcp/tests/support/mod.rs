@@ -22,7 +22,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdin, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -33,6 +33,11 @@ use serde_json::{json, Value};
 /// polls it without draining. One file shared by every crate's tests.
 #[path = "../../../infigraph-core/tests/common/stdio.rs"]
 pub mod stdio;
+
+/// `Transport` and `channel`: a pipe or a unix socket as a server's stderr.
+#[path = "../../../infigraph-core/tests/common/stderr_channel.rs"]
+pub mod stderr_channel;
+pub use stderr_channel::Transport;
 
 /// A tiny project with a graph, a document index and a git history.
 pub mod docs;
@@ -479,8 +484,8 @@ pub struct Server {
     pub child: Child,
     pub stdin: Option<ChildStdin>,
     pub replies: Receiver<Value>,
-    /// The read end of the server's stderr, when the test asked for a pipe (`start_supervisor_piped_stderr`).
-    pub stderr: Option<ChildStderr>,
+    /// The client's end of the server's stderr, when the test asked for one (`start_supervisor_stderr`).
+    pub stderr: Option<std::fs::File>,
 }
 
 impl Drop for Server {
@@ -505,9 +510,13 @@ pub fn start_supervisor_with(
     spawn_supervisor(program, args, extra_env, Stdio::null())
 }
 
-/// [`start_supervisor`] with the server's stderr a pipe the test holds (`Server::stderr`).
-pub fn start_supervisor_piped_stderr(extra_env: &[(&str, &str)]) -> Server {
-    spawn_supervisor(None, &["--mcp"], extra_env, Stdio::piped())
+/// [`start_supervisor`] with the server's stderr a pipe or unix socket whose other end the test holds
+/// (`Server::stderr`).
+pub fn start_supervisor_stderr(transport: Transport, extra_env: &[(&str, &str)]) -> Server {
+    let (client_end, server_end) = stderr_channel::channel(transport);
+    let mut server = spawn_supervisor(None, &["--mcp"], extra_env, Stdio::from(server_end));
+    server.stderr = Some(client_end);
+    server
 }
 
 fn spawn_supervisor(
@@ -539,7 +548,6 @@ fn spawn_supervisor(
     let mut child = cmd.spawn().expect("spawn infigraph-mcp supervisor");
     let stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take();
     let (tx, replies) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
@@ -557,7 +565,7 @@ fn spawn_supervisor(
         child,
         stdin: Some(stdin),
         replies,
-        stderr,
+        stderr: None,
     }
 }
 

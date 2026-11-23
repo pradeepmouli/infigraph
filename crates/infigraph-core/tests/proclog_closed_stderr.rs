@@ -1,17 +1,26 @@
-//! Logging and panic hooks must survive a stderr nobody reads any more.
+//! Logging and panic hooks must survive a stderr nobody reads any more, and the stderr shield
+//! (`proclog::shield_stderr`) must keep every plain `eprintln!` from failing or waiting on one.
 //!
 //! `eprintln!` panics when its write fails. An MCP server or daemon whose launching client has
-//! closed the read end of its stderr pipe therefore died inside its own logging, and a panic
-//! inside a panic hook aborts the process (SIGABRT). These tests run the code in a child process
-//! whose stderr is a pipe with the read end already closed.
+//! closed the read end of its stderr therefore died inside its own logging, and a panic inside a
+//! panic hook aborts the process (SIGABRT). These tests run the code in a child process whose
+//! stderr is the write end of a pipe or of a unix socket (real clients use both) whose other end
+//! the parent closes, reads, or holds without reading.
+
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// `Transport` and `channel`: the pipe or socket that becomes a child's stderr (shared with infigraph-mcp's tests).
+#[path = "common/stderr_channel.rs"]
+mod stderr_channel;
+use stderr_channel::{channel, Transport};
+
 const CHILD: &str = "INFIGRAPH_PROCLOG_CHILD";
 
-/// The child side: wait until the parent has closed its end of our stderr pipe, then do `what`.
+/// The child side: wait until the parent has set up our stderr, then do `what`.
 fn wait_for_go(dir: &Path) {
     let go = dir.join("go");
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -21,7 +30,7 @@ fn wait_for_go(dir: &Path) {
     }
 }
 
-/// What the parent does with the read end of the child's stderr pipe.
+/// What the parent does with its end of the child's stderr.
 #[derive(Clone, Copy, PartialEq)]
 enum Reader {
     /// Closes it before the child writes: a client that went away.
@@ -42,32 +51,32 @@ struct Outcome {
     elapsed: Duration,
 }
 
-/// Run this test binary again, as `test_name` only, with stderr a pipe the parent treats as `reader` says.
-fn run_child(test_name: &str, dir: &Path, reader: Reader) -> Outcome {
+/// Run this test binary again, as `test_name` only, with stderr a `transport` the parent treats as `reader` says.
+fn run_child(test_name: &str, dir: &Path, reader: Reader, transport: Transport) -> Outcome {
+    let (parent_end, child_end) = channel(transport);
     let mut child = Command::new(std::env::current_exe().unwrap())
-        // `--nocapture`: libtest otherwise captures a test thread's `eprintln!` and the pipe is never written.
+        // `--nocapture`: libtest otherwise captures a test thread's `eprintln!` and nothing is ever written.
         .args(["--exact", test_name, "--test-threads=1", "--nocapture"])
         .env(CHILD, dir)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::from(child_end))
         .spawn()
         .unwrap();
-    let pipe = child.stderr.take().unwrap();
+    let mut held = None;
     let reading = match reader {
         Reader::Closed => {
-            drop(pipe);
+            drop(parent_end);
             None
         }
         Reader::Reads => Some(std::thread::spawn(move || {
             use std::io::Read as _;
-            let mut pipe = pipe;
+            let mut parent_end = parent_end;
             let mut bytes = Vec::new();
-            let _ = pipe.read_to_end(&mut bytes);
+            let _ = parent_end.read_to_end(&mut bytes);
             (String::from_utf8_lossy(&bytes).into_owned(), Instant::now())
         })),
         Reader::Silent => {
-            // Kept open, never read; dropped when this function returns.
-            std::mem::forget(pipe);
+            held = Some(parent_end);
             None
         }
     };
@@ -89,6 +98,7 @@ fn run_child(test_name: &str, dir: &Path, reader: Reader) -> Outcome {
         Some(thread) => thread.join().unwrap(),
         None => (String::new(), exited),
     };
+    drop(held);
     Outcome {
         status,
         stderr,
@@ -101,6 +111,22 @@ fn child_dir() -> Option<PathBuf> {
     std::env::var_os(CHILD).map(PathBuf::from)
 }
 
+/// `#[test]`s for one body over both transports.
+macro_rules! over_transports {
+    ($body:ident => $pipe:ident, $socket:ident) => {
+        #[test]
+        fn $pipe() {
+            $body(Transport::Pipe)
+        }
+        #[test]
+        fn $socket() {
+            $body(Transport::Socket)
+        }
+    };
+}
+
+// ---- logging and the panic hook, without the shield
+
 #[test]
 fn child_writes_a_log_line() {
     let Some(dir) = child_dir() else { return };
@@ -108,13 +134,18 @@ fn child_writes_a_log_line() {
     infigraph_core::proclog::write_log_line(&dir.join("proc.log"), "INFO", "line from the child");
 }
 
-#[test]
-fn a_log_line_survives_a_stderr_whose_reader_is_gone() {
+fn a_log_line_survives_a_stderr_whose_reader_is_gone(transport: Transport) {
     let dir = tempfile::tempdir().unwrap();
-    let status = run_child("child_writes_a_log_line", dir.path(), Reader::Closed).status;
+    let status = run_child(
+        "child_writes_a_log_line",
+        dir.path(),
+        Reader::Closed,
+        transport,
+    )
+    .status;
     assert!(
         status.success(),
-        "the process died logging to a closed stderr pipe: {status:?}"
+        "the process died logging to a closed stderr ({transport:?}): {status:?}"
     );
     let log = std::fs::read_to_string(dir.path().join("proc.log")).unwrap_or_default();
     assert!(
@@ -122,6 +153,7 @@ fn a_log_line_survives_a_stderr_whose_reader_is_gone() {
         "the line never reached the log file: {log:?}"
     );
 }
+over_transports!(a_log_line_survives_a_stderr_whose_reader_is_gone => log_line_survives_on_a_pipe, log_line_survives_on_a_socket);
 
 #[test]
 fn child_panics_with_a_hook_that_writes_to_stderr() {
@@ -138,18 +170,18 @@ fn child_panics_with_a_hook_that_writes_to_stderr() {
     std::fs::write(dir.join("survived"), "yes").unwrap();
 }
 
-#[test]
-fn a_panic_hook_cannot_abort_the_process_on_a_closed_stderr() {
+fn a_panic_hook_cannot_abort_the_process_on_a_closed_stderr(transport: Transport) {
     let dir = tempfile::tempdir().unwrap();
     let status = run_child(
         "child_panics_with_a_hook_that_writes_to_stderr",
         dir.path(),
         Reader::Closed,
+        transport,
     )
     .status;
     assert!(
         dir.path().join("survived").exists(),
-        "the process died inside its panic hook: {status:?}"
+        "the process died inside its panic hook ({transport:?}): {status:?}"
     );
     assert!(status.success(), "unexpected exit: {status:?}");
     let log = std::fs::read_to_string(dir.path().join("proc.log")).unwrap_or_default();
@@ -158,10 +190,11 @@ fn a_panic_hook_cannot_abort_the_process_on_a_closed_stderr() {
         "the panic never reached the log file: {log:?}"
     );
 }
+over_transports!(a_panic_hook_cannot_abort_the_process_on_a_closed_stderr => hook_survives_on_a_pipe, hook_survives_on_a_socket);
 
 // ---- the stderr shield (`proclog::shield_stderr`): what the real stderr sees, and what the process survives.
 
-/// A plain `eprintln!` on a closed pipe, with no shield: the premise (it panics).
+/// A plain `eprintln!` on a closed stderr, with no shield: the premise (it panics).
 #[test]
 fn child_writes_plain_lines_unshielded() {
     let Some(dir) = child_dir() else { return };
@@ -170,21 +203,22 @@ fn child_writes_plain_lines_unshielded() {
     std::fs::write(dir.join("survived"), "yes").unwrap();
 }
 
-#[test]
-fn an_unshielded_plain_eprintln_dies_on_a_closed_reader() {
+fn an_unshielded_plain_eprintln_dies_on_a_closed_reader(transport: Transport) {
     let dir = tempfile::tempdir().unwrap();
     let out = run_child(
         "child_writes_plain_lines_unshielded",
         dir.path(),
         Reader::Closed,
+        transport,
     );
     assert!(
         !out.status.success(),
-        "the premise changed: {:?}",
+        "the premise changed ({transport:?}): {:?}",
         out.status
     );
     assert!(!dir.path().join("survived").exists());
 }
+over_transports!(an_unshielded_plain_eprintln_dies_on_a_closed_reader => unshielded_dies_on_a_pipe, unshielded_dies_on_a_socket);
 
 /// `lines` plain `eprintln!`s behind the shield, then `exit` (not a return), which must drain the pipe.
 #[test]
@@ -209,41 +243,124 @@ fn child_writes_plain_lines_shielded() {
     std::process::exit(0);
 }
 
-fn shielded_run(reader: Reader, lines: usize) -> (tempfile::TempDir, Outcome) {
+fn shielded_run(
+    reader: Reader,
+    transport: Transport,
+    lines: usize,
+) -> (tempfile::TempDir, Outcome) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("lines"), lines.to_string()).unwrap();
-    let out = run_child("child_writes_plain_lines_shielded", dir.path(), reader);
+    let out = run_child(
+        "child_writes_plain_lines_shielded",
+        dir.path(),
+        reader,
+        transport,
+    );
     (dir, out)
 }
 
-#[test]
-fn a_shielded_plain_eprintln_survives_a_closed_reader() {
-    let (dir, out) = shielded_run(Reader::Closed, 5000);
+fn a_shielded_plain_eprintln_survives_a_closed_reader(transport: Transport) {
+    let (dir, out) = shielded_run(Reader::Closed, transport, 5000);
     assert!(
         out.status.success(),
-        "died on a closed stderr: {:?}",
+        "died on a closed stderr ({transport:?}): {:?}",
         out.status
     );
     assert!(dir.path().join("survived").exists());
 }
+over_transports!(a_shielded_plain_eprintln_survives_a_closed_reader => shielded_survives_closed_pipe, shielded_survives_closed_socket);
 
-/// A short burst (well under any pipe's capacity, so nothing may be dropped) and an immediate `exit`: the
-/// exit must wait for the forwarder to hand the burst over. Run many times, since the forwarder usually
-/// wins the race by itself and only a missing drain loses lines now and then.
-#[test]
-fn a_reading_client_receives_every_line_even_when_the_process_exits_at_once() {
-    for round in 0..40 {
-        let (_dir, out) = shielded_run(Reader::Reads, 40);
+/// A short burst (well under any capacity, so nothing may be dropped) and an immediate `exit`: the exit
+/// must wait for the forwarder to hand the burst over. Run many times, since the forwarder usually wins the
+/// race by itself and only a missing drain loses lines now and then.
+fn a_reading_client_receives_every_line_even_when_the_process_exits_at_once(transport: Transport) {
+    for round in 0..20 {
+        let (_dir, out) = shielded_run(Reader::Reads, transport, 40);
         assert!(out.status.success(), "round {round}: {:?}", out.status);
         for i in 0..40 {
             assert!(
                 out.stderr.contains(&format!("shielded line {i:06} ")),
-                "round {round}: line {i} never reached the client ({} bytes arrived)",
+                "{transport:?} round {round}: line {i} never reached the client ({} bytes arrived)",
                 out.stderr.len()
             );
         }
     }
 }
+over_transports!(a_reading_client_receives_every_line_even_when_the_process_exits_at_once => reading_pipe_gets_every_line, reading_socket_gets_every_line);
+
+fn a_client_that_never_reads_cannot_stall_the_process(transport: Transport) {
+    // 20,000 lines of ~120 bytes is 2.4 MB, far past any pipe's or socket's capacity.
+    let (dir, out) = shielded_run(Reader::Silent, transport, 20_000);
+    assert!(out.status.success(), "{transport:?}: {:?}", out.status);
+    assert!(
+        out.elapsed < Duration::from_secs(20),
+        "the writer waited on a reader that never reads ({transport:?}): {:?}",
+        out.elapsed
+    );
+    let dropped: u64 = std::fs::read_to_string(dir.path().join("dropped"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        dropped > 1_000_000,
+        "the shield should have dropped what could not be written ({transport:?}), dropped {dropped}"
+    );
+}
+over_transports!(a_client_that_never_reads_cannot_stall_the_process => never_reading_pipe_cannot_stall, never_reading_socket_cannot_stall);
+
+/// Many threads writing at once through every path (plain `eprintln!` into the shield, the panic hook's
+/// `stderr_line`, the breadcrumb's `write_stderr_async_safe`) to a client that never reads. The forwarder
+/// and the direct writers all poll-then-write the same descriptor; without one lock around that pair two of
+/// them can both see room for one more piece and the second would block, stalling fd 2 for the whole process.
+#[test]
+fn child_hammers_stderr_from_many_threads() {
+    let Some(dir) = child_dir() else { return };
+    wait_for_go(&dir);
+    infigraph_core::proclog::shield_stderr().unwrap();
+    let threads: Vec<_> = (0..8)
+        .map(|t| {
+            std::thread::spawn(move || {
+                for i in 0..3000 {
+                    match i % 3 {
+                        0 => eprintln!("hammer {t} {i} {}", "y".repeat(90)),
+                        1 => infigraph_core::proclog::stderr_line(&format!(
+                            "direct {t} {i} {}",
+                            "z".repeat(90)
+                        )),
+                        _ => infigraph_core::proclog::write_stderr_async_safe(
+                            format!("signal-safe {t} {i} {}\n", "w".repeat(90)).as_bytes(),
+                        ),
+                    }
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    // The forwarder must still be draining fd 2: one more plain line cannot block.
+    eprintln!("after the hammering");
+    std::fs::write(dir.join("survived"), "yes").unwrap();
+    std::process::exit(0);
+}
+
+fn many_threads_writing_to_a_client_that_never_reads_finish(transport: Transport) {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_child(
+        "child_hammers_stderr_from_many_threads",
+        dir.path(),
+        Reader::Silent,
+        transport,
+    );
+    assert!(out.status.success(), "{transport:?}: {:?}", out.status);
+    assert!(dir.path().join("survived").exists());
+    assert!(
+        out.elapsed < Duration::from_secs(20),
+        "{transport:?}: writers stalled behind a reader that never reads: {:?}",
+        out.elapsed
+    );
+}
+over_transports!(many_threads_writing_to_a_client_that_never_reads_finish => hammer_a_silent_pipe, hammer_a_silent_socket);
 
 /// `write_stderr_async_safe` goes to the real stderr itself, so even a `_exit` right after it (no `atexit`, no
 /// drain, the forwarder killed with the process) loses nothing.
@@ -261,44 +378,25 @@ fn child_writes_straight_to_the_real_stderr_then_dies_at_once() {
     unsafe { libc::_exit(0) };
 }
 
-#[test]
-fn a_direct_write_survives_a_process_that_dies_at_once() {
+fn a_direct_write_survives_a_process_that_dies_at_once(transport: Transport) {
     for round in 0..10 {
         let dir = tempfile::tempdir().unwrap();
         let out = run_child(
             "child_writes_straight_to_the_real_stderr_then_dies_at_once",
             dir.path(),
             Reader::Reads,
+            transport,
         );
         assert!(out.status.success(), "{:?}", out.status);
         for i in 0..100 {
             assert!(
                 out.stderr.contains(&format!("direct line {i:03}\n")),
-                "round {round}: direct line {i} lost"
+                "{transport:?} round {round}: direct line {i} lost"
             );
         }
     }
 }
-
-#[test]
-fn a_client_that_never_reads_cannot_stall_the_process() {
-    // 20,000 lines of ~120 bytes is 2.4 MB, far past any pipe's capacity.
-    let (dir, out) = shielded_run(Reader::Silent, 20_000);
-    assert!(out.status.success(), "{:?}", out.status);
-    assert!(
-        out.elapsed < Duration::from_secs(20),
-        "the writer waited on a reader that never reads: {:?}",
-        out.elapsed
-    );
-    let dropped: u64 = std::fs::read_to_string(dir.path().join("dropped"))
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert!(
-        dropped > 1_000_000,
-        "the shield should have dropped what could not be written, dropped {dropped}"
-    );
-}
+over_transports!(a_direct_write_survives_a_process_that_dies_at_once => direct_write_survives_on_a_pipe, direct_write_survives_on_a_socket);
 
 /// The panic hook's line and a SIGABRT breadcrumb go straight to the real stderr, not into the shield's pipe
 /// (which dies with the process).
@@ -315,19 +413,25 @@ fn child_aborts_inside_a_phase_behind_the_shield() {
     });
     // A panic whose hook line must survive the abort that follows at once.
     let _ = std::panic::catch_unwind(|| panic!("boom"));
+    // SAFETY: abort is the point.
     unsafe { libc::abort() };
 }
 
-#[test]
-fn an_abort_behind_the_shield_still_leaves_the_breadcrumb_and_the_hook_line() {
+fn an_abort_behind_the_shield_still_leaves_the_breadcrumb_and_the_hook_line(transport: Transport) {
     use std::os::unix::process::ExitStatusExt;
     let dir = tempfile::tempdir().unwrap();
     let out = run_child(
         "child_aborts_inside_a_phase_behind_the_shield",
         dir.path(),
         Reader::Reads,
+        transport,
     );
-    assert_eq!(out.status.signal(), Some(libc::SIGABRT), "{:?}", out.status);
+    assert_eq!(
+        out.status.signal(),
+        Some(libc::SIGABRT),
+        "{transport:?}: {:?}",
+        out.status
+    );
     assert!(
         out.stderr.contains("HOOK: boom at "),
         "hook line missing:\n{}",
@@ -340,6 +444,27 @@ fn an_abort_behind_the_shield_still_leaves_the_breadcrumb_and_the_hook_line() {
         out.stderr
     );
 }
+over_transports!(an_abort_behind_the_shield_still_leaves_the_breadcrumb_and_the_hook_line => abort_leaves_breadcrumb_on_a_pipe, abort_leaves_breadcrumb_on_a_socket);
+
+/// The same abort with the client's end already closed: the signal handler's write to a closed socket must
+/// not raise SIGPIPE (which would replace the SIGABRT the process must still die by).
+fn a_closed_peer_cannot_turn_the_abort_into_a_sigpipe(transport: Transport) {
+    use std::os::unix::process::ExitStatusExt;
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_child(
+        "child_aborts_inside_a_phase_behind_the_shield",
+        dir.path(),
+        Reader::Closed,
+        transport,
+    );
+    assert_eq!(
+        out.status.signal(),
+        Some(libc::SIGABRT),
+        "{transport:?}: the handler's write to a closed peer changed how the process dies: {:?}",
+        out.status
+    );
+}
+over_transports!(a_closed_peer_cannot_turn_the_abort_into_a_sigpipe => closed_pipe_keeps_sigabrt, closed_socket_keeps_sigabrt);
 
 /// A child of a shielded process inherits the shield's pipe, never the client's real stderr: once the process
 /// exits the client sees end-of-file at once, even while that child lives on.
@@ -354,26 +479,27 @@ fn child_leaves_a_sleeper_holding_its_stderr() {
     std::process::exit(0);
 }
 
-#[test]
-fn a_surviving_child_does_not_keep_the_clients_stderr_open() {
+fn a_surviving_child_does_not_keep_the_clients_stderr_open(transport: Transport) {
     let dir = tempfile::tempdir().unwrap();
     let out = run_child(
         "child_leaves_a_sleeper_holding_its_stderr",
         dir.path(),
         Reader::Reads,
+        transport,
     );
     assert!(out.status.success(), "{:?}", out.status);
     assert!(out.stderr.contains("last words"), "{}", out.stderr);
     assert!(
         out.eof_after_exit < Duration::from_secs(3),
-        "the client's pipe stayed open {:?} after the server exited: a child holds it",
+        "the client's {transport:?} stayed open {:?} after the server exited: a child holds it",
         out.eof_after_exit
     );
 }
+over_transports!(a_surviving_child_does_not_keep_the_clients_stderr_open => sleeper_does_not_hold_the_pipe, sleeper_does_not_hold_the_socket);
 
-/// CHARACTERIZATION: a child that outlives its shielded parent inherits the shield's pipe, whose
-/// reader died with the parent, so its next write to stderr fails. `std` puts SIGPIPE back to its default in
-/// every child it spawns, so what the child does depends on how it writes. Pins what was measured.
+/// CHARACTERIZATION: a child that outlives its shielded parent inherits the shield's pipe, whose reader died
+/// with the parent, so its next write to stderr fails. `std` puts SIGPIPE back to its default in every child
+/// it spawns, so what the child does depends on how it writes. Pins what was measured.
 #[test]
 fn child_leaves_children_that_write_after_it_is_gone() {
     let Some(dir) = child_dir() else { return };
@@ -408,6 +534,7 @@ fn what_a_child_that_outlives_the_shield_sees_on_stderr() {
         "child_leaves_children_that_write_after_it_is_gone",
         dir.path(),
         Reader::Reads,
+        Transport::Pipe,
     );
     assert!(out.status.success(), "{:?}", out.status);
     std::thread::sleep(Duration::from_millis(2500));
@@ -420,3 +547,59 @@ fn what_a_child_that_outlives_the_shield_sees_on_stderr() {
     let ignoring = std::fs::read_to_string(dir.path().join("sh_ign.out")).unwrap_or_default();
     assert!(ignoring.contains("survived rc=1"), "{ignoring:?}");
 }
+
+/// The forwarder cannot go on (its read end ends): fd 2 must stop being a pipe nobody drains. The child
+/// finds the shield's read end (the one read-only FIFO it holds), keeps the pipe alive with a duplicate that
+/// never reads, and replaces the original descriptor with /dev/null, whose read returns end-of-file: the
+/// forwarder's next read fails the way a broken read end would.
+#[test]
+fn child_loses_its_forwarder() {
+    let Some(dir) = child_dir() else { return };
+    wait_for_go(&dir);
+    infigraph_core::proclog::shield_stderr().unwrap();
+    let mut read_end = None;
+    for fd in 3..256 {
+        // SAFETY: probing descriptors with fstat/fcntl is harmless.
+        unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            if libc::fstat(fd, &mut st) != 0 || (st.st_mode & libc::S_IFMT) != libc::S_IFIFO {
+                continue;
+            }
+            let acc = libc::fcntl(fd, libc::F_GETFL) & libc::O_ACCMODE;
+            if acc == libc::O_RDONLY {
+                read_end = Some(fd);
+            }
+        }
+    }
+    let read_end = read_end.expect("the shield's read end");
+    // SAFETY: duplicating, then replacing, a descriptor this process owns.
+    unsafe {
+        // Never closed: the pipe keeps a reader that never reads, as a stranded fd 2 would meet.
+        libc::dup(read_end);
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+        libc::dup2(null, read_end);
+        libc::close(null);
+    }
+    // The forwarder sleeps in poll on the old pipe, which the kernel does not wake when the descriptor is
+    // replaced; its tick makes it look again, read end-of-file from /dev/null and give up.
+    std::thread::sleep(Duration::from_millis(2500));
+    // fd 2 must now be /dev/null: this volume is a hundred times what a pipe takes before it blocks.
+    for i in 0..2000 {
+        eprintln!("after the forwarder died {i:05} {}", "q".repeat(100));
+    }
+    std::fs::write(dir.join("survived"), "yes").unwrap();
+    std::process::exit(0);
+}
+
+fn a_dead_forwarder_does_not_strand_fd_2(transport: Transport) {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_child(
+        "child_loses_its_forwarder",
+        dir.path(),
+        Reader::Silent,
+        transport,
+    );
+    assert!(out.status.success(), "{transport:?}: {:?}", out.status);
+    assert!(dir.path().join("survived").exists());
+}
+over_transports!(a_dead_forwarder_does_not_strand_fd_2 => dead_forwarder_with_a_pipe_client, dead_forwarder_with_a_socket_client);

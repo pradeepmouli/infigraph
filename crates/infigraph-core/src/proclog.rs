@@ -44,15 +44,19 @@ pub fn write_stderr_async_safe(bytes: &[u8]) {
 
 /// Put a pipe this process owns in front of its stderr, so nothing written to fd 2 can fail with a broken pipe
 /// while the process lives (`eprintln!` panics on a failed write, and a client that closes its end of the pipe
-/// it gave an MCP server made every one of them a panic).
+/// or socket it gave an MCP server made every one of them a panic).
 ///
-/// The real stderr is duplicated (close-on-exec, so no child keeps the client's pipe open past the server),
-/// fd 2 becomes the write end of a new pipe, and one thread forwards what arrives to the saved descriptor
-/// without ever waiting for it: it writes only when `poll(POLLOUT)` says the descriptor can take up to
-/// `PIPE_BUF` bytes at once, and counts what it has to drop (`dropped_bytes`). `O_NONBLOCK` is not set on the
-/// saved descriptor, since that open file description is shared with the client. An exit drains the pipe first
-/// (`atexit`, bounded by `DRAIN_BOUND`). Call it first thing in `main`, before any thread starts; fd 1 is never
-/// touched. Returns the reason when a step failed, and then the process carries on unshielded.
+/// The real stderr is duplicated (close-on-exec, so no child keeps the client's descriptor open past the
+/// server), fd 2 becomes the write end of a new pipe, and one thread forwards what arrives to the saved
+/// descriptor without ever waiting for it. The saved descriptor is whatever the client gave: a pipe or a unix
+/// socket in practice. It is written only after `poll(POLLOUT)` says it can take a piece, in pieces of at most
+/// `PIPE_BUF` bytes, which cannot block a pipe (POSIX) or a unix socket (`POLLOUT` promises `SO_SNDLOWAT`
+/// bytes); `send(MSG_DONTWAIT)` was measured to block on a full macOS socket, so it is not used. One lock around poll and write keeps a second writer from using the
+/// space the first just saw. What cannot go is dropped and counted (`dropped_stderr_bytes`). `O_NONBLOCK` is
+/// never set on the saved descriptor, since that open file description is shared with the client. An exit
+/// drains the pipe first (`atexit`, bounded by `DRAIN_BOUND`), as a courtesy rather than a guarantee. Call it
+/// first thing in `main`, before any thread starts; fd 1 is never touched. Returns the reason when a step
+/// failed, and then the process carries on unshielded.
 pub fn shield_stderr() -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -61,18 +65,6 @@ pub fn shield_stderr() -> Result<(), String> {
     #[cfg(not(unix))]
     {
         Ok(())
-    }
-}
-
-/// The descriptor that is the process's real stderr: the saved one while the shield is up, else fd 2.
-pub fn real_stderr_fd() -> i32 {
-    #[cfg(unix)]
-    {
-        shield::real_fd()
-    }
-    #[cfg(not(unix))]
-    {
-        2
     }
 }
 
@@ -88,15 +80,6 @@ pub fn dropped_stderr_bytes() -> u64 {
     }
 }
 
-/// Wait up to `bound` for everything written to fd 2 so far to reach the real stderr (or be dropped).
-/// Runs by itself at exit once the shield is up; a no-op without it.
-pub fn drain_stderr(bound: std::time::Duration) {
-    #[cfg(unix)]
-    shield::drain(bound);
-    #[cfg(not(unix))]
-    let _ = bound;
-}
-
 #[cfg(unix)]
 mod shield {
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
@@ -105,7 +88,12 @@ mod shield {
     /// POSIX's minimum `PIPE_BUF` (macOS has exactly this, Linux 4096): a write of at most this many bytes to
     /// a pipe that polled writable never blocks and is never split.
     const PIPE_BUF: usize = 512;
-    pub(super) const DRAIN_BOUND: Duration = Duration::from_millis(300);
+    /// How long an exit waits for the forwarder to hand over what the pipe holds.
+    const DRAIN_BOUND: Duration = Duration::from_millis(300);
+    /// How often the forwarder looks at its read end even when nothing arrives.
+    const FORWARDER_TICK_MS: libc::c_int = 1000;
+    /// How many times a writer re-tries the write lock before it drops its bytes.
+    const LOCK_SPINS: u32 = 20_000;
 
     /// The saved real stderr; -1 until the shield is up.
     static SAVED: AtomicI32 = AtomicI32::new(-1);
@@ -113,60 +101,76 @@ mod shield {
     static DROPPED: AtomicU64 = AtomicU64::new(0);
     /// The forwarder holds bytes it has read and not yet delivered or dropped.
     static BUSY: AtomicBool = AtomicBool::new(false);
+    /// Held while a writer polls and writes the saved descriptor. A spin lock because one writer is a signal
+    /// handler, which may not take a mutex.
+    static WRITING: AtomicBool = AtomicBool::new(false);
 
     pub(super) fn is_up() -> bool {
         SAVED.load(Ordering::Acquire) >= 0
-    }
-
-    pub(super) fn real_fd() -> i32 {
-        let saved = SAVED.load(Ordering::Acquire);
-        if saved >= 0 {
-            saved
-        } else {
-            2
-        }
     }
 
     pub(super) fn dropped() -> u64 {
         DROPPED.load(Ordering::Relaxed)
     }
 
-    /// Write `bytes` to `fd` in `PIPE_BUF` pieces, each only when `fd` polls writable right now; whatever
-    /// cannot go is dropped and its length returned. Async-signal-safe.
-    pub(super) fn write_nowait(fd: i32, mut bytes: &[u8]) -> usize {
-        while !bytes.is_empty() {
-            let mut p = libc::pollfd {
-                fd,
-                events: libc::POLLOUT,
-                revents: 0,
-            };
-            // SAFETY: `p` is a valid pollfd and the count is 1.
-            let ready = unsafe { libc::poll(&mut p, 1, 0) };
-            if ready < 0 {
-                if last_errno() == libc::EINTR {
-                    continue;
-                }
-                return bytes.len();
-            }
-            if ready == 0 || p.revents & libc::POLLOUT == 0 {
-                return bytes.len();
-            }
-            let n = bytes.len().min(PIPE_BUF);
-            // SAFETY: `bytes` holds at least `n` readable bytes.
-            let w = unsafe { libc::write(fd, bytes.as_ptr().cast(), n) };
-            if w < 0 {
-                if last_errno() == libc::EINTR {
-                    continue;
-                }
-                return bytes.len();
-            }
-            bytes = &bytes[w as usize..];
-        }
-        0
-    }
-
     fn last_errno() -> i32 {
         std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    }
+
+    /// One piece to `fd` without waiting: bytes written, 0 when it cannot take any now, -1 on a failure that
+    /// should be retried (EINTR).
+    ///
+    /// `poll(POLLOUT)` first, then at most `PIPE_BUF` bytes. For a pipe POSIX guarantees such a write cannot
+    /// block. For a unix stream socket it holds because `POLLOUT` is only reported with at least `SO_SNDLOWAT`
+    /// bytes of room (2048 on macOS, a quarter of the buffer's room on Linux), which `install` raises to
+    /// `PIPE_BUF` when a client lowered it. `send(MSG_DONTWAIT)` would be the obvious alternative, and does not
+    /// work: measured on macOS, `send` to a full unix socket blocks despite the flag.
+    fn write_piece(fd: i32, bytes: &[u8]) -> isize {
+        let n = bytes.len().min(PIPE_BUF);
+        let mut p = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: `p` is a valid pollfd and the count is 1.
+        let ready = unsafe { libc::poll(&mut p, 1, 0) };
+        if ready < 0 {
+            return if last_errno() == libc::EINTR { -1 } else { 0 };
+        }
+        if ready == 0 || p.revents & libc::POLLOUT == 0 {
+            return 0;
+        }
+        // SAFETY: `bytes` holds at least `n` readable bytes.
+        let w = unsafe { libc::write(fd, bytes.as_ptr().cast(), n) };
+        if w < 0 {
+            return if last_errno() == libc::EINTR { -1 } else { 0 };
+        }
+        w
+    }
+
+    /// Write `bytes` to `fd` without ever waiting, one writer at a time; whatever cannot go is dropped and
+    /// its length returned. Async-signal-safe: atomics, `send`, `poll` and `write` only.
+    pub(super) fn write_nowait(fd: i32, mut bytes: &[u8]) -> usize {
+        let mut spins = 0u32;
+        while WRITING
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spins += 1;
+            if spins > LOCK_SPINS {
+                return bytes.len();
+            }
+            std::hint::spin_loop();
+        }
+        while !bytes.is_empty() {
+            match write_piece(fd, bytes) {
+                -1 => continue,
+                0 => break,
+                n => bytes = &bytes[n as usize..],
+            }
+        }
+        WRITING.store(false, Ordering::Release);
+        bytes.len()
     }
 
     /// To the real stderr: the saved descriptor without waiting when the shield is up, else a plain write to fd 2.
@@ -189,9 +193,54 @@ mod shield {
         }
     }
 
+    /// `SIGPIPE` must be ignored for the whole process (Rust's runtime does that for every binary): a `send`
+    /// to a closed socket would otherwise kill it, on platforms without `MSG_NOSIGNAL`.
+    fn sigpipe_is_ignored() -> bool {
+        // SAFETY: a read-only sigaction query into a zeroed struct.
+        unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut old) == 0
+                && old.sa_sigaction == libc::SIG_IGN
+        }
+    }
+
+    /// A socket client may have set `SO_SNDLOWAT` below `PIPE_BUF`, which would let `POLLOUT` promise less room
+    /// than one piece. Raise it (on our end only; a pipe or file just fails the call).
+    fn raise_send_low_water(fd: i32) {
+        let mut have: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: getsockopt/setsockopt on a descriptor this process owns, with correctly sized buffers.
+        unsafe {
+            if libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDLOWAT,
+                (&mut have as *mut libc::c_int).cast(),
+                &mut len,
+            ) == 0
+                && (have as usize) < PIPE_BUF
+            {
+                let want = PIPE_BUF as libc::c_int;
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDLOWAT,
+                    (&want as *const libc::c_int).cast(),
+                    len,
+                );
+            }
+        }
+    }
+
     pub(super) fn install() -> Result<(), String> {
         if is_up() {
             return Ok(());
+        }
+        if !sigpipe_is_ignored() {
+            return Err(
+                "SIGPIPE is not ignored, so a write to a closed socket could kill the process"
+                    .into(),
+            );
         }
         // SAFETY: plain descriptor calls; every descriptor opened here is closed on every failure path.
         unsafe {
@@ -203,6 +252,7 @@ mod shield {
             if saved < 0 {
                 return Err(format!("dup stderr: {}", std::io::Error::last_os_error()));
             }
+            raise_send_low_water(saved);
             let mut fds = [0i32; 2];
             if libc::pipe(fds.as_mut_ptr()) < 0 {
                 let e = std::io::Error::last_os_error();
@@ -228,7 +278,7 @@ mod shield {
                 return Err(format!("forwarder thread: {e}"));
             }
             if libc::dup2(w, 2) < 0 {
-                // The forwarder is already running on `r`; leave it (it ends when `w` closes) and stay unshielded.
+                // The forwarder is already running on `r`; it ends when `w` closes.
                 let e = std::io::Error::last_os_error();
                 libc::close(w);
                 libc::close(saved);
@@ -245,7 +295,8 @@ mod shield {
         drain(DRAIN_BOUND);
     }
 
-    pub(super) fn drain(bound: Duration) {
+    /// Wait up to `bound` for what the pipe holds to reach the real stderr (or be dropped).
+    fn drain(bound: Duration) {
         let r = READ_END.load(Ordering::Acquire);
         if r < 0 || !is_up() {
             return;
@@ -262,6 +313,21 @@ mod shield {
         }
     }
 
+    /// The forwarder cannot go on (its read end failed or ended): fd 2 would be a pipe nobody drains, and once
+    /// it filled every `eprintln!` in the process would block. Point fd 2 at /dev/null first, then let go of
+    /// the read end.
+    fn give_up(read_end: i32) {
+        if let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
+            use std::os::fd::AsRawFd as _;
+            // SAFETY: both descriptors are valid; `null` closes itself when it drops.
+            unsafe { libc::dup2(null.as_raw_fd(), 2) };
+        }
+        READ_END.store(-1, Ordering::Release);
+        BUSY.store(false, Ordering::Release);
+        // SAFETY: this thread owns `read_end`.
+        unsafe { libc::close(read_end) };
+    }
+
     fn forward(read_end: i32, saved: i32) {
         let mut buf = [0u8; 4096];
         loop {
@@ -270,13 +336,18 @@ mod shield {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            // SAFETY: `p` is a valid pollfd.
-            let ready = unsafe { libc::poll(&mut p, 1, -1) };
+            // SAFETY: `p` is a valid pollfd. A timeout, not -1: the descriptor number is looked up again on
+            // every round, so a read end that was closed or replaced under a sleeping poll (which the kernel
+            // does not wake) is noticed within a tick instead of stranding fd 2 for good.
+            let ready = unsafe { libc::poll(&mut p, 1, FORWARDER_TICK_MS) };
             if ready < 0 {
                 if last_errno() == libc::EINTR {
                     continue;
                 }
-                return;
+                return give_up(read_end);
+            }
+            if ready == 0 {
+                continue;
             }
             BUSY.store(true, Ordering::Release);
             // SAFETY: `buf` is a writable buffer of the length passed.
@@ -286,8 +357,7 @@ mod shield {
                 continue;
             }
             if n <= 0 {
-                BUSY.store(false, Ordering::Release);
-                return;
+                return give_up(read_end);
             }
             let dropped = write_nowait(saved, &buf[..n as usize]);
             DROPPED.fetch_add(dropped as u64, Ordering::Relaxed);
