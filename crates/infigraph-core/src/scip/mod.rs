@@ -521,14 +521,34 @@ pub fn discard_if_rejected(path: &Path) -> Option<ScipRejected> {
     Some(rejected)
 }
 
-/// Order a file's symbols for the container lookup: the smallest span that holds a line comes
-/// first. The graph preload has no ORDER BY, so ties on span size (two symbols of the same
-/// span, or of the same length) must not fall to row order, or the container of a reference,
-/// and with it the edges an import writes, differs between runs over one unchanged graph.
-fn sort_for_containment(symbols: &mut [(u32, u32, String)]) {
-    symbols.sort_by(|(s1, e1, id1), (s2, e2, id2)| {
-        (*e1 as i64 - *s1 as i64, s1, id1).cmp(&(*e2 as i64 - *s2 as i64, s2, id2))
-    });
+/// Order a file's symbols for the container lookup: the first one that holds a reference's
+/// line is its container. The graph preload has no ORDER BY, so every tie must be settled by
+/// the symbols themselves, never by row order, or the edges an import writes differ with it.
+/// The order is: the smallest span (lines); then real code before the rest (a function,
+/// method, test, class, struct or module, as `metadata::is_container` says, before a
+/// variable, property or interface that happens to share its span); then a named symbol
+/// before a numeric literal member (`136`, `136#1`); then the earlier start line; then the id.
+/// `kind_of` gives a symbol's kind by id; an id it does not know ranks with the rest.
+fn sort_for_containment<'a>(
+    symbols: &mut [(u32, u32, String)],
+    kind_of: impl Fn(&str) -> Option<&'a str>,
+) {
+    let key = |(start, end, id): &(u32, u32, String)| {
+        let real_code = kind_of(id).is_some_and(metadata::is_container);
+        let numeric = {
+            let name = id.rsplit("::").next().unwrap_or(id);
+            let base = name.split('#').next().unwrap_or(name);
+            !base.is_empty() && base.bytes().all(|b| b.is_ascii_digit())
+        };
+        (
+            *end as i64 - *start as i64,
+            !real_code,
+            numeric,
+            *start,
+            id.clone(),
+        )
+    };
+    symbols.sort_by_cached_key(key);
 }
 
 /// Import a SCIP index.scip file into the Infigraph graph store.
@@ -694,7 +714,7 @@ fn import_scip_index_unrecorded(
 
     // Sort file_symbols by span size (smallest first) for containment lookup
     for syms in file_symbols.values_mut() {
-        sort_for_containment(syms);
+        sort_for_containment(syms, |id| existing.get(id).map(|e| e.kind.as_str()));
     }
     clock.lap("preload symbols");
 
@@ -1164,8 +1184,17 @@ fn import_scip_index_unrecorded(
                 .or_default()
                 .push((*start, *end, id.clone()));
         }
+        let new_kinds: HashMap<&str, &str> = remaining
+            .iter()
+            .map(|(id, _, kind, ..)| (id.as_str(), kind.as_str()))
+            .collect();
         for syms in file_symbols.values_mut() {
-            sort_for_containment(syms);
+            sort_for_containment(syms, |id| {
+                new_kinds
+                    .get(id)
+                    .copied()
+                    .or_else(|| existing.get(id).map(|e| e.kind.as_str()))
+            });
         }
         if duplicates > 0 {
             crate::last_run::note(
@@ -4200,31 +4229,33 @@ mod tests {
         );
     }
 
-    /// Two symbols with the same span (a class and its constructor, an `export const f` and
-    /// its arrow function) both contain a reference. The graph preload has no ORDER BY, so
-    /// which one the reference belonged to followed the order the rows came back in, and the
-    /// edges an enrichment wrote differed from run to run (`references_added` 121,504 /
-    /// 121,526 / 121,550 on one graph with nothing changed between runs).
+    /// Two symbols with spans of the same length (a class and its constructor, or any two
+    /// one-line members that share a line: a span is lines only, so they tie) both contain a
+    /// reference. The graph preload has no ORDER BY, so which one the reference belonged to
+    /// followed the row order. The winner is now fixed by `sort_for_containment`: real code
+    /// before a variable, a named symbol before a numeric one, then start line, then id.
+    /// Builds the graph with the two symbols created in the given order, imports one
+    /// reference inside both, and returns the CALLS edges.
     fn twin_callers_graph(
-        first: &str,
-        second: &str,
+        first: (&str, &str),
+        second: (&str, &str),
     ) -> std::collections::BTreeSet<(String, String)> {
         let env = TestEnv::new();
         env.add_file("test.ts");
         {
             let conn = env.store.connection().unwrap();
-            let create = |id: &str, name: &str, start: u32, end: u32| {
+            let create = |id: &str, kind: &str, start: u32, end: u32| {
                 conn.query(&format!(
-                    "CREATE (:Symbol {{id: 'test.ts::{id}', name: '{name}', kind: 'function', \
+                    "CREATE (:Symbol {{id: 'test.ts::{id}', name: '{id}', kind: '{kind}', \
                      file: 'test.ts', start_line: {start}, end_line: {end}, signature_hash: '', \
                      language: 'typescript', visibility: 'public', parent: '', docstring: '', \
                      complexity: 0, parameters: '', return_type: ''}})"
                 ))
                 .unwrap();
             };
-            create("target", "target", 1, 5);
-            create(first, first, 20, 25);
-            create(second, second, 20, 25);
+            create("target", "function", 1, 5);
+            create(first.0, first.1, 20, 25);
+            create(second.0, second.1, 20, 25);
         }
         let target = "scip-test npm test 1.0.0 `test.ts`/target().".to_string();
         let doc = Document {
@@ -4259,10 +4290,40 @@ mod tests {
 
     #[test]
     fn a_reference_inside_two_symbols_of_one_span_belongs_to_the_same_one_whatever_the_row_order() {
-        let ab = twin_callers_graph("caller_a", "caller_b");
-        let ba = twin_callers_graph("caller_b", "caller_a");
+        let ab = twin_callers_graph(("caller_a", "function"), ("caller_b", "function"));
+        let ba = twin_callers_graph(("caller_b", "function"), ("caller_a", "function"));
         assert_eq!(ab, ba, "the container followed the preload's row order");
         assert_eq!(ab.len(), 1, "{ab:?}");
+    }
+
+    /// The ids are chosen so a bare id tie-break would pick the wrong one ("a_var" < "z_fn").
+    #[test]
+    fn a_function_beats_a_variable_on_one_span_whatever_the_row_order() {
+        let want: std::collections::BTreeSet<(String, String)> =
+            [("test.ts::z_fn".to_string(), "test.ts::target".to_string())].into();
+        assert_eq!(
+            twin_callers_graph(("a_var", "variable"), ("z_fn", "function")),
+            want
+        );
+        assert_eq!(
+            twin_callers_graph(("z_fn", "function"), ("a_var", "variable")),
+            want
+        );
+    }
+
+    /// "136" sorts before "named" as a string; the named variable must still win.
+    #[test]
+    fn a_named_variable_beats_a_numeric_one_on_one_span_whatever_the_row_order() {
+        let want: std::collections::BTreeSet<(String, String)> =
+            [("test.ts::named".to_string(), "test.ts::target".to_string())].into();
+        assert_eq!(
+            twin_callers_graph(("136#1", "variable"), ("named", "variable")),
+            want
+        );
+        assert_eq!(
+            twin_callers_graph(("named", "variable"), ("136#1", "variable")),
+            want
+        );
     }
 
     /// Two same-named symbols of one span rank equally for a definition that names neither
