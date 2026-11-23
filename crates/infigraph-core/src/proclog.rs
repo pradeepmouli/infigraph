@@ -28,8 +28,10 @@ pub fn stderr_line(line: &str) {
     let _ = writeln!(std::io::stderr(), "{line}");
 }
 
-/// Write `bytes` to the process's real stderr from a signal handler (async-signal-safe: no allocation, no lock,
-/// only `poll(2)` and `write(2)`). With the shield up that is the saved descriptor, written without waiting,
+/// Write `bytes` to the process's real stderr from a signal handler (async-signal-safe: no allocation, no
+/// mutex; atomics, `poll(2)` and `write(2)` only). With the shield up it takes the shield's spin lock as a
+/// bounded try-lock and drops the bytes on contention, so a handler that interrupted the lock's holder cannot
+/// wait for it. With the shield up that is the saved descriptor, written without waiting,
 /// because a line left in the shield's own pipe dies with the process; otherwise it is fd 2.
 pub fn write_stderr_async_safe(bytes: &[u8]) {
     #[cfg(unix)]
@@ -51,12 +53,17 @@ pub fn write_stderr_async_safe(bytes: &[u8]) {
 /// descriptor without ever waiting for it. The saved descriptor is whatever the client gave: a pipe or a unix
 /// socket in practice. It is written only after `poll(POLLOUT)` says it can take a piece, in pieces of at most
 /// `PIPE_BUF` bytes, which cannot block a pipe (POSIX) or a unix socket (`POLLOUT` promises `SO_SNDLOWAT`
-/// bytes); `send(MSG_DONTWAIT)` was measured to block on a full macOS socket, so it is not used. One lock around poll and write keeps a second writer from using the
-/// space the first just saw. What cannot go is dropped and counted (`dropped_stderr_bytes`). `O_NONBLOCK` is
+/// bytes); `send(MSG_DONTWAIT)` was measured to block on a full macOS socket, so it is not used. One lock
+/// around poll and write keeps a second writer *in this process* from using the space the first just saw. What cannot go is dropped and counted (`dropped_stderr_bytes`). `O_NONBLOCK` is
 /// never set on the saved descriptor, since that open file description is shared with the client. An exit
 /// drains the pipe first (`atexit`, bounded by `DRAIN_BOUND`), as a courtesy rather than a guarantee. Call it
 /// first thing in `main`, before any thread starts; fd 1 is never touched. Returns the reason when a step
 /// failed, and then the process carries on unshielded.
+///
+/// Known limit: the guarantee that a write after `POLLOUT` cannot block assumes this process is the only
+/// writer on the saved descriptor. If a client gave the same pipe or socket to several processes and stopped
+/// reading, two of them can both see room for one piece, and the second write can block (the shield's own
+/// lock is per process).
 pub fn shield_stderr() -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -86,7 +93,9 @@ mod shield {
     use std::time::{Duration, Instant};
 
     /// POSIX's minimum `PIPE_BUF` (macOS has exactly this, Linux 4096): a write of at most this many bytes to
-    /// a pipe that polled writable never blocks and is never split.
+    /// a pipe that polled writable never blocks and is never split. For a unix stream socket the same size is
+    /// safe because `POLLOUT` promises at least `SO_SNDLOWAT` bytes of room, which `install` keeps at or above
+    /// this size; it is the piece size for both.
     const PIPE_BUF: usize = 512;
     /// How long an exit waits for the forwarder to hand over what the pipe holds.
     const DRAIN_BOUND: Duration = Duration::from_millis(300);
@@ -149,7 +158,8 @@ mod shield {
     }
 
     /// Write `bytes` to `fd` without ever waiting, one writer at a time; whatever cannot go is dropped and
-    /// its length returned. Async-signal-safe: atomics, `send`, `poll` and `write` only.
+    /// its length returned. Async-signal-safe: atomics, `poll` and `write` only; the lock is a bounded spin that
+    /// gives up and drops, never a wait.
     pub(super) fn write_nowait(fd: i32, mut bytes: &[u8]) -> usize {
         let mut spins = 0u32;
         while WRITING
@@ -193,8 +203,8 @@ mod shield {
         }
     }
 
-    /// `SIGPIPE` must be ignored for the whole process (Rust's runtime does that for every binary): a `send`
-    /// to a closed socket would otherwise kill it, on platforms without `MSG_NOSIGNAL`.
+    /// `SIGPIPE` must be ignored for the whole process (Rust's runtime does that for every binary): a `write`
+    /// to a closed pipe or socket, from the forwarder or from a signal handler, would otherwise kill it.
     fn sigpipe_is_ignored() -> bool {
         // SAFETY: a read-only sigaction query into a zeroed struct.
         unsafe {
