@@ -521,6 +521,16 @@ pub fn discard_if_rejected(path: &Path) -> Option<ScipRejected> {
     Some(rejected)
 }
 
+/// Order a file's symbols for the container lookup: the smallest span that holds a line comes
+/// first. The graph preload has no ORDER BY, so ties on span size (two symbols of the same
+/// span, or of the same length) must not fall to row order, or the container of a reference,
+/// and with it the edges an import writes, differs between runs over one unchanged graph.
+fn sort_for_containment(symbols: &mut [(u32, u32, String)]) {
+    symbols.sort_by(|(s1, e1, id1), (s2, e2, id2)| {
+        (*e1 as i64 - *s1 as i64, s1, id1).cmp(&(*e2 as i64 - *s2 as i64, s2, id2))
+    });
+}
+
 /// Import a SCIP index.scip file into the Infigraph graph store.
 ///
 /// Matches SCIP definitions to existing tree-sitter symbols by (file, name)
@@ -684,7 +694,7 @@ fn import_scip_index_unrecorded(
 
     // Sort file_symbols by span size (smallest first) for containment lookup
     for syms in file_symbols.values_mut() {
-        syms.sort_by_key(|(s, e, _)| *e as i64 - *s as i64);
+        sort_for_containment(syms);
     }
     clock.lap("preload symbols");
 
@@ -997,7 +1007,10 @@ fn import_scip_index_unrecorded(
                 })
                 .flatten()
                 .filter_map(|(s, e, id)| rank(*s, *e, id).map(|r| (r, *s, id)))
-                .min_by_key(|(r, ..)| *r)
+                // Equal ranks are ordered by start line, then id: the preload has no
+                // ORDER BY, so a tie left to row order picks a different candidate on
+                // each run over one unchanged graph.
+                .min_by_key(|(r, s, id)| (*r, *s, id.as_str()))
                 .map(|(_, s, id)| (s, id.clone()))
                 .or_else(|| {
                     if literal.is_some() || local_id.is_some() {
@@ -1152,7 +1165,7 @@ fn import_scip_index_unrecorded(
                 .push((*start, *end, id.clone()));
         }
         for syms in file_symbols.values_mut() {
-            syms.sort_by_key(|(s, e, _)| *e as i64 - *s as i64);
+            sort_for_containment(syms);
         }
         if duplicates > 0 {
             crate::last_run::note(
@@ -4184,6 +4197,129 @@ mod tests {
         assert_eq!(
             second.references_added, 0,
             "the edge is already in the graph"
+        );
+    }
+
+    /// Two symbols with the same span (a class and its constructor, an `export const f` and
+    /// its arrow function) both contain a reference. The graph preload has no ORDER BY, so
+    /// which one the reference belonged to followed the order the rows came back in, and the
+    /// edges an enrichment wrote differed from run to run (`references_added` 121,504 /
+    /// 121,526 / 121,550 on one graph with nothing changed between runs).
+    fn twin_callers_graph(
+        first: &str,
+        second: &str,
+    ) -> std::collections::BTreeSet<(String, String)> {
+        let env = TestEnv::new();
+        env.add_file("test.ts");
+        {
+            let conn = env.store.connection().unwrap();
+            let create = |id: &str, name: &str, start: u32, end: u32| {
+                conn.query(&format!(
+                    "CREATE (:Symbol {{id: 'test.ts::{id}', name: '{name}', kind: 'function', \
+                     file: 'test.ts', start_line: {start}, end_line: {end}, signature_hash: '', \
+                     language: 'typescript', visibility: 'public', parent: '', docstring: '', \
+                     complexity: 0, parameters: '', return_type: ''}})"
+                ))
+                .unwrap();
+            };
+            create("target", "target", 1, 5);
+            create(first, first, 20, 25);
+            create(second, second, 20, 25);
+        }
+        let target = "scip-test npm test 1.0.0 `test.ts`/target().".to_string();
+        let doc = Document {
+            relative_path: "test.ts".to_string(),
+            occurrences: vec![
+                Occurrence {
+                    symbol: target.clone(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..ranged(RangeForm::Legacy, 1, 9, 15)
+                },
+                Occurrence {
+                    symbol: target.clone(),
+                    symbol_roles: 0,
+                    ..ranged(RangeForm::Legacy, 21, 2, 8)
+                },
+            ],
+            symbols: vec![SymbolInformation {
+                symbol: target,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let index = Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let path = env._dir.path().join("index.scip");
+        std::fs::write(&path, index.write_to_bytes().unwrap()).unwrap();
+        import_scip_index(&path, &env.store, None).unwrap();
+        edge_pairs(&env, "CALLS", "id").into_iter().collect()
+    }
+
+    #[test]
+    fn a_reference_inside_two_symbols_of_one_span_belongs_to_the_same_one_whatever_the_row_order() {
+        let ab = twin_callers_graph("caller_a", "caller_b");
+        let ba = twin_callers_graph("caller_b", "caller_a");
+        assert_eq!(ab, ba, "the container followed the preload's row order");
+        assert_eq!(ab.len(), 1, "{ab:?}");
+    }
+
+    /// Two same-named symbols of one span rank equally for a definition that names neither
+    /// by moniker; the one `scip_id` landed on followed the preload's row order.
+    fn enriched_of_twin_defs(first: &str, second: &str) -> Vec<String> {
+        let env = TestEnv::new();
+        env.add_file("test.ts");
+        {
+            let conn = env.store.connection().unwrap();
+            for id in [first, second] {
+                conn.query(&format!(
+                    "CREATE (:Symbol {{id: 'test.ts::{id}::foo', name: 'foo', kind: 'method', \
+                     file: 'test.ts', start_line: 10, end_line: 15, signature_hash: '', \
+                     language: 'typescript', visibility: 'public', parent: 'test.ts::{id}', \
+                     docstring: '', complexity: 0, parameters: '', return_type: '', scip_id: ''}})"
+                ))
+                .unwrap();
+            }
+        }
+        let foo = "scip-test npm test 1.0.0 `test.ts`/foo().".to_string();
+        let doc = Document {
+            relative_path: "test.ts".to_string(),
+            occurrences: vec![Occurrence {
+                symbol: foo.clone(),
+                symbol_roles: SymbolRole::Definition as i32,
+                ..ranged(RangeForm::Legacy, 10, 4, 7)
+            }],
+            symbols: vec![SymbolInformation {
+                symbol: foo,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let index = Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let path = env._dir.path().join("index.scip");
+        std::fs::write(&path, index.write_to_bytes().unwrap()).unwrap();
+        import_scip_index(&path, &env.store, None).unwrap();
+        let conn = env.store.connection().unwrap();
+        let mut ids: Vec<String> = conn
+            .query("MATCH (s:Symbol) WHERE s.scip_id <> '' RETURN s.id")
+            .unwrap()
+            .map(|r| raw_string(&r[0]).to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn a_definition_that_two_equal_candidates_fit_enriches_the_same_one_whatever_the_row_order() {
+        let ab = enriched_of_twin_defs("A", "B");
+        let ba = enriched_of_twin_defs("B", "A");
+        assert_eq!(
+            ab, ba,
+            "the enriched symbol followed the preload's row order"
         );
     }
 
