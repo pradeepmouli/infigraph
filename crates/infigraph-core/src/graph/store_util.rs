@@ -1026,6 +1026,99 @@ impl IncomingEdges {
 /// Source ids per existence query in [`absent_edges`].
 const EXISTING_SOURCES_PER_QUERY: usize = 1000;
 
+/// From this many sources a chunk is looked up with [`existing_edges_unwind`]; below it
+/// with [`existing_edges_in_list`].
+///
+/// 100 is a crossover MEASURED on one graph, not a property of the query forms. Read-only
+/// on one 498,436-symbol graph (the rule-library snapshot), median of 5, CALLS, READS and
+/// REFERENCES alike: the IN-list form costs 5 ms for 1 source, 8 ms for 10, 34 ms for 100
+/// and 285-288 ms for 1,000; the UNWIND form costs a flat 25-35 ms for 1, 10 and 100
+/// sources, and 38-44 ms for 1,000. An incremental one-file index asks about a handful of
+/// sources per edge table. A different engine version or a graph of a very different size
+/// or shape could move the crossover; re-measure both forms at 1, 10, 100 and 1,000
+/// sources before changing this number.
+const UNWIND_FROM_SOURCES: usize = 100;
+
+/// The edges of `table` that start at one of `sources`, as `(source id, target id)`.
+fn existing_edges_of(
+    conn: &GatedConnection<'_>,
+    table: &str,
+    src_label: &str,
+    dst_label: &str,
+    sources: &[&str],
+) -> Result<Vec<(String, String)>> {
+    if sources.len() < UNWIND_FROM_SOURCES {
+        existing_edges_in_list(conn, table, src_label, dst_label, sources)
+    } else {
+        existing_edges_unwind(conn, table, src_label, dst_label, sources)
+    }
+}
+
+fn id_literals(sources: &[&str]) -> String {
+    sources
+        .iter()
+        .map(|s| format!("'{}'", escape(s)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn read_edge_rows(
+    conn: &GatedConnection<'_>,
+    table: &str,
+    query: &str,
+) -> Result<Vec<(String, String)>> {
+    let rows = conn
+        .query(query)
+        .map_err(|e| anyhow::anyhow!("reading the existing {table} edges: {e}"))?;
+    Ok(rows
+        .filter(|row| row.len() >= 2)
+        .map(|row| {
+            (
+                raw_string(&row[0]).to_string(),
+                raw_string(&row[1]).to_string(),
+            )
+        })
+        .collect())
+}
+
+/// `WHERE a.id IN [...]`: cheap for a few sources, and the cost grows with their number.
+fn existing_edges_in_list(
+    conn: &GatedConnection<'_>,
+    table: &str,
+    src_label: &str,
+    dst_label: &str,
+    sources: &[&str],
+) -> Result<Vec<(String, String)>> {
+    read_edge_rows(
+        conn,
+        table,
+        &format!(
+            "MATCH (a:{src_label})-[:{table}]->(b:{dst_label}) WHERE a.id IN [{}] RETURN a.id, b.id",
+            id_literals(sources)
+        ),
+    )
+}
+
+/// `UNWIND [...] AS x MATCH (a {id: x})`: a flat cost, so it wins for many sources. EXPLAIN
+/// of this form shows two table scans and four hash joins and no primary-key scan, so the
+/// gain is the measured one and not a key lookup.
+fn existing_edges_unwind(
+    conn: &GatedConnection<'_>,
+    table: &str,
+    src_label: &str,
+    dst_label: &str,
+    sources: &[&str],
+) -> Result<Vec<(String, String)>> {
+    read_edge_rows(
+        conn,
+        table,
+        &format!(
+            "UNWIND [{}] AS x MATCH (a:{src_label} {{id: x}})-[:{table}]->(b:{dst_label}) RETURN a.id, b.id",
+            id_literals(sources)
+        ),
+    )
+}
+
 /// The `(source, target)` pairs of `table` the graph does not hold yet, each
 /// once, in their original order.
 ///
@@ -1053,21 +1146,7 @@ pub(crate) fn absent_edges(
         .collect();
     let mut present: HashSet<(String, String)> = HashSet::new();
     for chunk in sources.chunks(EXISTING_SOURCES_PER_QUERY) {
-        let ids: Vec<String> = chunk.iter().map(|s| format!("'{}'", escape(s))).collect();
-        let rows = conn
-            .query(&format!(
-                "MATCH (a:{src_label})-[:{table}]->(b:{dst_label}) WHERE a.id IN [{}] RETURN a.id, b.id",
-                ids.join(", ")
-            ))
-            .map_err(|e| anyhow::anyhow!("reading the existing {table} edges: {e}"))?;
-        for row in rows {
-            if row.len() >= 2 {
-                present.insert((
-                    raw_string(&row[0]).to_string(),
-                    raw_string(&row[1]).to_string(),
-                ));
-            }
-        }
+        present.extend(existing_edges_of(conn, table, src_label, dst_label, chunk)?);
     }
     let mut seen = present;
     Ok(pairs
@@ -1474,6 +1553,103 @@ mod tests {
             fresh,
             vec![("a.py::s0".to_string(), "a.py::s2".to_string())],
             "the existing edge and the in-batch repeat are both dropped"
+        );
+    }
+
+    /// A batch of any size finds its existing edges, on either side of the cutover.
+    #[test]
+    fn absent_edges_drops_existing_edges_below_and_above_the_unwind_cutover() {
+        for n in [
+            1,
+            super::UNWIND_FROM_SOURCES - 1,
+            super::UNWIND_FROM_SOURCES,
+            250,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = store_with_symbols(tmp.path(), n + 1);
+            let pairs: Vec<(String, String)> = (0..n)
+                .map(|i| (format!("a.py::s{i}"), format!("a.py::s{}", i + 1)))
+                .collect();
+            let refs: Vec<(&str, &str)> = pairs
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect();
+            write_calls(&store, &refs);
+            let conn = store.connection().unwrap();
+            let fresh = super::absent_edges(&conn, "CALLS", "Symbol", "Symbol", pairs).unwrap();
+            assert!(fresh.is_empty(), "n={n}: every edge exists: {fresh:?}");
+        }
+    }
+
+    /// The lookup form changed from `WHERE a.id IN [...]` to `UNWIND ... {id: x}`. The two
+    /// must return the same rows, including for ids that need escaping in the literal.
+    #[test]
+    fn the_unwind_lookup_returns_what_the_in_list_lookup_returned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            super::super::GraphStore::open(&tmp.path().join(crate::graph::names::STEM)).unwrap();
+        let ids: Vec<String> = vec![
+            "plain".into(),
+            "it's".into(),
+            "back\\slash".into(),
+            "quo\"te".into(),
+            "tail\\".into(),
+            "\\'mixed\\\"'".into(),
+            "caf\u{e9}::\u{65e5}\u{672c}".into(),
+            "line\nbreak".into(),
+            "a b\ttab".into(),
+            "{id: 'x'}".into(),
+            "$param".into(),
+            "".into(),
+        ];
+        {
+            let conn = store.connection().unwrap();
+            for id in &ids {
+                conn.query(&format!(
+                    "CREATE (s:Symbol {{id: '{}', name: 'n', kind: 'Function', file: 'a.py'}})",
+                    super::escape(id)
+                ))
+                .unwrap();
+            }
+        }
+        // `escape` folds control whitespace to spaces (`literal_round_trip`), so an id with a
+        // newline or tab is STORED as its folded form, and that is the id an edge names. The
+        // raw ids still go into both lookups below, which fold them the same way.
+        let stored: Vec<String> = ids.iter().map(|id| super::literal_round_trip(id)).collect();
+        // every id calls the next one, and the first calls the last
+        let pairs: Vec<(String, String)> = (0..stored.len())
+            .map(|i| (stored[i].clone(), stored[(i + 1) % stored.len()].clone()))
+            .collect();
+        let conn = store.connection().unwrap();
+        let refs: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        super::write_absent_edges(&conn, "Symbol", "Symbol", "CALLS", &refs).unwrap();
+
+        let sources: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        let in_list: std::collections::BTreeSet<(String, String)> =
+            super::existing_edges_in_list(&conn, "CALLS", "Symbol", "Symbol", &sources)
+                .unwrap()
+                .into_iter()
+                .collect();
+        let unwind: std::collections::BTreeSet<(String, String)> =
+            super::existing_edges_unwind(&conn, "CALLS", "Symbol", "Symbol", &sources)
+                .unwrap()
+                .into_iter()
+                .collect();
+
+        // not two empty results: the IN-list form finds every edge written above
+        assert_eq!(
+            in_list.len(),
+            ids.len(),
+            "the IN-list form finds every edge: {in_list:?}"
+        );
+        assert_eq!(unwind, in_list);
+        let fresh = super::absent_edges(&conn, "CALLS", "Symbol", "Symbol", pairs).unwrap();
+        assert!(
+            fresh.is_empty(),
+            "every edge exists, so none is absent: {fresh:?}"
         );
     }
 
