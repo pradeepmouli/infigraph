@@ -122,7 +122,8 @@ impl Cursor<'_> {
 }
 
 /// Installs a SIGABRT handler that writes the breadcrumb line to stderr
-/// (the daemon's `daemon.log`) and lets the abort proceed. Call once, from
+/// (the daemon's `daemon.log`; behind the stderr shield, the saved real stderr, since a line left in the
+/// shield's own pipe dies with the process) and lets the abort proceed. Call once, from
 /// the daemon's main, next to its panic hook.
 #[cfg(unix)]
 pub fn install_abort_breadcrumb() {
@@ -134,7 +135,7 @@ pub fn install_abort_breadcrumb() {
         // default action once this handler returns and the process still
         // dies by SIGABRT (core dump semantics untouched).
         unsafe {
-            libc::write(libc::STDERR_FILENO, buf.as_ptr().cast(), n);
+            crate::proclog::write_stderr_async_safe(&buf[..n]);
             libc::raise(libc::SIGABRT);
         }
     }

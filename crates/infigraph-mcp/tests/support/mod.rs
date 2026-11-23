@@ -34,6 +34,11 @@ use serde_json::{json, Value};
 #[path = "../../../infigraph-core/tests/common/stdio.rs"]
 pub mod stdio;
 
+/// `Transport` and `channel`: a pipe or a unix socket as a server's stderr.
+#[path = "../../../infigraph-core/tests/common/stderr_channel.rs"]
+pub mod stderr_channel;
+pub use stderr_channel::Transport;
+
 /// A tiny project with a graph, a document index and a git history.
 pub mod docs;
 
@@ -477,8 +482,10 @@ pub struct Server {
     pub _tmp: tempfile::TempDir,
     pub instances: PathBuf,
     pub child: Child,
-    pub stdin: ChildStdin,
+    pub stdin: Option<ChildStdin>,
     pub replies: Receiver<Value>,
+    /// The client's end of the server's stderr, when the test asked for one (`start_supervisor_stderr`).
+    pub stderr: Option<std::fs::File>,
 }
 
 impl Drop for Server {
@@ -500,6 +507,24 @@ pub fn start_supervisor_with(
     args: &[&str],
     extra_env: &[(&str, &str)],
 ) -> Server {
+    spawn_supervisor(program, args, extra_env, Stdio::null())
+}
+
+/// [`start_supervisor`] with the server's stderr a pipe or unix socket whose other end the test holds
+/// (`Server::stderr`).
+pub fn start_supervisor_stderr(transport: Transport, extra_env: &[(&str, &str)]) -> Server {
+    let (client_end, server_end) = stderr_channel::channel(transport);
+    let mut server = spawn_supervisor(None, &["--mcp"], extra_env, Stdio::from(server_end));
+    server.stderr = Some(client_end);
+    server
+}
+
+fn spawn_supervisor(
+    program: Option<&Path>,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+    stderr: Stdio,
+) -> Server {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let startup = root.join("startup");
@@ -516,7 +541,7 @@ pub fn start_supervisor_with(
         .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(stderr);
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -538,8 +563,9 @@ pub fn start_supervisor_with(
         _tmp: tmp,
         instances,
         child,
-        stdin,
+        stdin: Some(stdin),
         replies,
+        stderr: None,
     }
 }
 
@@ -556,8 +582,14 @@ impl Server {
     }
 
     pub fn send(&mut self, msg: Value) {
-        writeln!(self.stdin, "{msg}").unwrap();
-        self.stdin.flush().unwrap();
+        let stdin = self.stdin.as_mut().expect("stdin was closed");
+        writeln!(stdin, "{msg}").unwrap();
+        stdin.flush().unwrap();
+    }
+
+    /// Close the server's stdin: the end of the MCP session.
+    pub fn close_stdin(&mut self) {
+        self.stdin = None;
     }
 
     /// The reply to `id`, within `budget`.
