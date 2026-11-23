@@ -349,11 +349,11 @@ fn watchdog_should_defer(
 /// trace at all -- `infigraph daemon` had neither a panic hook nor a
 /// signal handler until R3.1.4's hardening pass; the signal handler
 /// (`ctrlc::set_handler`, below in `cmd_daemon`) already existed, this was
-/// the missing half. `eprintln!` is deliberate, not a shortcut: this
-/// process's stderr is already redirected to `daemon.log` by
+/// the missing half. The line goes to stderr only, not to a file of its
+/// own: this process's stderr is already redirected to `daemon.log` by
 /// `build_daemon_command`, so a second explicit file write would just
-/// double every line. Written through `proclog::stderr_line`, which ignores a failed write: a
-/// hook that panics aborts the process.
+/// double every line. It is written through `proclog::stderr_line`, which
+/// ignores a failed write, because a hook that panics aborts the process.
 fn install_daemon_panic_hook() {
     infigraph_core::proclog::install_panic_hook(|desc, bt| {
         infigraph_core::proclog::stderr_line(&format!("[daemon] PANIC: {desc}\n{bt}"));
