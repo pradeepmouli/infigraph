@@ -1125,7 +1125,8 @@ fn existing_edges_unwind(
 /// Every writer of a keyless edge table (CALLS, INHERITS, ...) comes through
 /// here, because such a table has no uniqueness: a COPY or CREATE appends
 /// whatever it is handed, and an edge written twice stays twice. The check
-/// covers the edges already in the graph and repeats inside `pairs`. It looks
+/// covers the edges already in the graph and repeats inside `pairs`, both judged in the
+/// ids' stored form (see [`literal_round_trip`]). It looks
 /// up only the batch's own sources, in chunks, so its cost follows the batch,
 /// not the size of the table.
 pub(crate) fn absent_edges(
@@ -1148,10 +1149,18 @@ pub(crate) fn absent_edges(
     for chunk in sources.chunks(EXISTING_SOURCES_PER_QUERY) {
         present.extend(existing_edges_of(conn, table, src_label, dst_label, chunk)?);
     }
-    let mut seen = present;
+    // `escape` folds control whitespace to a space when an id is written, so a pair is judged
+    // in its stored form: `line\nbreak` and `line break` are one edge, the one the graph
+    // holds or the one about to be written. Both sides are folded, so an id the bulk COPY
+    // path stored unfolded still matches. The pairs handed back keep the spelling they
+    // came in with.
+    let mut seen: HashSet<(String, String)> = present
+        .into_iter()
+        .map(|(src, dst)| (literal_round_trip(&src), literal_round_trip(&dst)))
+        .collect();
     Ok(pairs
         .into_iter()
-        .filter(|pair| seen.insert(pair.clone()))
+        .filter(|(src, dst)| seen.insert((literal_round_trip(src), literal_round_trip(dst))))
         .collect())
 }
 
@@ -1651,6 +1660,68 @@ mod tests {
             fresh.is_empty(),
             "every edge exists, so none is absent: {fresh:?}"
         );
+    }
+
+    /// `escape` folds control whitespace to a space, so an id with a newline or tab is STORED
+    /// as its folded form. `absent_edges` must judge a pair in that stored form: an edge
+    /// written once for `line\nbreak` is the edge for `line break`, and asking again with
+    /// either spelling must not offer it a second time (a keyless edge table would keep both).
+    #[test]
+    fn a_pair_with_a_newline_or_tab_is_compared_in_its_stored_form() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            super::super::GraphStore::open(&tmp.path().join(crate::graph::names::STEM)).unwrap();
+        {
+            let conn = store.connection().unwrap();
+            for id in ["line break", "a b tab", "plain"] {
+                conn.query(&format!(
+                    "CREATE (s:Symbol {{id: '{id}', name: 'n', kind: 'Function', file: 'a.py'}})"
+                ))
+                .unwrap();
+            }
+        }
+        let conn = store.connection().unwrap();
+        // written once, named with the raw characters
+        super::write_absent_edges(
+            &conn,
+            "Symbol",
+            "Symbol",
+            "CALLS",
+            &[("line\nbreak", "a b\ttab")],
+        )
+        .unwrap();
+        assert_eq!(calls_edge_count(&store), 1);
+
+        let again: Vec<(String, String)> = vec![
+            ("line\nbreak".into(), "a b\ttab".into()),
+            ("line break".into(), "a b tab".into()),
+            ("line\nbreak".into(), "plain".into()),
+            ("line break".into(), "plain".into()),
+        ];
+        let fresh = super::absent_edges(&conn, "CALLS", "Symbol", "Symbol", again).unwrap();
+        assert_eq!(
+            fresh,
+            vec![("line\nbreak".to_string(), "plain".to_string())],
+            "the written edge is present in either spelling, and the two spellings of the new \
+             one are one edge"
+        );
+
+        // and through the real writer: both spellings of the new edge, offered together,
+        // leave exactly one new row, and offering all four again adds nothing
+        let all = [
+            ("line\nbreak", "a b\ttab"),
+            ("line break", "a b tab"),
+            ("line\nbreak", "plain"),
+            ("line break", "plain"),
+        ];
+        super::write_absent_edges(&conn, "Symbol", "Symbol", "CALLS", &all).unwrap();
+        assert_eq!(
+            calls_edge_count(&store),
+            2,
+            "one written edge and one new edge"
+        );
+        super::write_absent_edges(&conn, "Symbol", "Symbol", "CALLS", &all).unwrap();
+        assert_eq!(calls_edge_count(&store), 2, "a replay writes nothing");
     }
 
     #[test]
