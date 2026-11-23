@@ -95,7 +95,7 @@ impl PathQueue for CodeIndex {
                         kind: WatchEventKind::Removed,
                         path: handle.root.join(path),
                         has_cross_file_calls: false,
-                        index: None,
+                        held: None,
                     },
                 );
             }

@@ -35,11 +35,53 @@ pub struct WatchEvent {
     pub path: PathBuf,
     /// True if this file has cross-file CALLS edges — full reindex needed to re-resolve them.
     pub has_cross_file_calls: bool,
-    /// The write coordinator's own graph handle, on the events it raises from its loop thread
-    /// (`Some`) and `None` on those raised elsewhere (the file-event producer). A handler that
-    /// has to touch the graph in answer to an event uses this one, never a `CodeIndex` of its
-    /// own: a process holds exactly one `Database` per graph file (#149).
-    pub index: Option<Arc<CodeIndex>>,
+    /// The coordinator's own graph handle, lent to the handler on the events the coordinator
+    /// raises from its loop thread (`Some`); `None` on those raised elsewhere (the file-event
+    /// producer). A handler that has to touch the graph in answer to an event uses this one,
+    /// never a `CodeIndex` of its own: a process holds exactly one `Database` per graph file
+    /// (#149).
+    pub held: Option<HeldStore>,
+}
+
+/// The write coordinator's graph handle, lent to an event handler for the length of its call.
+///
+/// A handler borrows the store ([`index`](Self::index)) and cannot clone it out, and must not
+/// keep the event, or a clone of it, past its call. A kept one pins the old `Database` across a
+/// poison and reopen: the coordinator waits for the retired store's last holder before it opens
+/// the next (`RETIRED_STORE_WAIT`), so retention stalls that reopen rather than corrupting
+/// anything.
+///
+/// A handler whose write to the graph failed says so with [`report_failed`](Self::report_failed);
+/// the coordinator then drops the held handle and reopens it, as it does for a failed drain, and
+/// raises no further event of that batch.
+#[derive(Clone)]
+pub struct HeldStore {
+    index: Arc<CodeIndex>,
+    failed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl HeldStore {
+    pub(crate) fn new(index: Arc<CodeIndex>) -> Self {
+        Self {
+            index,
+            failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// The coordinator's store, for the length of the handler's call.
+    pub fn index(&self) -> &CodeIndex {
+        &self.index
+    }
+
+    /// The handler's write to the graph failed: the coordinator treats its handle as suspect.
+    pub fn report_failed(&self) {
+        self.failed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a handler reported a failure since the last call, and forgets it.
+    pub(crate) fn take_failed(&self) -> bool {
+        self.failed.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl std::fmt::Debug for WatchEvent {
@@ -48,7 +90,7 @@ impl std::fmt::Debug for WatchEvent {
             .field("kind", &self.kind)
             .field("path", &self.path)
             .field("has_cross_file_calls", &self.has_cross_file_calls)
-            .field("index", &self.index.as_ref().map(|_| "<held store>"))
+            .field("held", &self.held.as_ref().map(|_| "<held store>"))
             .finish()
     }
 }
@@ -247,13 +289,14 @@ where
                 // read-write `Database` beside it (#149): its writes and checkpoints were
                 // invisible to the held one, whose next scan could read a torn view of
                 // the file.
-                let Some(p) = evt.index.as_ref() else {
+                let Some(held) = evt.held.as_ref() else {
                     eprintln!(
                         "[watch {prefix}] cross-file calls affected but the event carried no \
                          store -- skipping the targeted reindex"
                     );
                     return;
                 };
+                let p = held.index();
                 let changed_rel = evt
                     .path
                     .strip_prefix(&root_owned)
@@ -286,7 +329,8 @@ where
                                     eprintln!("[watch {prefix}] re-resolved: {stats}")
                                 }
                                 Err(e) => {
-                                    eprintln!("[watch {prefix}] re-resolve failed: {e}")
+                                    eprintln!("[watch {prefix}] re-resolve failed: {e}");
+                                    held.report_failed();
                                 }
                             }
 
@@ -307,7 +351,8 @@ where
                         }
                     }
                     Err(e) => {
-                        eprintln!("[watch {prefix}] targeted reindex failed: {e}")
+                        eprintln!("[watch {prefix}] targeted reindex failed: {e}");
+                        held.report_failed();
                     }
                 }
             } else {
@@ -640,7 +685,9 @@ mod tests {
         std::fs::write(&file_path, "v1").unwrap();
         let probe = raw_root.join("probe.txt");
 
-        let events: Arc<Mutex<Vec<WatchEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        // Only the paths: an event carries the coordinator's store (`WatchEvent::held`), and one
+        // kept past its call would pin it across a reopen.
+        let events: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
         let events_clone = Arc::clone(&events);
         let (stop_tx, stop_rx) = mpsc::channel();
 
@@ -650,7 +697,7 @@ mod tests {
                 || Ok(crate::lang::LanguageRegistry::new()),
                 50,
                 stop_rx,
-                move |evt| events_clone.lock().unwrap().push(evt),
+                move |evt| events_clone.lock().unwrap().push(evt.path),
             )
         });
 
@@ -686,7 +733,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|e| e.path.ends_with("watched.txt"))
+                .any(|p| p.ends_with("watched.txt"))
             {
                 seen = true;
                 break;

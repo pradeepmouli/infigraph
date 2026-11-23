@@ -820,11 +820,11 @@ fn auto_resolve_watcher_holds_one_read_write_database() {
     let graph = std::path::PathBuf::from(&path)
         .join(".infigraph")
         .join(infigraph_core::graph::names::STEM);
-    let (open_now, most_at_once) = infigraph_core::graph::rw_database_stats(&graph);
+    let stats = infigraph_core::graph::rw_database_stats(&graph);
     assert_eq!(
-        most_at_once,
+        stats.most_at_once,
         1,
-        "at most one read-write Database on {} at a time (open now: {open_now})",
+        "at most one read-write Database on {} at a time ({stats:?})",
         graph.display()
     );
 }
