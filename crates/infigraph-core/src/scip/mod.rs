@@ -562,6 +562,38 @@ fn sort_for_containment<'a>(
     symbols.sort_by_cached_key(key);
 }
 
+/// A file's container lookup (see [`sort_for_containment`]): the id of the first symbol whose
+/// lines hold a reference's line. A file has far more references than distinct lines, and every
+/// reference on a line has the same container, so each line is scanned once.
+struct ContainerLookup<'a> {
+    symbols: &'a [(u32, u32, String)],
+    by_line: HashMap<u32, Option<&'a str>>,
+    scans: usize,
+}
+
+impl<'a> ContainerLookup<'a> {
+    /// `symbols` must already be in containment order.
+    fn new(symbols: &'a [(u32, u32, String)]) -> Self {
+        Self {
+            symbols,
+            by_line: HashMap::new(),
+            scans: 0,
+        }
+    }
+
+    fn of_line(&mut self, line: u32) -> Option<&'a str> {
+        let symbols = self.symbols;
+        let scans = &mut self.scans;
+        *self.by_line.entry(line).or_insert_with(|| {
+            *scans += 1;
+            symbols
+                .iter()
+                .find(|(start, end, _)| line >= *start && line <= *end)
+                .map(|(_, _, id)| id.as_str())
+        })
+    }
+}
+
 /// Import a SCIP index.scip file into the Infigraph graph store.
 ///
 /// Matches SCIP definitions to existing tree-sitter symbols by (file, name)
@@ -1520,6 +1552,8 @@ fn import_scip_index_unrecorded(
     > = Default::default();
     for doc in &documents {
         let file = &doc.relative_path;
+        let mut containers =
+            ContainerLookup::new(file_symbols.get(file).map_or(&[][..], Vec::as_slice));
         for occ in &doc.occurrences {
             if (occ.symbol_roles & SymbolRole::Definition as i32) != 0
                 || occ.symbol.starts_with('<')
@@ -1527,12 +1561,7 @@ fn import_scip_index_unrecorded(
                 continue;
             }
             let ref_line = scip_line_to_1based(occurrence_range(occ).0);
-            let container = file_symbols.get(file).and_then(|symbols| {
-                symbols
-                    .iter()
-                    .find(|(start, end, _)| ref_line >= *start && ref_line <= *end)
-                    .map(|(_, _, id)| id.clone())
-            });
+            let container = containers.of_line(ref_line).map(str::to_owned);
             let key = metadata::symbol_key(file, &occ.symbol);
             let Some(target_id) = scip_sym_to_ts_id.get(&key).cloned() else {
                 continue;
@@ -1594,6 +1623,7 @@ fn import_scip_index_unrecorded(
             }
         }
     }
+    clock.lap("pass 2 occurrences");
     for (table, edges) in reference_edges {
         let pairs = crate::graph::store_util::absent_edges(
             &conn,
@@ -5782,6 +5812,59 @@ mod tests {
         assert_eq!(stats.symbols_added, 0);
         assert_eq!(stats.references_added, 0);
         assert_eq!(stats.relations_added, 0);
+    }
+}
+
+#[cfg(test)]
+mod container_lookup_tests {
+    use super::*;
+
+    /// Overlapping spans, a tie on span, a gap and a one-line symbol: the shapes a real file has.
+    fn file() -> Vec<(u32, u32, String)> {
+        let mut symbols = vec![
+            (3, 3, "f.rs::one_liner".to_string()),
+            (2, 8, "f.rs::A::m".to_string()),
+            (1, 10, "f.rs::A".to_string()),
+            (20, 30, "f.rs::g".to_string()),
+            (22, 24, "f.rs::g::inner".to_string()),
+        ];
+        sort_for_containment(&mut symbols, |_| None);
+        symbols
+    }
+
+    fn naive(symbols: &[(u32, u32, String)], line: u32) -> Option<&str> {
+        symbols
+            .iter()
+            .find(|(start, end, _)| line >= *start && line <= *end)
+            .map(|(_, _, id)| id.as_str())
+    }
+
+    #[test]
+    fn it_answers_every_line_as_a_linear_scan_does() {
+        let symbols = file();
+        let mut lookup = ContainerLookup::new(&symbols);
+        for line in 0..40 {
+            assert_eq!(lookup.of_line(line), naive(&symbols, line), "line {line}");
+        }
+        // Asked again, in another order: the same answers.
+        for line in (0..40).rev() {
+            assert_eq!(lookup.of_line(line), naive(&symbols, line), "line {line}");
+        }
+    }
+
+    #[test]
+    fn a_line_asked_twice_is_scanned_once() {
+        let symbols = file();
+        let mut lookup = ContainerLookup::new(&symbols);
+        assert_eq!(lookup.of_line(23), Some("f.rs::g::inner"));
+        assert_eq!(lookup.of_line(23), Some("f.rs::g::inner"));
+        assert_eq!(lookup.of_line(15), None);
+        assert_eq!(
+            lookup.of_line(15),
+            None,
+            "a line no symbol holds is cached too"
+        );
+        assert_eq!(lookup.scans, 2, "two distinct lines, four questions");
     }
 }
 
