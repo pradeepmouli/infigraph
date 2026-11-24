@@ -9,30 +9,77 @@
 use std::io::Write;
 use std::path::Path;
 
-/// Write one line to stderr and ignore the outcome. `eprintln!` PANICS when the write fails -- a
-/// broken pipe, which is what stderr becomes once the client that launched an MCP server or a
-/// daemon has closed its end -- and a logging call must never take its caller down with it.
+/// Set once, by a long-running process's own `main` (the daemon, the MCP server): from then on the
+/// `eprintln!`/`eprint!` macros the crates shadow std's with write through [`stderr_line`] / [`stderr_text`]
+/// and survive a failed write. Off by default, so tests and foreground commands keep std's macros (libtest
+/// captures them; a closed pipe stops a command that should stop). Call it before any thread that can print.
+static KEEP_RUNNING_ON_STDERR_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn the safe stderr write on for this process (see the flag above).
+pub fn keep_running_on_stderr_failure() {
+    KEEP_RUNNING_ON_STDERR_FAILURE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn keeps_running_on_stderr_failure() -> bool {
+    KEEP_RUNNING_ON_STDERR_FAILURE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// What `eprintln!` expands to. The one place std's `eprintln!` is called (`eprintln_guard` exempts exactly
+/// this function and `eprint_args`).
+#[doc(hidden)]
+pub fn eprintln_args(args: std::fmt::Arguments<'_>) {
+    if keeps_running_on_stderr_failure() {
+        stderr_line(&std::fmt::format(args));
+    } else {
+        std::eprintln!("{args}");
+    }
+}
+
+/// What `eprint!` expands to.
+#[doc(hidden)]
+pub fn eprint_args(args: std::fmt::Arguments<'_>) {
+    if keeps_running_on_stderr_failure() {
+        stderr_text(&std::fmt::format(args));
+    } else {
+        std::eprint!("{args}");
+    }
+}
+
+/// Write one line to stderr and ignore the outcome. `eprintln!` PANICS when the write fails -- a broken pipe,
+/// which is what stderr becomes once the client that launched an MCP server or a daemon has closed its end, or
+/// a log file on a full disk -- and a logging call must never take its caller down with it. The line and its
+/// newline go out in one write, so concurrent lines do not interleave.
 ///
 /// With the stderr shield up (`shield_stderr`) the line goes straight to the saved real stderr and is dropped
 /// when that cannot take it without waiting, so a panic hook never blocks on a client that stopped reading.
 pub fn stderr_line(line: &str) {
+    let mut bytes = Vec::with_capacity(line.len() + 1);
+    bytes.extend_from_slice(line.as_bytes());
+    bytes.push(b'\n');
+    write_stderr(&bytes);
+}
+
+/// [`stderr_line`] without the newline: what `eprint!` writes once the switch is on.
+pub fn stderr_text(text: &str) {
+    write_stderr(text.as_bytes());
+}
+
+fn write_stderr(bytes: &[u8]) {
     #[cfg(unix)]
     if shield::is_up() {
-        let mut bytes = Vec::with_capacity(line.len() + 1);
-        bytes.extend_from_slice(line.as_bytes());
-        bytes.push(b'\n');
-        shield::write_real(&bytes);
+        shield::write_real(bytes);
         return;
     }
     use std::io::Write as _;
-    let _ = writeln!(std::io::stderr(), "{line}");
+    let _ = std::io::stderr().lock().write_all(bytes);
 }
 
 /// Write `bytes` to the process's real stderr from a signal handler (async-signal-safe: no allocation, no
 /// mutex; atomics, `poll(2)` and `write(2)` only). With the shield up it takes the shield's spin lock as a
 /// bounded try-lock and drops the bytes on contention, so a handler that interrupted the lock's holder cannot
-/// wait for it. With the shield up that is the saved descriptor, written without waiting,
-/// because a line left in the shield's own pipe dies with the process; otherwise it is fd 2.
+/// wait for it. That descriptor is the saved real stderr, written without waiting, because a line
+/// left in the shield's own pipe dies with the process; without the shield it is fd 2.
 pub fn write_stderr_async_safe(bytes: &[u8]) {
     #[cfg(unix)]
     {

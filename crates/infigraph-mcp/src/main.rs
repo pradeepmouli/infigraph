@@ -1,3 +1,11 @@
+// Every plain `eprintln!`/`eprint!` in this crate (and its modules) goes through `infigraph_core::proclog`: std's
+// own while the process is a test or a foreground command, a write that ignores failure once a long-running
+// process has called `proclog::keep_running_on_stderr_failure()` (std's panics on a failed write, and a daemon
+// or MCP server whose log or client pipe went away died of its own logging).
+#[macro_use(eprintln, eprint)]
+#[allow(unused_imports)]
+extern crate infigraph_core;
+
 use std::io::{self, BufRead, Write};
 
 use anyhow::Result;
@@ -12,6 +20,9 @@ fn main() -> Result<()> {
     if infigraph_core::probe::run_if_probe_child() {
         return Ok(());
     }
+    // A long-running server: a failed write to stderr must never take it down, in the supervisor and the
+    // worker alike, and even when the shield below cannot be installed. Before any thread that can print.
+    infigraph_core::proclog::keep_running_on_stderr_failure();
     // Before any thread starts, in the supervisor and in the worker alike: every plain `eprintln!` below
     // this line (and in every crate) writes to a pipe this process owns, never to a client's pipe that may
     // be closed (`eprintln!` panics on a failed write).

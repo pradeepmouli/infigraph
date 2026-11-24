@@ -606,8 +606,17 @@ mod tests {
         let done = AtomicBool::new(false);
         let wins = std::sync::atomic::AtomicUsize::new(0);
         let wrong = std::sync::atomic::AtomicUsize::new(0);
+        /// Sets the flag on every exit from the handover thread, a panic included: the spinner loops until it
+        /// is set, so a handover thread that died on its `unwrap` once left the test hung for good.
+        struct SetOnDrop<'a>(&'a AtomicBool);
+        impl Drop for SetOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, SeqCst);
+            }
+        }
         std::thread::scope(|s| {
             s.spawn(|| {
+                let _done = SetOnDrop(&done);
                 for _ in 0..4000 {
                     drop(
                         store
@@ -615,7 +624,6 @@ mod tests {
                             .unwrap(),
                     );
                 }
-                done.store(true, SeqCst);
             });
             s.spawn(|| {
                 while !done.load(SeqCst) {
