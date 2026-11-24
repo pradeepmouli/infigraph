@@ -562,6 +562,51 @@ fn sort_for_containment<'a>(
     symbols.sort_by_cached_key(key);
 }
 
+/// Set `parent` and `visibility` on the Symbol rows the SCIP import has just matched:
+/// `(id, parent, private)` per row; an id with no row is skipped.
+///
+/// The rows travel in a Parquet file and one `LOAD FROM` statement, not as a Cypher literal:
+/// the database parses and binds a literal of structs at about 65 us a row, which was 11.3 of
+/// the 31 s of a 163,358-row import, and not the lookup (the same ids as a literal list of
+/// strings cost a tenth of that, and the key lookup about 1 ms for 2,000). It also needs no
+/// escaping of the ids.
+fn write_scope_metadata(conn: &GatedConnection<'_>, rows: &[(String, String, bool)]) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let _phase = crate::write_phase::enter(&"scip-import: scope metadata", rows.len() as u64);
+    let column = |value: &dyn Fn(&(String, String, bool)) -> &str| -> Arc<dyn arrow::array::Array> {
+        Arc::new(StringArray::from(
+            rows.iter().map(value).collect::<Vec<_>>(),
+        ))
+    };
+    let path = crate::graph::store_util::staging_parquet("infigraph_scip_scope");
+    let written = parquet_loader::write_node_parquet(
+        &path,
+        &[
+            ("id", DataType::Utf8),
+            ("parent", DataType::Utf8),
+            ("visibility", DataType::Utf8),
+        ],
+        vec![
+            column(&|(id, _, _)| id.as_str()),
+            column(&|(_, parent, _)| parent.as_str()),
+            column(&|(_, _, private)| if *private { "private" } else { "public" }),
+        ],
+    );
+    let result = written.and_then(|()| {
+        conn.query(&format!(
+            "LOAD FROM '{}' WITH id, parent, visibility MATCH (s:Symbol) WHERE s.id = id \
+             SET s.parent = parent, s.visibility = visibility",
+            crate::graph::store_util::fwd_slash_path(&path)
+        ))
+        .map(|_| ())
+        .map_err(Into::into)
+    });
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
 /// A file's container lookup (see [`sort_for_containment`]): the id of the first symbol whose
 /// lines hold a reference's line. A file has far more references than distinct lines, and every
 /// reference on a line has the same container, so each line is scanned once.
@@ -1517,24 +1562,12 @@ fn import_scip_index_unrecorded(
             }
         }
     }
+    clock.lap("scope metadata");
     let mut gate = store.growth_gate(1);
-    for chunk in parent_updates.chunks(CHUNK) {
-        gate.tick()?;
-        let _phase = crate::write_phase::enter(&"scip-import: scope metadata", chunk.len() as u64);
-        let values: Vec<_> = chunk
-            .iter()
-            .map(|(id, parent, local)| {
-                format!(
-                    "{{id: '{}', parent: '{}', visibility: '{}'}}",
-                    escape(id),
-                    escape(parent),
-                    if *local { "private" } else { "public" }
-                )
-            })
-            .collect();
-        conn.query(&format!("UNWIND [{}] AS e MATCH (s:Symbol) WHERE s.id = e.id SET s.parent = e.parent, s.visibility = e.visibility", values.join(", ")))
-            .context("SCIP import: writing enclosing symbols")?;
-    }
+    gate.tick()?;
+    write_scope_metadata(&conn, &parent_updates)
+        .context("SCIP import: writing enclosing symbols")?;
+    clock.lap("parent writes");
 
     // Only explicit metadata narrows the legacy containment lookup. A
     // kind-less object property may own an initializer call, while a typed
@@ -5812,6 +5845,120 @@ mod tests {
         assert_eq!(stats.symbols_added, 0);
         assert_eq!(stats.references_added, 0);
         assert_eq!(stats.relations_added, 0);
+    }
+}
+
+#[cfg(test)]
+mod scope_metadata_tests {
+    use super::*;
+
+    fn store() -> (tempfile::TempDir, GraphStore) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = GraphStore::open(&dir.path().join(crate::graph::names::STEM)).unwrap();
+        (dir, store)
+    }
+
+    fn seed(conn: &GatedConnection<'_>, id: &str) {
+        let id = escape(id);
+        conn.query(&format!(
+            "CREATE (:Symbol {{id: '{id}', name: 'n', kind: 'function', file: 'f.ts', start_line: 1, \
+             end_line: 1, signature_hash: '', language: 'typescript', visibility: 'old', \
+             parent: 'old', docstring: '', complexity: 0, parameters: '', return_type: ''}})"
+        ))
+        .unwrap();
+    }
+
+    fn scope_of(conn: &GatedConnection<'_>, id: &str) -> Option<(String, String)> {
+        let mut rows = conn
+            .query(&format!(
+                "MATCH (s:Symbol) WHERE s.id = '{}' RETURN s.parent, s.visibility",
+                escape(id)
+            ))
+            .unwrap();
+        rows.next().map(|r| (r[0].to_string(), r[1].to_string()))
+    }
+
+    #[test]
+    fn it_sets_parent_and_visibility_on_matched_rows_whatever_the_id_holds() {
+        let (_dir, store) = store();
+        let _lock = store.write_lock().unwrap();
+        let conn = store.connection().unwrap();
+        let ids = [
+            "f.ts::plain",
+            "f.ts::it's",
+            "f.ts::back\\slash",
+            "f.ts::naïve::日本",
+            "f.ts::a\"quote\"",
+        ];
+        for id in ids {
+            seed(&conn, id);
+        }
+        let rows: Vec<(String, String, bool)> = ids
+            .iter()
+            .enumerate()
+            .map(|(n, id)| (id.to_string(), format!("owner'{n}\\"), n % 2 == 0))
+            .collect();
+        write_scope_metadata(&conn, &rows).unwrap();
+        for (id, parent, private) in &rows {
+            assert_eq!(
+                scope_of(&conn, id),
+                Some((
+                    parent.clone(),
+                    if *private { "private" } else { "public" }.to_string()
+                )),
+                "{id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_id_with_no_row_is_skipped_and_an_empty_batch_writes_nothing() {
+        let (_dir, store) = store();
+        let _lock = store.write_lock().unwrap();
+        let conn = store.connection().unwrap();
+        seed(&conn, "f.ts::here");
+        write_scope_metadata(&conn, &[]).unwrap();
+        assert_eq!(
+            scope_of(&conn, "f.ts::here"),
+            Some(("old".into(), "old".into()))
+        );
+        write_scope_metadata(
+            &conn,
+            &[
+                ("f.ts::absent".into(), "x".into(), true),
+                ("f.ts::here".into(), "P".into(), false),
+            ],
+        )
+        .unwrap();
+        assert_eq!(scope_of(&conn, "f.ts::absent"), None);
+        assert_eq!(
+            scope_of(&conn, "f.ts::here"),
+            Some(("P".into(), "public".into()))
+        );
+    }
+
+    #[test]
+    fn more_rows_than_one_chunk_all_land() {
+        let (_dir, store) = store();
+        let _lock = store.write_lock().unwrap();
+        let conn = store.connection().unwrap();
+        let rows: Vec<(String, String, bool)> = (0..4500)
+            .map(|n| (format!("f.ts::s{n}"), format!("p{n}"), n % 3 == 0))
+            .collect();
+        for (id, _, _) in &rows {
+            seed(&conn, id);
+        }
+        write_scope_metadata(&conn, &rows).unwrap();
+        for n in [0usize, 1, 1999, 2000, 2001, 4499] {
+            let (id, parent, private) = &rows[n];
+            assert_eq!(
+                scope_of(&conn, id),
+                Some((
+                    parent.clone(),
+                    if *private { "private" } else { "public" }.to_string()
+                ))
+            );
+        }
     }
 }
 
