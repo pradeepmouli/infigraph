@@ -509,13 +509,18 @@ pub(crate) fn escape(s: &str) -> String {
         .replace('\'', "\\'")
 }
 
+/// Whether [`escape`] would fold something in `s`: a newline, a carriage return or a tab.
+pub(crate) fn has_control_whitespace(s: &str) -> bool {
+    s.contains(['\n', '\r', '\t'])
+}
+
 /// What a string [`escape`]d into a literal reads back as: the parser undoes
 /// the backslash and quote escapes, not the whitespace folding. Compare this,
 /// not the original, when asking whether a write would change a stored value
 /// (#178) -- a multi-line docstring never equals its stored form.
 pub(crate) fn literal_round_trip(s: &str) -> String {
     // Most ids and names hold none of the three: one scan and a copy, not three replaces.
-    if !s.contains(['\n', '\r', '\t']) {
+    if !has_control_whitespace(s) {
         return s.to_owned();
     }
     s.replace('\n', " ").replace('\r', "").replace('\t', " ")
@@ -1123,6 +1128,59 @@ fn existing_edges_unwind(
     )
 }
 
+/// A batch of at least this many pairs is checked with [`existing_edges_join`]; a smaller
+/// one with the per-source lookups ([`existing_edges_of`]), unless it names an id holding
+/// control whitespace (the join is the only form that can read a raw-stored one).
+///
+/// 100 is a crossover MEASURED on one graph, as [`UNWIND_FROM_SOURCES`] is, not a property of
+/// the two forms. CALLS on the 498,436-symbol rule-library snapshot, one pass, 2 runs: the
+/// per-source form costs 5-8 ms for 1 pair, 8-15 ms for 10, 36 ms for 100, 52-55 ms for 1,000
+/// and 371-381 ms for 10,000 (about 25-35 us a pair at 149k: 3-5 s); the join costs a flat
+/// 34-38 ms for 1, 10 and 100 pairs, 38 ms for 1,000 and 42-49 ms for 10,000, since it
+/// scans the edge table once whatever the batch. An incremental index asks about a handful.
+/// Re-measure both forms at 1, 10, 100, 1,000 and 10,000 pairs before changing this number.
+const JOIN_FROM_PAIRS: usize = 100;
+
+/// The edges of `table` that join one of `probes`, as the stored `(source id, target id)`.
+///
+/// The probes travel in a Parquet file and the statement is one join, not a Cypher literal of
+/// ids: the database parses a literal at a cost per id, and the per-source form scans the edge
+/// table once per chunk of 1,000 sources (see [`existing_edges_unwind`]). The ids are matched
+/// exactly as the file spells them, so a raw-stored id (the bulk COPY stores one as spelled)
+/// is found by the probe that spells it raw, which no literal can do (`escape` folds).
+fn existing_edges_join(
+    conn: &GatedConnection<'_>,
+    table: &str,
+    src_label: &str,
+    dst_label: &str,
+    probes: &[(&str, &str)],
+) -> Result<Vec<(String, String)>> {
+    use arrow::array::StringArray;
+    use arrow::datatypes::DataType;
+
+    let sources = StringArray::from(probes.iter().map(|(s, _)| *s).collect::<Vec<_>>());
+    let targets = StringArray::from(probes.iter().map(|(_, t)| *t).collect::<Vec<_>>());
+    let path = staging_parquet("infigraph_absent_edges");
+    let result = parquet_loader::write_node_parquet(
+        &path,
+        &[("s", DataType::Utf8), ("t", DataType::Utf8)],
+        vec![std::sync::Arc::new(sources), std::sync::Arc::new(targets)],
+    )
+    .and_then(|()| {
+        read_edge_rows(
+            conn,
+            table,
+            &format!(
+                "LOAD FROM '{}' WITH s, t MATCH (a:{src_label})-[:{table}]->(b:{dst_label}) \
+                 WHERE a.id = s AND b.id = t RETURN a.id, b.id",
+                fwd_slash_path(&path)
+            ),
+        )
+    });
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
 /// The `(source, target)` pairs of `table` the graph does not hold yet, each
 /// once, in their original order.
 ///
@@ -1131,9 +1189,10 @@ fn existing_edges_unwind(
 /// whatever it is handed, and an edge written twice stays twice. The check
 /// covers the edges already in the graph and repeats inside `pairs`; a pair is judged in
 /// the form a writer stores (see [`literal_round_trip`]), and the graph's own edges are
-/// compared as they are read, not folded (see the comment in the body). It looks
-/// up only the batch's own sources, in chunks, so its cost follows the batch,
-/// not the size of the table.
+/// compared as they are read, not folded (see the comment in the body). A small batch looks
+/// up only its own sources, in chunks, so its cost follows the batch, not the size of the
+/// table; from [`JOIN_FROM_PAIRS`] pairs (or with a control-whitespace id) one join against
+/// the pairs themselves does it, at a flat cost.
 pub(crate) fn absent_edges(
     conn: &GatedConnection<'_>,
     table: &str,
@@ -1144,15 +1203,36 @@ pub(crate) fn absent_edges(
     if pairs.is_empty() {
         return Ok(pairs);
     }
-    let sources: Vec<&str> = pairs
-        .iter()
-        .map(|(src, _)| src.as_str())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
     let mut present: HashSet<(String, String)> = HashSet::new();
-    for chunk in sources.chunks(EXISTING_SOURCES_PER_QUERY) {
-        present.extend(existing_edges_of(conn, table, src_label, dst_label, chunk)?);
+    let holds_control_whitespace = pairs
+        .iter()
+        .any(|(src, dst)| has_control_whitespace(src) || has_control_whitespace(dst));
+    if pairs.len() >= JOIN_FROM_PAIRS || holds_control_whitespace {
+        // Each pair as spelled and, when it differs, as a writer stores it: the graph holds
+        // whichever form the path that wrote the edge used.
+        let folded: Vec<(String, String)> = pairs
+            .iter()
+            .filter(|(src, dst)| has_control_whitespace(src) || has_control_whitespace(dst))
+            .map(|(src, dst)| (literal_round_trip(src), literal_round_trip(dst)))
+            .collect();
+        let probes: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(src, dst)| (src.as_str(), dst.as_str()))
+            .chain(folded.iter().map(|(src, dst)| (src.as_str(), dst.as_str())))
+            .collect();
+        present.extend(existing_edges_join(
+            conn, table, src_label, dst_label, &probes,
+        )?);
+    } else {
+        let sources: Vec<&str> = pairs
+            .iter()
+            .map(|(src, _)| src.as_str())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        for chunk in sources.chunks(EXISTING_SOURCES_PER_QUERY) {
+            present.extend(existing_edges_of(conn, table, src_label, dst_label, chunk)?);
+        }
     }
     // `escape` folds control whitespace to a space when an id is written, so the pair a writer
     // stores is the folded one: `line\nbreak` and `line break` are one edge, the one the graph
@@ -1160,10 +1240,11 @@ pub(crate) fn absent_edges(
     // single stored form: the bulk COPY path stores an id as spelled, so `d\ne` and `d e` can
     // be two nodes, and folding the stored side would hide the edge to one behind the edge to
     // the other. A pair is therefore dropped when it is in `present` as spelled, or when its
-    // folded form is, or when its folded form is already queued. The lookup folds the batch's
-    // SOURCES (the literal does), so an edge whose source was stored unfolded is never found;
-    // a target comes back as stored, so a raw one matches. The pairs handed back keep the
-    // spelling they came in with.
+    // folded form is, or when its folded form is already queued. Both forms are looked up
+    // (the join probes each pair as spelled and folded), so an edge is found whichever way
+    // either end was stored. The per-source form, used for a small batch with no such id,
+    // cannot spell a raw id in its literal, which is why a batch holding one never uses it.
+    // The pairs handed back keep the spelling they came in with.
     let mut queued: HashSet<(String, String)> = HashSet::new();
     Ok(pairs
         .into_iter()
@@ -1824,13 +1905,13 @@ mod tests {
         assert_eq!(calls_edge_count(&store), 2, "a replay adds nothing");
     }
 
-    /// The limit of the stored-form lookup, as it is today: the existing edges are found by
-    /// the batch's sources folded (the literal folds), so an edge whose SOURCE the bulk COPY
-    /// stored raw is never found, and its pair is offered again. A raw TARGET is found,
-    /// because the rows come back as stored. Making the bulk writer fold would change an id
-    /// (an `ID_SCHEME` bump), which is not this function's call.
+    /// A raw-stored SOURCE (`r\nsrc`, written by the bulk COPY as spelled) is found by its edges,
+    /// as a raw target is. The id-literal lookup could not do it: it folds the sources it is
+    /// given, so the raw node's edges were never read and the pair was offered again. A batch
+    /// that holds such an id is looked up by the pairs themselves (see `existing_edges_join`).
+    /// This test pinned the old limit ("known limit"); it was changed on purpose.
     #[test]
-    fn a_raw_stored_source_is_not_found_by_its_edges_but_a_raw_target_is() {
+    fn a_raw_stored_source_is_found_by_its_edges_like_a_raw_target() {
         let (_tmp, store) = bulk_graph(
             &["r\nsrc", "t", "src", "d\ne"],
             &[("r\nsrc", "t"), ("src", "d\ne")],
@@ -1845,11 +1926,58 @@ mod tests {
             vec![("r\nsrc".into(), "t".into()), ("src".into(), "d\ne".into())],
         )
         .unwrap();
+        assert!(
+            fresh.is_empty(),
+            "both raw-stored edges are recognised: {fresh:?}"
+        );
+    }
+
+    /// A source stored FOLDED (`f src`, written through a literal) is found by a batch that
+    /// spells it with the control character: the pair a writer stores is the folded one.
+    #[test]
+    fn a_folded_stored_source_is_found_by_a_batch_that_spells_it_raw() {
+        let (_tmp, store) = bulk_graph(&["f src", "t"], &[("f src", "t")]);
+        assert_eq!(calls_edge_count(&store), 1);
+        let conn = store.connection().unwrap();
+        let fresh = super::absent_edges(
+            &conn,
+            "CALLS",
+            "Symbol",
+            "Symbol",
+            vec![("f\tsrc".into(), "t".into())],
+        )
+        .unwrap();
+        assert!(fresh.is_empty(), "{fresh:?}");
+    }
+
+    /// A raw node and its folded twin are two nodes. An edge from the raw one is not the edge
+    /// from the folded one, in either direction of the lookup.
+    #[test]
+    fn a_raw_source_and_its_folded_twin_keep_their_own_edges() {
+        let (_tmp, store) = bulk_graph(&["s\nx", "s x", "t"], &[("s\nx", "t")]);
+        let conn = store.connection().unwrap();
+        let fresh = super::absent_edges(
+            &conn,
+            "CALLS",
+            "Symbol",
+            "Symbol",
+            vec![("s x".into(), "t".into())],
+        )
+        .unwrap();
         assert_eq!(
             fresh,
-            vec![("r\nsrc".to_string(), "t".to_string())],
-            "the raw target's edge is recognised; the raw source's edge is not (known limit)"
+            vec![("s x".to_string(), "t".to_string())],
+            "the folded twin has no edge of its own yet"
         );
+        let fresh = super::absent_edges(
+            &conn,
+            "CALLS",
+            "Symbol",
+            "Symbol",
+            vec![("s\nx".into(), "t".into())],
+        )
+        .unwrap();
+        assert!(fresh.is_empty(), "the raw one has its edge: {fresh:?}");
     }
 
     #[test]

@@ -594,6 +594,10 @@ fn write_scope_metadata(conn: &GatedConnection<'_>, rows: &[(String, String, boo
             column(&|(_, _, private)| if *private { "private" } else { "public" }),
         ],
     );
+    // The ids travel exactly as spelled, on purpose: the old literal form folded a newline or tab
+    // in an id to a space (`escape`), so such an id never matched a row the bulk COPY had
+    // written as spelled. Exact is the form the COPY wrote; no id on the rule-library corpus
+    // holds one, so the graph did not move.
     let result = written.and_then(|()| {
         conn.query(&format!(
             "LOAD FROM '{}' WITH id, parent, visibility MATCH (s:Symbol) WHERE s.id = id \
