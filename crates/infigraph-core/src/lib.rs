@@ -1,3 +1,8 @@
+// Every plain `eprintln!`/`eprint!` in this crate goes through `proclog` (see `stderr_macros`). Textual scope:
+// this `mod` comes before every other, so all of them see the macros.
+#[macro_use]
+mod stderr_macros;
+
 mod analysis;
 pub mod audit;
 pub mod bench;

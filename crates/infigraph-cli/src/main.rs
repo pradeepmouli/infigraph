@@ -1,3 +1,11 @@
+// Every plain `eprintln!`/`eprint!` in this crate (and its modules) goes through `infigraph_core::proclog`: std's
+// own while the process is a test or a foreground command, a write that ignores failure once a long-running
+// process has called `proclog::keep_running_on_stderr_failure()` (std's panics on a failed write, and a daemon
+// or MCP server whose log or client pipe went away died of its own logging).
+#[macro_use(eprintln, eprint)]
+#[allow(unused_imports)]
+extern crate infigraph_core;
+
 mod agent;
 mod analysis_commands;
 mod artifacts;
@@ -1277,9 +1285,20 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let update_handle = install::check_for_update_background();
-
     let cli = Cli::parse();
+    // The daemon's stderr is `daemon.log`, and the detached `scip-enrich` child's is `scip-enrich.log`: a
+    // failed write to either must not end the process (std's `eprintln!` panics on one). A person running
+    // `scip-enrich` by hand has a terminal on stderr and keeps std's behaviour. Before any thread that can
+    // print, which is why the update check starts after this.
+    {
+        use std::io::IsTerminal as _;
+        let detached_enrichment =
+            matches!(cli.command, Commands::ScipEnrich { .. }) && !std::io::stderr().is_terminal();
+        if matches!(cli.command, Commands::Daemon { .. }) || detached_enrichment {
+            infigraph_core::proclog::keep_running_on_stderr_failure();
+        }
+    }
+    let update_handle = install::check_for_update_background();
     // The daemon works in the background of a shared machine, so it takes a
     // bounded share of its cores; every other command is one a person waits
     // on and keeps them all. Before any pool or `Database` exists. (Also
